@@ -1,50 +1,33 @@
 <?php
 class Database {
-
-    private $host;
-    private $port;
-    private $db_name;
-    private $username;
-    private $password;
+    private $host     = 'shortline.proxy.rlwy.net';  // Railway MySQL host
+    private $port     = '48935';                     // Railway MySQL port
+    private $db_name  = 'railway';                  // Railway database name
+    private $username = 'root';                     // Railway username
+    private $password = 'zRmsMDcjRRrOIxvLmrPoaqGkKABEQxNO'; // Railway password
     public $conn;
-
-    public function __construct() {
-        // Railway MySQL environment variables
-        $this->host     = getenv("MYSQLHOST");
-        $this->port     = getenv("MYSQLPORT");
-        $this->db_name  = getenv("MYSQLDATABASE");
-        $this->username = getenv("MYSQLUSER");
-        $this->password = getenv("MYSQLPASSWORD");
-    }
 
     public function getConnection() {
         $this->conn = null;
-
         try {
-            $dsn = "mysql:host={$this->host};port={$this->port};dbname={$this->db_name};charset=utf8mb4";
-
             $this->conn = new PDO(
-                $dsn,
+                "mysql:host={$this->host};port={$this->port};dbname={$this->db_name}",
                 $this->username,
                 $this->password,
                 [
-                    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                    PDO::ATTR_EMULATE_PREPARES   => false,
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
                 ]
             );
-
-        } catch (PDOException $exception) {
-            http_response_code(500);
+        } catch(PDOException $exception) {
             echo json_encode([
-                "success" => false,
-                "message" => "Database connection failed",
-                "error"   => $exception->getMessage(),
-                "environment" => "Production / Railway MySQL"
+                'success' => false,
+                'message' => 'Database connection failed',
+                'error' => $exception->getMessage(),
+                'environment' => 'Production / Railway MySQL'
             ]);
-            exit();
+            exit;
         }
-
         return $this->conn;
     }
 }
