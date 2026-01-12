@@ -10,7 +10,7 @@ header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: https://dropx-frontend-seven.vercel.app');
 header('Access-Control-Allow-Credentials: true');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-CSRF-Token');
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
 
 // Handle OPTIONS preflight
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -180,20 +180,12 @@ function handleDeleteRequest($user_id, $conn) {
 
 function getUserProfile($user_id, $conn) {
     try {
-        // Get user data with COALESCE for null values
+        // Get user data
         $stmt = $conn->prepare("
             SELECT 
-                id, 
-                COALESCE(email, '') as email, 
-                COALESCE(full_name, '') as full_name, 
-                COALESCE(phone, '') as phone, 
-                COALESCE(avatar, '') as avatar,
-                COALESCE(wallet_balance, 0) as wallet_balance,
-                COALESCE(member_level, 'Standard') as member_level,
-                COALESCE(member_points, 0) as member_points,
-                COALESCE(total_orders, 0) as total_orders,
-                COALESCE(rating, 0) as rating,
-                COALESCE(verified, 0) as verified,
+                id, email, full_name, phone, avatar,
+                wallet_balance, member_level, member_points,
+                total_orders, rating, verified,
                 DATE_FORMAT(created_at, '%Y-%m-%d') as join_date
             FROM users 
             WHERE id = ?
@@ -203,6 +195,19 @@ function getUserProfile($user_id, $conn) {
         
         if (!$user) {
             jsonResponse(false, 'User not found', [], 404);
+        }
+        
+        // Convert avatar path to full URL if it exists
+        if (!empty($user['avatar']) && $user['avatar'] !== '') {
+            // If it's already a full URL, keep it
+            if (strpos($user['avatar'], 'http') === 0) {
+                // Already a full URL
+            } else {
+                // Convert relative path to full URL
+                $avatar_path = ltrim($user['avatar'], '/');
+                $base_url = 'https://dropxbackend-production.up.railway.app';
+                $user['avatar'] = $base_url . '/' . $avatar_path;
+            }
         }
         
         // Get default address
@@ -227,12 +232,9 @@ function getUserProfile($user_id, $conn) {
         // Get recent orders
         $ordersStmt = $conn->prepare("
             SELECT 
-                o.id, 
-                COALESCE(o.order_number, CONCAT('ORD', LPAD(o.id, 6, '0'))) as order_number, 
-                COALESCE(o.total_amount, 0) as total_amount, 
-                COALESCE(o.status, 'pending') as status, 
+                o.id, o.order_number, o.total_amount, o.status, 
                 DATE_FORMAT(o.created_at, '%Y-%m-%d') as formatted_date,
-                COALESCE(r.name, 'Restaurant') as restaurant_name,
+                r.name as restaurant_name,
                 (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count
             FROM orders o
             LEFT JOIN restaurants r ON o.restaurant_id = r.id
@@ -258,9 +260,23 @@ function getUserProfile($user_id, $conn) {
 function updateProfile($user_id, $data, $files, $conn) {
     try {
         // Log received data for debugging
-        error_log("Update profile request for user $user_id");
-        error_log("POST data: " . print_r($data, true));
-        error_log("FILES data: " . print_r($files, true));
+        error_log("=== UPDATE PROFILE DEBUG ===");
+        error_log("User ID: $user_id");
+        error_log("Full Name: " . ($data['full_name'] ?? 'Not provided'));
+        error_log("Email: " . ($data['email'] ?? 'Not provided'));
+        error_log("Phone: " . ($data['phone'] ?? 'Not provided'));
+        error_log("Address: " . ($data['address'] ?? 'Not provided'));
+        
+        if (isset($files['avatar'])) {
+            error_log("Avatar file received:");
+            error_log("  Name: " . $files['avatar']['name']);
+            error_log("  Type: " . $files['avatar']['type']);
+            error_log("  Size: " . $files['avatar']['size']);
+            error_log("  Error: " . $files['avatar']['error']);
+            error_log("  Tmp Name: " . $files['avatar']['tmp_name']);
+        } else {
+            error_log("No avatar file in request");
+        }
         
         // Validate required fields
         if (empty($data['full_name'])) {
@@ -288,8 +304,11 @@ function updateProfile($user_id, $data, $files, $conn) {
             // Handle avatar upload
             $avatar_url = null;
             if (isset($files['avatar']) && $files['avatar']['error'] === UPLOAD_ERR_OK) {
+                error_log("Starting avatar upload process...");
                 $avatar_url = uploadAvatar($user_id, $files['avatar']);
-                error_log("Avatar uploaded to: $avatar_url");
+                error_log("Avatar uploaded successfully. Path: $avatar_url");
+            } elseif (isset($files['avatar'])) {
+                error_log("Avatar upload error code: " . $files['avatar']['error']);
             }
             
             // Build update query
@@ -310,6 +329,7 @@ function updateProfile($user_id, $data, $files, $conn) {
             if ($avatar_url) {
                 $updateFields[] = "avatar = ?";
                 $params[] = $avatar_url;
+                error_log("Avatar will be saved to database: $avatar_url");
             }
             
             $updateFields[] = "updated_at = CURRENT_TIMESTAMP";
@@ -317,6 +337,9 @@ function updateProfile($user_id, $data, $files, $conn) {
             // Update user
             $sql = "UPDATE users SET " . implode(", ", $updateFields) . " WHERE id = ?";
             $params[] = $user_id;
+            
+            error_log("SQL Query: $sql");
+            error_log("Parameters: " . print_r($params, true));
             
             $stmt = $conn->prepare($sql);
             $stmt->execute($params);
@@ -329,24 +352,26 @@ function updateProfile($user_id, $data, $files, $conn) {
                 updateUserAddress($user_id, trim($data['address']), $conn);
             }
             
-            // Get updated user data with COALESCE
+            // Get updated user data
             $userStmt = $conn->prepare("
                 SELECT 
-                    id, 
-                    COALESCE(email, '') as email, 
-                    COALESCE(full_name, '') as full_name, 
-                    COALESCE(phone, '') as phone, 
-                    COALESCE(avatar, '') as avatar,
-                    COALESCE(wallet_balance, 0) as wallet_balance,
-                    COALESCE(total_orders, 0) as total_orders,
-                    COALESCE(rating, 0) as rating,
-                    COALESCE(verified, 0) as verified,
+                    id, email, full_name, phone, avatar,
+                    wallet_balance, total_orders, rating, verified,
                     DATE_FORMAT(created_at, '%Y-%m-%d') as join_date
                 FROM users 
                 WHERE id = ?
             ");
             $userStmt->execute([$user_id]);
             $updated_user = $userStmt->fetch(PDO::FETCH_ASSOC);
+            
+            // Convert avatar path to full URL if it exists
+            if (!empty($updated_user['avatar']) && $updated_user['avatar'] !== '') {
+                if (strpos($updated_user['avatar'], 'http') !== 0) {
+                    $avatar_path = ltrim($updated_user['avatar'], '/');
+                    $base_url = 'https://dropxbackend-production.up.railway.app';
+                    $updated_user['avatar'] = $base_url . '/' . $avatar_path;
+                }
+            }
             
             // Get default address
             $addrStmt = $conn->prepare("
@@ -370,6 +395,7 @@ function updateProfile($user_id, $data, $files, $conn) {
             $conn->commit();
             
             error_log("Profile update successful for user $user_id");
+            error_log("Returning user data: " . json_encode($updated_user));
             
             ob_end_clean();
             jsonResponse(true, 'Profile updated successfully', [
@@ -379,48 +405,97 @@ function updateProfile($user_id, $data, $files, $conn) {
         } catch (Exception $e) {
             $conn->rollBack();
             error_log("Transaction rollback: " . $e->getMessage());
+            error_log("Rollback trace: " . $e->getTraceAsString());
             throw $e;
         }
         
     } catch (Exception $e) {
         error_log("Profile update failed: " . $e->getMessage());
+        error_log("Update trace: " . $e->getTraceAsString());
         throw new Exception('Profile update failed: ' . $e->getMessage());
     }
 }
 
 function uploadAvatar($user_id, $file) {
-    // Validate file
-    $allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/jpg'];
-    $max_size = 5 * 1024 * 1024; // 5MB
-    
-    if (!in_array($file['type'], $allowed_types)) {
-        throw new Exception('Invalid file type. Allowed: JPEG, PNG, GIF, WebP');
-    }
-    
-    if ($file['size'] > $max_size) {
-        throw new Exception('File size exceeds 5MB limit');
-    }
-    
-    // Create upload directory - use absolute path
-    $upload_dir = __DIR__ . '/../../uploads/avatars/';
-    if (!file_exists($upload_dir)) {
-        if (!mkdir($upload_dir, 0755, true)) {
-            throw new Exception('Failed to create upload directory');
+    try {
+        // Validate file
+        $allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/jpg'];
+        $max_size = 5 * 1024 * 1024; // 5MB
+        
+        if (!in_array($file['type'], $allowed_types)) {
+            throw new Exception('Invalid file type. Allowed: JPEG, PNG, GIF, WebP');
         }
+        
+        if ($file['size'] > $max_size) {
+            throw new Exception('File size exceeds 5MB limit');
+        }
+        
+        // Get current directory (api/)
+        $current_dir = dirname(__FILE__);
+        
+        // Go up one level to project root (dropxbackend/)
+        $root_dir = dirname($current_dir);
+        
+        // Define upload directory path
+        $upload_dir = $root_dir . '/uploads/avatars/';
+        
+        error_log("Current dir: $current_dir");
+        error_log("Root dir: $root_dir");
+        error_log("Upload dir: $upload_dir");
+        
+        // Create directory if it doesn't exist
+        if (!file_exists($upload_dir)) {
+            error_log("Creating upload directory: $upload_dir");
+            if (!mkdir($upload_dir, 0755, true)) {
+                throw new Exception('Failed to create upload directory: ' . $upload_dir);
+            }
+            error_log("Upload directory created successfully");
+        } else {
+            error_log("Upload directory already exists");
+        }
+        
+        // Check if directory is writable
+        if (!is_writable($upload_dir)) {
+            $perms = substr(sprintf('%o', fileperms($upload_dir)), -4);
+            throw new Exception('Upload directory not writable. Permissions: ' . $perms);
+        }
+        
+        // Generate unique filename
+        $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        $filename = 'avatar_' . $user_id . '_' . time() . '.' . $ext;
+        $filepath = $upload_dir . $filename;
+        
+        error_log("Generated filename: $filename");
+        error_log("Full filepath: $filepath");
+        
+        // Check if tmp file exists
+        if (!file_exists($file['tmp_name'])) {
+            throw new Exception('Temporary file does not exist: ' . $file['tmp_name']);
+        }
+        
+        // Move uploaded file
+        error_log("Moving file from " . $file['tmp_name'] . " to " . $filepath);
+        if (!move_uploaded_file($file['tmp_name'], $filepath)) {
+            $error = error_get_last();
+            throw new Exception('Failed to move uploaded file. Error: ' . ($error['message'] ?? 'Unknown'));
+        }
+        
+        error_log("File moved successfully");
+        
+        // Set proper permissions
+        chmod($filepath, 0644);
+        
+        // Return relative path for database
+        $relative_path = '/uploads/avatars/' . $filename;
+        error_log("Returning relative path: $relative_path");
+        
+        return $relative_path;
+        
+    } catch (Exception $e) {
+        error_log("Avatar upload error: " . $e->getMessage());
+        error_log("Avatar upload trace: " . $e->getTraceAsString());
+        throw $e;
     }
-    
-    // Generate unique filename
-    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    $filename = 'avatar_' . $user_id . '_' . time() . '.' . $ext;
-    $filepath = $upload_dir . $filename;
-    
-    // Move uploaded file
-    if (!move_uploaded_file($file['tmp_name'], $filepath)) {
-        throw new Exception('Failed to upload file. Check directory permissions.');
-    }
-    
-    // Return relative URL for frontend access
-    return '/uploads/avatars/' . $filename;
 }
 
 function updateUserAddress($user_id, $address, $conn) {
@@ -461,16 +536,9 @@ function getUserAddresses($user_id, $conn) {
     try {
         $stmt = $conn->prepare("
             SELECT 
-                id, 
-                COALESCE(title, 'Address') as title, 
-                COALESCE(address, '') as address, 
-                COALESCE(city, '') as city, 
-                COALESCE(state, '') as state, 
-                COALESCE(zip_code, '') as zip_code,
-                latitude, longitude, 
-                COALESCE(is_default, 0) as is_default, 
-                COALESCE(instructions, '') as instructions,
-                COALESCE(address_type, 'home') as address_type,
+                id, title, address, city, state, zip_code,
+                latitude, longitude, is_default, instructions,
+                address_type,
                 DATE_FORMAT(created_at, '%Y-%m-%d') as created_date
             FROM user_addresses 
             WHERE user_id = ? 
@@ -485,7 +553,6 @@ function getUserAddresses($user_id, $conn) {
         ]);
         
     } catch (Exception $e) {
-        error_log("Get addresses error: " . $e->getMessage());
         throw new Exception('Failed to get addresses: ' . $e->getMessage());
     }
 }
@@ -519,7 +586,7 @@ function addAddress($user_id, $data, $conn) {
         
         $state = $data['state'] ?? '';
         $zip_code = $data['zip_code'] ?? '';
-        $address_type = $data['address_type'] ?? 'home';
+        $address_type = $data['address_type'] ?? 'other';
         $instructions = $data['instructions'] ?? '';
         
         $stmt->execute([
@@ -542,7 +609,6 @@ function addAddress($user_id, $data, $conn) {
         ]);
         
     } catch (Exception $e) {
-        error_log("Add address error: " . $e->getMessage());
         throw new Exception('Failed to add address: ' . $e->getMessage());
     }
 }
@@ -584,7 +650,6 @@ function setDefaultAddress($user_id, $data, $conn) {
         }
         
     } catch (Exception $e) {
-        error_log("Set default address error: " . $e->getMessage());
         throw new Exception('Failed to set default address: ' . $e->getMessage());
     }
 }
@@ -656,7 +721,6 @@ function updateAddress($user_id, $data, $conn) {
         jsonResponse(true, 'Address updated successfully');
         
     } catch (Exception $e) {
-        error_log("Update address error: " . $e->getMessage());
         throw new Exception('Failed to update address: ' . $e->getMessage());
     }
 }
@@ -690,7 +754,6 @@ function deleteAddress($user_id, $data, $conn) {
         jsonResponse(true, 'Address deleted successfully');
         
     } catch (Exception $e) {
-        error_log("Delete address error: " . $e->getMessage());
         throw new Exception('Failed to delete address: ' . $e->getMessage());
     }
 }
@@ -707,7 +770,7 @@ function getUserOrders($user_id, $conn) {
         $where = "WHERE o.user_id = ?";
         $params = [$user_id];
         
-        if (!empty($status) && $status !== 'all') {
+        if (!empty($status)) {
             $where .= " AND o.status = ?";
             $params[] = $status;
         }
@@ -724,12 +787,9 @@ function getUserOrders($user_id, $conn) {
         
         $sql = "
             SELECT 
-                o.id,
-                COALESCE(o.order_number, CONCAT('ORD', LPAD(o.id, 6, '0'))) as order_number,
-                COALESCE(o.total_amount, 0) as total_amount,
-                COALESCE(o.status, 'pending') as status,
-                COALESCE(r.name, 'Restaurant') as restaurant_name,
-                COALESCE(r.image, '') as restaurant_image,
+                o.*,
+                r.name as restaurant_name,
+                r.image as restaurant_image,
                 DATE_FORMAT(o.created_at, '%Y-%m-%d %H:%i') as formatted_date,
                 (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count
             FROM orders o
@@ -755,7 +815,6 @@ function getUserOrders($user_id, $conn) {
         ]);
         
     } catch (Exception $e) {
-        error_log("Get orders error: " . $e->getMessage());
         throw new Exception('Failed to get orders: ' . $e->getMessage());
     }
 }
@@ -802,7 +861,6 @@ function changePassword($user_id, $data, $conn) {
         jsonResponse(true, 'Password changed successfully');
         
     } catch (Exception $e) {
-        error_log("Change password error: " . $e->getMessage());
         throw new Exception('Failed to change password: ' . $e->getMessage());
     }
 }
