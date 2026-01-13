@@ -1,10 +1,6 @@
 <?php
-// profile.php - COMPLETE CORRECTED VERSION
+// profile.php - COMPLETE WORKING VERSION
 ob_start();
-
-// Enable error reporting for development
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
 
 // ============ CORS HEADERS ============
 header('Content-Type: application/json');
@@ -12,7 +8,7 @@ header('Access-Control-Allow-Origin: https://dropx-frontend-seven.vercel.app');
 header('Access-Control-Allow-Credentials: true');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Session-ID');
-header('Access-Control-Max-Age: 86400'); // Cache preflight for 24 hours
+header('Access-Control-Max-Age: 86400');
 
 // Handle OPTIONS preflight requests
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -21,27 +17,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 // ============ SESSION CONFIGURATION ============
-// Reduce session overhead
-session_cache_limiter('private_no_expire');
-session_cache_expire(60);
-
 ini_set('session.cookie_samesite', 'None');
 ini_set('session.cookie_secure', true);
-ini_set('session.use_strict_mode', 1);
-ini_set('session.gc_maxlifetime', 86400);
-
-// Check for session ID in headers for optimization
-if (isset($_SERVER['HTTP_X_SESSION_ID'])) {
-    session_id($_SERVER['HTTP_X_SESSION_ID']);
-}
 
 if (session_status() === PHP_SESSION_NONE) {
     session_start([
         'cookie_lifetime' => 86400,
         'cookie_secure' => true,
         'cookie_httponly' => true,
-        'cookie_samesite' => 'None',
-        'read_and_close' => false
+        'cookie_samesite' => 'None'
     ]);
 }
 
@@ -65,7 +49,11 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['logged_in']) || $_SESSION[
 $user_id = $_SESSION['user_id'];
 
 // ============ INCLUDE DATABASE ============
-require_once __DIR__ . '/../config/database.php';
+try {
+    require_once __DIR__ . '/../config/database.php';
+} catch (Exception $e) {
+    handleError('Database configuration error', 500);
+}
 
 // ============ MAIN API CLASS ============
 class ProfileAPI {
@@ -73,7 +61,6 @@ class ProfileAPI {
     private $user_id;
     private $base_url = 'https://dropxbackend-production.up.railway.app';
     private $cache = [];
-    private $cache_timeout = 300; // 5 minutes
 
     public function __construct() {
         try {
@@ -81,12 +68,11 @@ class ProfileAPI {
             $this->conn = $database->getConnection();
             $this->user_id = $_SESSION['user_id'];
             
-            // Quick user validation with caching
             if (!$this->validateUser()) {
                 handleError('User not found', 404);
             }
         } catch (Exception $e) {
-            handleError('Database connection failed: ' . $e->getMessage(), 500);
+            handleError('Database connection failed', 500);
         }
     }
 
@@ -97,12 +83,15 @@ class ProfileAPI {
             return $this->cache[$cacheKey];
         }
         
-        $stmt = $this->conn->prepare("SELECT 1 FROM users WHERE id = ? LIMIT 1");
-        $stmt->execute([$this->user_id]);
-        $exists = (bool)$stmt->fetch();
-        
-        $this->cache[$cacheKey] = $exists;
-        return $exists;
+        try {
+            $stmt = $this->conn->prepare("SELECT id FROM users WHERE id = ? LIMIT 1");
+            $stmt->execute([$this->user_id]);
+            $exists = (bool)$stmt->fetch();
+            $this->cache[$cacheKey] = $exists;
+            return $exists;
+        } catch (Exception $e) {
+            return false;
+        }
     }
 
     public function handleRequest() {
@@ -158,9 +147,6 @@ class ProfileAPI {
             case 'orders':
                 $this->getUserOrders();
                 break;
-            case 'health':
-                $this->healthCheck();
-                break;
             default:
                 handleError('Invalid action', 400);
         }
@@ -215,29 +201,22 @@ class ProfileAPI {
         }
     }
 
-    // ============ ADD THE MISSING METHOD ============
-    private function updateProfileWithAvatar($data, $files) {
-        $this->updateProfileData($data, $files);
-    }
-
     // ============ PROFILE FUNCTIONS ============
     private function getUserProfile($light = false) {
         $cacheKey = 'profile_' . $this->user_id . '_' . ($light ? 'light' : 'full');
         
-        // Check memory cache
-        if (isset($this->cache[$cacheKey]) && 
-            time() - ($this->cache[$cacheKey]['timestamp'] ?? 0) < $this->cache_timeout) {
-            echo json_encode($this->cache[$cacheKey]['data']);
+        if (isset($this->cache[$cacheKey])) {
+            echo json_encode($this->cache[$cacheKey]);
             return;
         }
         
         try {
-            // Get user data with optimized query
+            // Get user data according to your table structure
             $query = "SELECT 
-                        id, email, full_name, phone, avatar,
+                        id, username, email, full_name, phone, address, avatar,
                         wallet_balance, member_level, member_points,
                         total_orders, rating, verified,
-                        DATE_FORMAT(created_at, '%Y-%m-%d') as join_date
+                        join_date, created_at
                       FROM users 
                       WHERE id = ?";
             
@@ -251,11 +230,7 @@ class ProfileAPI {
             
             // Handle avatar URL
             if (!empty($user['avatar'])) {
-                $user['avatar'] = $this->getFullAvatarUrl($user['avatar'], 'large');
-            } else {
-                // Generate default avatar URL
-                $initials = substr($user['full_name'] ?? 'US', 0, 2);
-                $user['avatar'] = "https://ui-avatars.com/api/?name=" . urlencode($initials) . "&background=random&size=400&bold=true&color=fff";
+                $user['avatar'] = $this->getFullAvatarUrl($user['avatar']);
             }
             
             $response = [
@@ -267,19 +242,16 @@ class ProfileAPI {
             ];
             
             if (!$light) {
-                // Get additional data only if not light mode
-                $user['address'] = $this->getUserDefaultAddress();
+                // Get recent orders (5 most recent)
                 $recent_orders = $this->getRecentOrders(5);
-                
                 $response['data']['recent_orders'] = $recent_orders;
+                
+                // Get user addresses count
+                $addressCount = $this->getUserAddressCount();
+                $user['address_count'] = $addressCount;
             }
             
-            // Cache the response
-            $this->cache[$cacheKey] = [
-                'data' => $response,
-                'timestamp' => time()
-            ];
-            
+            $this->cache[$cacheKey] = $response;
             echo json_encode($response);
             
         } catch (Exception $e) {
@@ -287,9 +259,9 @@ class ProfileAPI {
         }
     }
 
-    private function getFullAvatarUrl($avatarPath, $size = 'large') {
+    private function getFullAvatarUrl($avatarPath) {
         if (empty($avatarPath)) {
-            return $this->generateDefaultAvatar('User', $size);
+            return $this->generateDefaultAvatar();
         }
         
         // If it's already a full URL, return as is
@@ -304,99 +276,59 @@ class ProfileAPI {
         
         if (!file_exists($fullPath)) {
             // File doesn't exist, return default
-            return $this->generateDefaultAvatar('User', $size);
+            return $this->generateDefaultAvatar();
         }
         
-        // For size variations
-        if ($size !== 'large') {
-            $pathInfo = pathinfo($avatarPath);
-            $sizePath = $pathInfo['dirname'] . '/' . $pathInfo['filename'] . '_' . $size . '.' . $pathInfo['extension'];
-            $sizeRelativePath = ltrim($sizePath, '/');
-            $sizeFullPath = $root_dir . '/' . $sizeRelativePath;
-            
-            if (file_exists($sizeFullPath)) {
-                return $this->base_url . '/' . $sizeRelativePath;
-            }
-        }
-        
-        // Return original
+        // Return full URL
         $cleanPath = ltrim($avatarPath, '/');
         return $this->base_url . '/' . $cleanPath;
     }
     
-    private function generateDefaultAvatar($name, $size = 'large') {
-        $sizes = [
-            'large' => 400,
-            'medium' => 200,
-            'small' => 100,
-            'thumbnail' => 50
-        ];
-        
-        $sizeValue = $sizes[$size] ?? 400;
-        $initials = strtoupper(substr($name, 0, 2));
-        
-        return "https://ui-avatars.com/api/?name=" . urlencode($initials) . 
-               "&background=random&size=" . $sizeValue . "&bold=true&color=fff";
+    private function generateDefaultAvatar() {
+        return "https://ui-avatars.com/api/?name=User&background=random&size=400&bold=true&color=fff";
     }
 
-    private function getUserDefaultAddress() {
-        $cacheKey = 'default_address_' . $this->user_id;
-        
-        if (isset($this->cache[$cacheKey])) {
-            return $this->cache[$cacheKey];
+    private function getUserAddressCount() {
+        try {
+            $query = "SELECT COUNT(*) as count FROM user_addresses WHERE user_id = ?";
+            $stmt = $this->conn->prepare($query);
+            $stmt->execute([$this->user_id]);
+            $result = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $result['count'] ?? 0;
+        } catch (Exception $e) {
+            return 0;
         }
-        
-        $query = "SELECT address, city 
-                 FROM user_addresses 
-                 WHERE user_id = ? AND is_default = 1 
-                 LIMIT 1";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute([$this->user_id]);
-        $address = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if ($address) {
-            $fullAddress = $address['address'];
-            if (!empty($address['city'])) {
-                $fullAddress .= ', ' . $address['city'];
-            }
-            $this->cache[$cacheKey] = $fullAddress;
-            return $fullAddress;
-        }
-        
-        $this->cache[$cacheKey] = '';
-        return '';
     }
 
     private function getRecentOrders($limit = 5) {
-        $cacheKey = 'recent_orders_' . $this->user_id . '_' . $limit;
-        
-        if (isset($this->cache[$cacheKey])) {
-            return $this->cache[$cacheKey];
+        try {
+            $query = "SELECT 
+                        o.id, o.order_number, o.total_amount, o.status, 
+                        DATE_FORMAT(o.created_at, '%Y-%m-%d') as formatted_date,
+                        r.name as restaurant_name,
+                        COUNT(oi.id) as item_count
+                      FROM orders o
+                      LEFT JOIN restaurants r ON o.restaurant_id = r.id
+                      LEFT JOIN order_items oi ON o.id = oi.order_id
+                      WHERE o.user_id = ?
+                      GROUP BY o.id
+                      ORDER BY o.created_at DESC 
+                      LIMIT ?";
+            
+            $stmt = $this->conn->prepare($query);
+            $stmt->execute([$this->user_id, $limit]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (Exception $e) {
+            return [];
         }
-        
-        $query = "SELECT 
-                    o.id, o.order_number, o.total_amount, o.status, 
-                    DATE_FORMAT(o.created_at, '%Y-%m-%d') as formatted_date,
-                    r.name as restaurant_name,
-                    COUNT(oi.id) as item_count
-                  FROM orders o
-                  LEFT JOIN restaurants r ON o.restaurant_id = r.id
-                  LEFT JOIN order_items oi ON o.id = oi.order_id
-                  WHERE o.user_id = ?
-                  GROUP BY o.id
-                  ORDER BY o.created_at DESC 
-                  LIMIT ?";
-        
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute([$this->user_id, $limit]);
-        $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        $this->cache[$cacheKey] = $orders;
-        return $orders;
     }
 
     private function updateProfile($data) {
         $this->updateProfileData($data, null);
+    }
+
+    private function updateProfileWithAvatar($data, $files) {
+        $this->updateProfileData($data, $files);
     }
 
     private function updateProfileData($data, $files = null) {
@@ -431,7 +363,7 @@ class ProfileAPI {
                     $avatar_url = $this->uploadAvatar($files['avatar']);
                 }
                 
-                // Build update query
+                // Build update query based on your table structure
                 $updateFields = [];
                 $params = [];
                 
@@ -442,6 +374,10 @@ class ProfileAPI {
                 
                 if (isset($data['phone'])) {
                     $fields['phone'] = trim($data['phone']);
+                }
+                
+                if (isset($data['address'])) {
+                    $fields['address'] = trim($data['address']);
                 }
                 
                 if ($avatar_url) {
@@ -466,16 +402,17 @@ class ProfileAPI {
                 $stmt = $this->conn->prepare($sql);
                 $stmt->execute($params);
                 
-                // Update address if provided
-                if (isset($data['address']) && !empty(trim($data['address']))) {
-                    $this->updateUserAddress(trim($data['address']));
-                }
+                $this->conn->commit();
+                
+                // Clear cache
+                $this->clearProfileCache();
                 
                 // Get updated user data
                 $userQuery = "SELECT 
-                                id, email, full_name, phone, avatar,
-                                wallet_balance, total_orders, rating, verified,
-                                DATE_FORMAT(created_at, '%Y-%m-%d') as join_date
+                                id, username, email, full_name, phone, address, avatar,
+                                wallet_balance, member_level, member_points,
+                                total_orders, rating, verified,
+                                join_date, created_at
                               FROM users 
                               WHERE id = ?";
                 
@@ -485,16 +422,8 @@ class ProfileAPI {
                 
                 // Handle avatar URL
                 if (!empty($updated_user['avatar'])) {
-                    $updated_user['avatar'] = $this->getFullAvatarUrl($updated_user['avatar'], 'large');
+                    $updated_user['avatar'] = $this->getFullAvatarUrl($updated_user['avatar']);
                 }
-                
-                // Get default address
-                $updated_user['address'] = $this->getUserDefaultAddress();
-                
-                $this->conn->commit();
-                
-                // Clear relevant cache
-                $this->clearProfileCache();
                 
                 echo json_encode([
                     'success' => true,
@@ -518,7 +447,6 @@ class ProfileAPI {
         $cacheKeys = [
             'profile_' . $this->user_id . '_light',
             'profile_' . $this->user_id . '_full',
-            'default_address_' . $this->user_id,
             'user_exists_' . $this->user_id
         ];
         
@@ -551,16 +479,15 @@ class ProfileAPI {
                 }
             }
             
-            // Generate unique filename (use webp for better compression)
-            $ext = 'webp';
-            $filename = 'avatar_' . $this->user_id . '_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+            // Generate unique filename
+            $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+            $filename = 'avatar_' . $this->user_id . '_' . time() . '.' . $ext;
             $filepath = $upload_dir . $filename;
             
-            // Resize and save image
-            $this->createAvatarSizes($file['tmp_name'], $filepath);
-            
-            // Delete original uploaded file
-            unlink($file['tmp_name']);
+            // Move uploaded file
+            if (!move_uploaded_file($file['tmp_name'], $filepath)) {
+                throw new Exception('Failed to upload file');
+            }
             
             // Return relative path
             return '/uploads/avatars/' . $filename;
@@ -570,136 +497,7 @@ class ProfileAPI {
         }
     }
 
-    private function createAvatarSizes($sourcePath, $destinationBasePath) {
-        $sizes = [
-            'large' => 400,
-            'medium' => 200,
-            'small' => 100,
-            'thumbnail' => 50
-        ];
-        
-        $extension = pathinfo($destinationBasePath, PATHINFO_EXTENSION);
-        $filename = pathinfo($destinationBasePath, PATHINFO_FILENAME);
-        $directory = dirname($destinationBasePath);
-        
-        foreach ($sizes as $sizeName => $size) {
-            $destinationPath = $directory . '/' . $filename . '_' . $sizeName . '.' . $extension;
-            $this->resizeImage($sourcePath, $destinationPath, $size, $size);
-        }
-    }
-
-    private function resizeImage($sourcePath, $destinationPath, $maxWidth, $maxHeight) {
-        // Get image info
-        $imageInfo = getimagesize($sourcePath);
-        if (!$imageInfo) {
-            return false;
-        }
-        
-        $mime = $imageInfo['mime'];
-        $width = $imageInfo[0];
-        $height = $imageInfo[1];
-        
-        // Calculate new dimensions
-        $ratio = $width / $height;
-        $newWidth = $maxWidth;
-        $newHeight = $maxHeight;
-        
-        if ($width > $height) {
-            $newHeight = $maxWidth / $ratio;
-        } else {
-            $newWidth = $maxHeight * $ratio;
-        }
-        
-        // Create image resource based on mime type
-        switch ($mime) {
-            case 'image/jpeg':
-            case 'image/jpg':
-                $source = imagecreatefromjpeg($sourcePath);
-                break;
-            case 'image/png':
-                $source = imagecreatefrompng($sourcePath);
-                break;
-            case 'image/gif':
-                $source = imagecreatefromgif($sourcePath);
-                break;
-            case 'image/webp':
-                $source = imagecreatefromwebp($sourcePath);
-                break;
-            default:
-                return false;
-        }
-        
-        if (!$source) {
-            return false;
-        }
-        
-        // Create new image
-        $destination = imagecreatetruecolor($newWidth, $newHeight);
-        
-        // Preserve transparency for PNG and GIF
-        if ($mime == 'image/png' || $mime == 'image/gif') {
-            imagecolortransparent($destination, imagecolorallocatealpha($destination, 0, 0, 0, 127));
-            imagealphablending($destination, false);
-            imagesavealpha($destination, true);
-        }
-        
-        // Resize image
-        imagecopyresampled($destination, $source, 0, 0, 0, 0, $newWidth, $newHeight, $width, $height);
-        
-        // Save as WebP (better compression)
-        imagewebp($destination, $destinationPath, 80);
-        
-        // Clean up
-        imagedestroy($source);
-        imagedestroy($destination);
-        
-        return true;
-    }
-
-    private function updateUserAddress($address) {
-        try {
-            // Check if user has default address
-            $checkQuery = "SELECT id FROM user_addresses 
-                          WHERE user_id = ? AND is_default = 1 
-                          LIMIT 1";
-            $stmt = $this->conn->prepare($checkQuery);
-            $stmt->execute([$this->user_id]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($result) {
-                // Update existing address
-                $updateQuery = "UPDATE user_addresses 
-                               SET address = ?, updated_at = CURRENT_TIMESTAMP 
-                               WHERE id = ?";
-                $stmt = $this->conn->prepare($updateQuery);
-                $stmt->execute([$address, $result['id']]);
-            } else {
-                // Create new address
-                $insertQuery = "INSERT INTO user_addresses 
-                               (user_id, title, address, city, address_type, is_default, created_at)
-                               VALUES (?, 'Home', ?, '', 'home', 1, CURRENT_TIMESTAMP)";
-                $stmt = $this->conn->prepare($insertQuery);
-                $stmt->execute([$this->user_id, $address]);
-            }
-            
-            // Clear address cache
-            unset($this->cache['default_address_' . $this->user_id]);
-            
-        } catch (Exception $e) {
-            // Address update is not critical, log and continue
-            error_log('Address update failed: ' . $e->getMessage());
-        }
-    }
-
     private function getUserAddresses() {
-        $cacheKey = 'addresses_' . $this->user_id;
-        
-        if (isset($this->cache[$cacheKey]) && 
-            time() - ($this->cache[$cacheKey]['timestamp'] ?? 0) < $this->cache_timeout) {
-            echo json_encode($this->cache[$cacheKey]['data']);
-            return;
-        }
-        
         try {
             $query = "SELECT 
                         id, title, address, city, state, zip_code,
@@ -714,20 +512,13 @@ class ProfileAPI {
             $stmt->execute([$this->user_id]);
             $addresses = $stmt->fetchAll(PDO::FETCH_ASSOC);
             
-            $response = [
+            echo json_encode([
                 'success' => true,
                 'message' => 'Addresses retrieved successfully',
                 'data' => [
                     'addresses' => $addresses
                 ]
-            ];
-            
-            $this->cache[$cacheKey] = [
-                'data' => $response,
-                'timestamp' => time()
-            ];
-            
-            echo json_encode($response);
+            ]);
             
         } catch (Exception $e) {
             throw new Exception('Failed to get addresses: ' . $e->getMessage());
@@ -736,19 +527,18 @@ class ProfileAPI {
 
     private function addAddress($data) {
         try {
-            // Validate required fields
             if (empty($data['title']) || empty($data['address']) || empty($data['city'])) {
                 throw new Exception('Title, address, and city are required');
             }
             
-            // Check if this is the first address
+            // Check if first address
             $checkQuery = "SELECT COUNT(*) as count FROM user_addresses WHERE user_id = ?";
             $stmt = $this->conn->prepare($checkQuery);
             $stmt->execute([$this->user_id]);
             $count = $stmt->fetch(PDO::FETCH_ASSOC)['count'];
             $is_default = $count == 0 ? 1 : 0;
             
-            // If setting as default, clear other defaults
+            // If setting as default, clear others
             if (isset($data['is_default']) && $data['is_default']) {
                 $clearQuery = "UPDATE user_addresses SET is_default = 0 WHERE user_id = ?";
                 $stmt = $this->conn->prepare($clearQuery);
@@ -756,7 +546,6 @@ class ProfileAPI {
                 $is_default = 1;
             }
             
-            // Insert new address
             $query = "INSERT INTO user_addresses 
                      (user_id, title, address, city, state, zip_code, 
                       address_type, is_default, instructions, created_at)
@@ -781,10 +570,6 @@ class ProfileAPI {
             ]);
             
             $address_id = $this->conn->lastInsertId();
-            
-            // Clear addresses cache
-            unset($this->cache['addresses_' . $this->user_id]);
-            unset($this->cache['default_address_' . $this->user_id]);
             
             echo json_encode([
                 'success' => true,
@@ -830,10 +615,6 @@ class ProfileAPI {
                 
                 $this->conn->commit();
                 
-                // Clear cache
-                unset($this->cache['addresses_' . $this->user_id]);
-                unset($this->cache['default_address_' . $this->user_id]);
-                
                 echo json_encode([
                     'success' => true,
                     'message' => 'Default address updated successfully'
@@ -865,7 +646,6 @@ class ProfileAPI {
                 throw new Exception('Address not found');
             }
             
-            // Build update query dynamically
             $updates = [];
             $params = [];
             
@@ -893,10 +673,6 @@ class ProfileAPI {
             
             $stmt = $this->conn->prepare($sql);
             $stmt->execute($params);
-            
-            // Clear cache
-            unset($this->cache['addresses_' . $this->user_id]);
-            unset($this->cache['default_address_' . $this->user_id]);
             
             echo json_encode([
                 'success' => true,
@@ -930,13 +706,9 @@ class ProfileAPI {
                 throw new Exception('Cannot delete default address');
             }
             
-            // Delete address
             $deleteQuery = "DELETE FROM user_addresses WHERE id = ? AND user_id = ?";
             $stmt = $this->conn->prepare($deleteQuery);
             $stmt->execute([$address_id, $this->user_id]);
-            
-            // Clear cache
-            unset($this->cache['addresses_' . $this->user_id]);
             
             echo json_encode([
                 'success' => true,
@@ -949,19 +721,11 @@ class ProfileAPI {
     }
 
     private function getUserOrders() {
-        $page = isset($_GET['page']) ? intval($_GET['page']) : 1;
-        $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 10;
-        $status = $_GET['status'] ?? '';
-        
-        $cacheKey = 'orders_' . $this->user_id . '_' . $page . '_' . $limit . '_' . $status;
-        
-        if (isset($this->cache[$cacheKey]) && 
-            time() - ($this->cache[$cacheKey]['timestamp'] ?? 0) < $this->cache_timeout) {
-            echo json_encode($this->cache[$cacheKey]['data']);
-            return;
-        }
-        
         try {
+            $page = isset($_GET['page']) ? intval($_GET['page']) : 1;
+            $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 10;
+            $status = $_GET['status'] ?? '';
+            
             $offset = ($page - 1) * $limit;
             
             // Build query
@@ -979,7 +743,7 @@ class ProfileAPI {
             $countStmt->execute($params);
             $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
             
-            // Get orders with optimized query
+            // Get orders
             $sql = "SELECT 
                     o.*,
                     r.name as restaurant_name,
@@ -1001,7 +765,7 @@ class ProfileAPI {
             $stmt->execute($params);
             $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
             
-            $response = [
+            echo json_encode([
                 'success' => true,
                 'message' => 'Orders retrieved successfully',
                 'data' => [
@@ -1013,14 +777,7 @@ class ProfileAPI {
                         'pages' => ceil($total / $limit)
                     ]
                 ]
-            ];
-            
-            $this->cache[$cacheKey] = [
-                'data' => $response,
-                'timestamp' => time()
-            ];
-            
-            echo json_encode($response);
+            ]);
             
         } catch (Exception $e) {
             throw new Exception('Failed to get orders: ' . $e->getMessage());
@@ -1076,28 +833,6 @@ class ProfileAPI {
             throw new Exception('Failed to change password: ' . $e->getMessage());
         }
     }
-
-    private function healthCheck() {
-        $response = [
-            'status' => 'ok',
-            'timestamp' => time(),
-            'session' => [
-                'active' => isset($_SESSION['user_id']),
-                'user_id' => $_SESSION['user_id'] ?? null
-            ],
-            'avatar_dir' => [
-                'path' => dirname(__FILE__) . '/../uploads/avatars',
-                'exists' => file_exists(dirname(__FILE__) . '/../uploads/avatars'),
-                'writable' => is_writable(dirname(__FILE__) . '/../uploads/avatars')
-            ],
-            'cache' => [
-                'size' => count($this->cache),
-                'keys' => array_keys($this->cache)
-            ]
-        ];
-        
-        echo json_encode($response);
-    }
 }
 
 // ============ MAIN EXECUTION ============
@@ -1105,8 +840,10 @@ try {
     $api = new ProfileAPI();
     $api->handleRequest();
 } catch (Exception $e) {
-    handleError('Application error: ' . $e->getMessage(), 500);
+    handleError('Application error', 500);
 }
 
-ob_end_flush();
+// Clear output buffer
+$output = ob_get_clean();
+echo $output;
 ?>
