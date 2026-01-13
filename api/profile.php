@@ -1,5 +1,5 @@
 <?php
-// profile.php - COMPLETE WORKING VERSION WITH AVATAR HANDLING
+// profile.php - CORRECTED VERSION WITH DATABASE SCHEMA MATCH
 ob_start();
 
 // ============ CORS HEADERS ============
@@ -19,14 +19,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // ============ SESSION CONFIGURATION ============
 ini_set('session.cookie_samesite', 'None');
 ini_set('session.cookie_secure', true);
+ini_set('session.use_only_cookies', 1);
+
+session_set_cookie_params([
+    'lifetime' => 86400,
+    'path' => '/',
+    'domain' => '', // Your domain here
+    'secure' => true,
+    'httponly' => true,
+    'samesite' => 'None'
+]);
 
 if (session_status() === PHP_SESSION_NONE) {
-    session_start([
-        'cookie_lifetime' => 86400,
-        'cookie_secure' => true,
-        'cookie_httponly' => true,
-        'cookie_samesite' => 'None'
-    ]);
+    session_start();
 }
 
 // ============ ERROR HANDLING ============
@@ -52,7 +57,7 @@ $user_id = $_SESSION['user_id'];
 try {
     require_once __DIR__ . '/../config/database.php';
 } catch (Exception $e) {
-    handleError('Database configuration error', 500);
+    handleError('Database configuration error: ' . $e->getMessage(), 500);
 }
 
 // ============ MAIN API CLASS ============
@@ -78,23 +83,15 @@ class ProfileAPI {
                 handleError('User not found', 404);
             }
         } catch (Exception $e) {
-            handleError('Database connection failed', 500);
+            handleError('Database connection failed: ' . $e->getMessage(), 500);
         }
     }
 
     private function validateUser() {
-        $cacheKey = 'user_exists_' . $this->user_id;
-        
-        if (isset($this->cache[$cacheKey])) {
-            return $this->cache[$cacheKey];
-        }
-        
         try {
             $stmt = $this->conn->prepare("SELECT id FROM users WHERE id = ? LIMIT 1");
             $stmt->execute([$this->user_id]);
-            $exists = (bool)$stmt->fetch();
-            $this->cache[$cacheKey] = $exists;
-            return $exists;
+            return (bool)$stmt->fetch();
         } catch (Exception $e) {
             return false;
         }
@@ -103,6 +100,8 @@ class ProfileAPI {
     public function handleRequest() {
         try {
             $method = $_SERVER['REQUEST_METHOD'];
+            
+            // Handle multipart/form-data separately
             $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
             $isMultipart = strpos($contentType, 'multipart/form-data') !== false;
             
@@ -110,8 +109,7 @@ class ProfileAPI {
                 $action = $_GET['action'] ?? 'get_profile';
                 $this->handleGetRequest($action);
             } else if ($isMultipart) {
-                $action = $_POST['action'] ?? '';
-                $this->handleMultipartRequest($action);
+                $this->handleMultipartRequest();
             } else {
                 $input = file_get_contents('php://input');
                 $data = json_decode($input, true);
@@ -203,7 +201,10 @@ class ProfileAPI {
         }
     }
 
-    private function handleMultipartRequest($action) {
+    private function handleMultipartRequest() {
+        // Parse multipart data
+        $action = $_POST['action'] ?? '';
+        
         switch ($action) {
             case 'update_profile':
                 $this->updateProfileWithAvatar($_POST, $_FILES);
@@ -246,7 +247,7 @@ class ProfileAPI {
     }
 
     private function getAvatarUrl($avatarPath, $size = 'large', $fullName = null) {
-        if (empty($avatarPath) || strpos($avatarPath, 'ui-avatars.com') !== false) {
+        if (empty($avatarPath)) {
             // Generate default avatar
             $initials = 'US';
             if ($fullName) {
@@ -266,33 +267,34 @@ class ProfileAPI {
                    "&bold=true&color=fff";
         }
         
-        if (strpos($avatarPath, 'http') === 0) {
+        // If it's already a URL, return as-is
+        if (filter_var($avatarPath, FILTER_VALIDATE_URL)) {
             return $avatarPath;
         }
         
-        // Check if file exists
+        // Check if file exists locally
         $root_dir = dirname(dirname(__FILE__));
         $full_path = $root_dir . $avatarPath;
         
-        if (!file_exists($full_path)) {
-            // File doesn't exist, return default
-            return $this->getAvatarUrl(null, $size, $fullName);
-        }
-        
-        // For resized versions
-        if ($size !== 'large') {
-            $path_parts = pathinfo($full_path);
-            $resized_path = $path_parts['dirname'] . '/' . 
-                           $path_parts['filename'] . '_' . $size . '.' . 
-                           $path_parts['extension'];
-            
-            if (file_exists($resized_path)) {
-                $relative_path = str_replace($root_dir, '', $resized_path);
-                return $this->base_url . $relative_path;
+        if (file_exists($full_path)) {
+            // Check for resized version
+            if ($size !== 'large') {
+                $path_parts = pathinfo($full_path);
+                $resized_path = $path_parts['dirname'] . '/' . 
+                               $path_parts['filename'] . '_' . $size . '.' . 
+                               $path_parts['extension'];
+                
+                if (file_exists($resized_path)) {
+                    $relative_path = str_replace($root_dir, '', $resized_path);
+                    return $this->base_url . $relative_path;
+                }
             }
+            
+            return $this->base_url . $avatarPath;
         }
         
-        return $this->base_url . $avatarPath;
+        // File doesn't exist, return default
+        return $this->getAvatarUrl(null, $size, $fullName);
     }
 
     private function uploadAvatarOnly($files) {
@@ -312,13 +314,11 @@ class ProfileAPI {
             $stmt->execute([$this->user_id]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             
+            // Generate all avatar URLs
             $avatar_urls = [];
-            foreach (array_keys($this->avatarSizes) as $size) {
+            foreach ($this->avatarSizes as $size => $dimensions) {
                 $avatar_urls[$size] = $this->getAvatarUrl($avatar_path, $size, $user['full_name'] ?? null);
             }
-            
-            // Clear cache
-            $this->clearProfileCache();
             
             echo json_encode([
                 'success' => true,
@@ -330,63 +330,53 @@ class ProfileAPI {
             ]);
             
         } catch (Exception $e) {
-            throw new Exception('Avatar upload failed: ' . $e->getMessage());
+            handleError('Avatar upload failed: ' . $e->getMessage(), 400);
         }
     }
 
     private function processAvatarUpload($file) {
-        try {
-            $allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
-            $max_size = 2 * 1024 * 1024; // 2MB
-            
-            // Check file type
-            $finfo = finfo_open(FILEINFO_MIME_TYPE);
-            $mime_type = finfo_file($finfo, $file['tmp_name']);
-            finfo_close($finfo);
-            
-            if (!in_array($mime_type, ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'])) {
-                throw new Exception('Invalid file type. Allowed: JPG, PNG, GIF, WebP');
-            }
-            
-            if ($file['size'] > $max_size) {
-                throw new Exception('File size exceeds 2MB limit');
-            }
-            
-            $root_dir = dirname(dirname(__FILE__));
-            $upload_dir = $root_dir . '/uploads/avatars/';
-            
-            // Create directories
-            if (!file_exists($upload_dir)) {
-                if (!mkdir($upload_dir, 0755, true)) {
-                    throw new Exception('Failed to create upload directory');
-                }
-            }
-            
-            // Generate unique filename
-            $filename = 'avatar_' . $this->user_id . '_' . time();
-            $original_ext = $this->getExtensionFromMime($mime_type);
-            
-            // Delete old avatar files first
-            $this->deleteOldAvatarFiles();
-            
-            // Save original
-            $original_path = $upload_dir . $filename . '.' . $original_ext;
-            
-            if (!move_uploaded_file($file['tmp_name'], $original_path)) {
-                throw new Exception('Failed to upload file');
-            }
-            
-            // Create resized versions
-            $this->createAvatarResizes($original_path, $filename, $original_ext);
-            
-            // Return relative path
-            $relative_path = '/uploads/avatars/' . $filename . '.' . $original_ext;
-            
-            return $relative_path;
-            
-        } catch (Exception $e) {
-            throw new Exception('Avatar upload failed: ' . $e->getMessage());
+        $allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+        $max_size = 2 * 1024 * 1024; // 2MB
+        
+        // Check file type
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime_type = finfo_file($finfo, $file['tmp_name']);
+        finfo_close($finfo);
+        
+        if (!in_array($mime_type, $allowed_types)) {
+            throw new Exception('Invalid file type. Allowed: JPG, PNG, GIF, WebP');
         }
+        
+        if ($file['size'] > $max_size) {
+            throw new Exception('File size exceeds 2MB limit');
+        }
+        
+        $root_dir = dirname(dirname(__FILE__));
+        $upload_dir = $root_dir . '/uploads/avatars/';
+        
+        // Create directories if they don't exist
+        if (!file_exists($upload_dir)) {
+            mkdir($upload_dir, 0755, true);
+        }
+        
+        // Delete old avatar files first
+        $this->deleteOldAvatarFiles();
+        
+        // Generate unique filename
+        $filename = 'avatar_' . $this->user_id . '_' . time();
+        $extension = $this->getExtensionFromMime($mime_type);
+        $original_path = $upload_dir . $filename . '.' . $extension;
+        
+        // Move uploaded file
+        if (!move_uploaded_file($file['tmp_name'], $original_path)) {
+            throw new Exception('Failed to upload file');
+        }
+        
+        // Create resized versions
+        $this->createAvatarResizes($original_path, $filename, $extension);
+        
+        // Return relative path
+        return '/uploads/avatars/' . $filename . '.' . $extension;
     }
 
     private function getExtensionFromMime($mime_type) {
@@ -403,13 +393,15 @@ class ProfileAPI {
 
     private function createAvatarResizes($original_path, $base_name, $ext) {
         try {
-            // Get original image
+            // Get image info
             $image_info = getimagesize($original_path);
-            $original_width = $image_info[0];
-            $original_height = $image_info[1];
+            if (!$image_info) {
+                return;
+            }
+            
             $mime_type = $image_info['mime'];
             
-            // Create image resource based on type
+            // Create image resource
             switch ($mime_type) {
                 case 'image/jpeg':
                     $source = imagecreatefromjpeg($original_path);
@@ -424,7 +416,7 @@ class ProfileAPI {
                     $source = imagecreatefromwebp($original_path);
                     break;
                 default:
-                    return; // Unsupported type
+                    return;
             }
             
             if (!$source) {
@@ -432,23 +424,26 @@ class ProfileAPI {
             }
             
             $upload_dir = dirname($original_path);
+            $original_width = imagesx($source);
+            $original_height = imagesy($source);
             
             foreach ($this->avatarSizes as $size_name => $dimensions) {
-                if ($size_name === 'large') continue; // Skip large (original)
+                if ($size_name === 'large') continue;
                 
                 list($width, $height) = explode('x', $dimensions);
+                $width = (int)$width;
+                $height = (int)$height;
                 
                 // Create new image
                 $resized = imagecreatetruecolor($width, $height);
                 
-                // Handle transparency for PNG/GIF
+                // Handle transparency
                 if ($mime_type === 'image/png' || $mime_type === 'image/gif') {
                     imagealphablending($resized, false);
                     imagesavealpha($resized, true);
-                    $transparent = imagecolorallocatealpha($resized, 255, 255, 255, 127);
-                    imagefilledrectangle($resized, 0, 0, $width, $height, $transparent);
+                    $transparent = imagecolorallocatealpha($resized, 0, 0, 0, 127);
+                    imagefill($resized, 0, 0, $transparent);
                 } else {
-                    // Fill with white background for JPEG/WebP
                     $white = imagecolorallocate($resized, 255, 255, 255);
                     imagefill($resized, 0, 0, $white);
                 }
@@ -466,7 +461,7 @@ class ProfileAPI {
                     $src_width = $original_height * $target_ratio;
                     $src_height = $original_height;
                 } else {
-                    // Source is taller or equal
+                    // Source is taller
                     $new_width = $width;
                     $new_height = $height;
                     $src_x = 0;
@@ -475,14 +470,14 @@ class ProfileAPI {
                     $src_height = $original_width / $target_ratio;
                 }
                 
-                // Resize image
+                // Resize
                 imagecopyresampled(
                     $resized, $source,
                     0, 0, $src_x, $src_y,
                     $new_width, $new_height, $src_width, $src_height
                 );
                 
-                // Save resized image
+                // Save resized
                 $resized_path = $upload_dir . '/' . $base_name . '_' . $size_name . '.' . $ext;
                 
                 switch ($mime_type) {
@@ -506,7 +501,7 @@ class ProfileAPI {
             imagedestroy($source);
             
         } catch (Exception $e) {
-            // Log error but don't fail
+            // Log but don't fail
             error_log("Avatar resize error: " . $e->getMessage());
         }
     }
@@ -517,15 +512,14 @@ class ProfileAPI {
             $stmt->execute([$this->user_id]);
             $current_avatar = $stmt->fetchColumn();
             
-            if (!$current_avatar || strpos($current_avatar, 'ui-avatars.com') !== false) {
-                return; // Don't delete default avatars
+            if (!$current_avatar) {
+                return;
             }
             
             $root_dir = dirname(dirname(__FILE__));
             $avatar_path = $root_dir . $current_avatar;
             
             if (file_exists($avatar_path)) {
-                // Delete original and all resized versions
                 $path_parts = pathinfo($avatar_path);
                 $pattern = $path_parts['dirname'] . '/' . $path_parts['filename'] . '*.' . $path_parts['extension'];
                 
@@ -541,32 +535,12 @@ class ProfileAPI {
 
     private function deleteAvatar($data) {
         try {
-            // Get current avatar path
-            $stmt = $this->conn->prepare("SELECT avatar FROM users WHERE id = ?");
-            $stmt->execute([$this->user_id]);
-            $current_avatar = $stmt->fetchColumn();
+            // Delete old files
+            $this->deleteOldAvatarFiles();
             
-            if ($current_avatar && strpos($current_avatar, 'ui-avatars.com') === false) {
-                // Delete files
-                $root_dir = dirname(dirname(__FILE__));
-                $avatar_path = $root_dir . $current_avatar;
-                
-                if (file_exists($avatar_path)) {
-                    $path_parts = pathinfo($avatar_path);
-                    $pattern = $path_parts['dirname'] . '/' . $path_parts['filename'] . '*.' . $path_parts['extension'];
-                    
-                    foreach (glob($pattern) as $file) {
-                        @unlink($file);
-                    }
-                }
-            }
-            
-            // Update database to NULL
+            // Update database
             $stmt = $this->conn->prepare("UPDATE users SET avatar = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
             $stmt->execute([$this->user_id]);
-            
-            // Clear cache
-            $this->clearProfileCache();
             
             echo json_encode([
                 'success' => true,
@@ -580,15 +554,8 @@ class ProfileAPI {
 
     // ============ PROFILE FUNCTIONS ============
     private function getUserProfile($light = false) {
-        $cacheKey = 'profile_' . $this->user_id . '_' . ($light ? 'light' : 'full');
-        
-        if (isset($this->cache[$cacheKey])) {
-            echo json_encode($this->cache[$cacheKey]);
-            return;
-        }
-        
         try {
-            // Get user data - MATCHING DATABASE SCHEMA
+            // Get user data - MATCH YOUR EXACT DATABASE SCHEMA
             $query = "SELECT 
                         id, username, email, password, full_name, phone, address, avatar,
                         wallet_balance, member_level, member_points,
@@ -609,14 +576,15 @@ class ProfileAPI {
             // Remove sensitive data
             unset($user['password']);
             
-            // Add avatar URLs for all sizes
-            $user['avatar_urls'] = [];
-            foreach (array_keys($this->avatarSizes) as $size) {
-                $user['avatar_urls'][$size] = $this->getAvatarUrl($user['avatar'], $size, $user['full_name']);
+            // Generate avatar URLs for all sizes
+            $avatar_urls = [];
+            foreach ($this->avatarSizes as $size => $dimensions) {
+                $avatar_urls[$size] = $this->getAvatarUrl($user['avatar'], $size, $user['full_name']);
             }
             
-            // Set default avatar_url for backward compatibility
-            $user['avatar_url'] = $user['avatar_urls']['large'];
+            // Add avatar URLs to user data
+            $user['avatar_urls'] = $avatar_urls;
+            $user['avatar_url'] = $avatar_urls['large'];
             
             $response = [
                 'success' => true,
@@ -627,16 +595,15 @@ class ProfileAPI {
             ];
             
             if (!$light) {
-                // Get recent orders (5 most recent)
+                // Get recent orders
                 $recent_orders = $this->getRecentOrders(5);
                 $response['data']['recent_orders'] = $recent_orders;
                 
-                // Get user addresses count
+                // Get address count
                 $addressCount = $this->getUserAddressCount();
                 $user['address_count'] = $addressCount;
             }
             
-            $this->cache[$cacheKey] = $response;
             echo json_encode($response);
             
         } catch (Exception $e) {
@@ -644,161 +611,11 @@ class ProfileAPI {
         }
     }
 
-    private function updateProfile($data) {
-        $this->updateProfileData($data, null);
-    }
-
-    private function updateProfileWithAvatar($data, $files) {
-        $this->updateProfileData($data, $files);
-    }
-
-    private function updateProfileData($data, $files = null) {
-        try {
-            // Validate required fields
-            if (empty($data['full_name'])) {
-                throw new Exception('Full name is required');
-            }
-            
-            if (empty($data['email'])) {
-                throw new Exception('Email is required');
-            }
-            
-            if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
-                throw new Exception('Invalid email format');
-            }
-            
-            // Check if email exists for another user
-            $checkQuery = "SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1";
-            $stmt = $this->conn->prepare($checkQuery);
-            $stmt->execute([trim($data['email']), $this->user_id]);
-            if ($stmt->fetch()) {
-                throw new Exception('Email already in use by another account');
-            }
-            
-            $this->conn->beginTransaction();
-            
-            try {
-                // Handle avatar upload
-                $avatar_url = null;
-                if ($files && isset($files['avatar']) && $files['avatar']['error'] === UPLOAD_ERR_OK) {
-                    $avatar_url = $this->processAvatarUpload($files['avatar']);
-                }
-                
-                // Build update query - MATCHING DATABASE SCHEMA
-                $updateFields = [];
-                $params = [];
-                
-                // Fields that should be updated
-                $fields = [
-                    'full_name' => trim($data['full_name']),
-                    'email' => trim($data['email'])
-                ];
-                
-                // Optional fields
-                if (isset($data['phone'])) {
-                    $fields['phone'] = trim($data['phone']);
-                }
-                
-                if (isset($data['address'])) {
-                    $fields['address'] = trim($data['address']);
-                }
-                
-                if ($avatar_url) {
-                    $fields['avatar'] = $avatar_url;
-                }
-                
-                // Add timestamp
-                $fields['updated_at'] = 'CURRENT_TIMESTAMP';
-                
-                foreach ($fields as $field => $value) {
-                    if ($value === 'CURRENT_TIMESTAMP') {
-                        $updateFields[] = "$field = CURRENT_TIMESTAMP";
-                    } else {
-                        $updateFields[] = "$field = ?";
-                        $params[] = $value;
-                    }
-                }
-                
-                // Update user
-                $sql = "UPDATE users SET " . implode(", ", $updateFields) . " WHERE id = ?";
-                $params[] = $this->user_id;
-                
-                $stmt = $this->conn->prepare($sql);
-                $stmt->execute($params);
-                
-                $this->conn->commit();
-                
-                // Clear cache
-                $this->clearProfileCache();
-                
-                // Get updated user data
-                $userQuery = "SELECT 
-                                id, username, email, full_name, phone, address, avatar,
-                                wallet_balance, member_level, member_points,
-                                total_orders, rating, verified,
-                                DATE_FORMAT(created_at, '%Y-%m-%d') as join_date,
-                                created_at
-                              FROM users 
-                              WHERE id = ?";
-                
-                $stmt = $this->conn->prepare($userQuery);
-                $stmt->execute([$this->user_id]);
-                $updated_user = $stmt->fetch(PDO::FETCH_ASSOC);
-                
-                // Add avatar URLs
-                $updated_user['avatar_urls'] = [];
-                foreach (array_keys($this->avatarSizes) as $size) {
-                    $updated_user['avatar_urls'][$size] = $this->getAvatarUrl($updated_user['avatar'], $size, $updated_user['full_name']);
-                }
-                $updated_user['avatar_url'] = $updated_user['avatar_urls']['large'];
-                
-                echo json_encode([
-                    'success' => true,
-                    'message' => 'Profile updated successfully',
-                    'data' => [
-                        'user' => $updated_user
-                    ]
-                ]);
-                
-            } catch (Exception $e) {
-                $this->conn->rollBack();
-                throw $e;
-            }
-            
-        } catch (Exception $e) {
-            throw new Exception('Profile update failed: ' . $e->getMessage());
-        }
-    }
-
-    private function clearProfileCache() {
-        $cacheKeys = [
-            'profile_' . $this->user_id . '_light',
-            'profile_' . $this->user_id . '_full',
-            'user_exists_' . $this->user_id
-        ];
-        
-        foreach ($cacheKeys as $key) {
-            unset($this->cache[$key]);
-        }
-    }
-
-    private function getUserAddressCount() {
-        try {
-            $query = "SELECT COUNT(*) as count FROM user_addresses WHERE user_id = ?";
-            $stmt = $this->conn->prepare($query);
-            $stmt->execute([$this->user_id]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            return $result['count'] ?? 0;
-        } catch (Exception $e) {
-            return 0;
-        }
-    }
-
     private function getRecentOrders($limit = 5) {
         try {
             $query = "SELECT 
                         o.id, o.order_number, o.total_amount, o.status, 
-                        DATE_FORMAT(o.created_at, '%Y-%m-%d') as formatted_date,
+                        DATE_FORMAT(o.created_at, '%Y-%m-%d %H:%i') as formatted_date,
                         r.name as restaurant_name,
                         COUNT(oi.id) as item_count
                       FROM orders o
@@ -817,13 +634,190 @@ class ProfileAPI {
         }
     }
 
+    private function getUserAddressCount() {
+        try {
+            $query = "SELECT COUNT(*) as count FROM user_addresses WHERE user_id = ?";
+            $stmt = $this->conn->prepare($query);
+            $stmt->execute([$this->user_id]);
+            $result = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $result['count'] ?? 0;
+        } catch (Exception $e) {
+            return 0;
+        }
+    }
+
+    private function updateProfile($data) {
+        $this->updateProfileData($data, null);
+    }
+
+    private function updateProfileWithAvatar($data, $files) {
+        $this->updateProfileData($data, $files);
+    }
+
+    private function updateProfileData($data, $files = null) {
+        try {
+            $this->conn->beginTransaction();
+            
+            // Handle avatar upload if provided
+            $avatar_path = null;
+            if ($files && isset($files['avatar']) && $files['avatar']['error'] === UPLOAD_ERR_OK) {
+                $avatar_path = $this->processAvatarUpload($files['avatar']);
+            }
+            
+            // Build update fields
+            $updateFields = [];
+            $params = [];
+            
+            // Required fields
+            if (isset($data['full_name'])) {
+                $updateFields[] = "full_name = ?";
+                $params[] = trim($data['full_name']);
+            }
+            
+            if (isset($data['email'])) {
+                // Check if email exists for another user
+                if (!empty($data['email'])) {
+                    $checkQuery = "SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1";
+                    $checkStmt = $this->conn->prepare($checkQuery);
+                    $checkStmt->execute([trim($data['email']), $this->user_id]);
+                    if ($checkStmt->fetch()) {
+                        throw new Exception('Email already in use by another account');
+                    }
+                }
+                
+                $updateFields[] = "email = ?";
+                $params[] = trim($data['email']);
+            }
+            
+            // Optional fields
+            if (isset($data['phone'])) {
+                $updateFields[] = "phone = ?";
+                $params[] = trim($data['phone']);
+            }
+            
+            if (isset($data['address'])) {
+                $updateFields[] = "address = ?";
+                $params[] = trim($data['address']);
+            }
+            
+            // Add avatar if uploaded
+            if ($avatar_path) {
+                $updateFields[] = "avatar = ?";
+                $params[] = $avatar_path;
+            }
+            
+            // Always update timestamp
+            $updateFields[] = "updated_at = CURRENT_TIMESTAMP";
+            
+            if (empty($updateFields)) {
+                throw new Exception('No data to update');
+            }
+            
+            // Execute update
+            $sql = "UPDATE users SET " . implode(", ", $updateFields) . " WHERE id = ?";
+            $params[] = $this->user_id;
+            
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute($params);
+            
+            $this->conn->commit();
+            
+            // Get updated user data
+            $userQuery = "SELECT 
+                            id, username, email, full_name, phone, address, avatar,
+                            wallet_balance, member_level, member_points,
+                            total_orders, rating, verified,
+                            DATE_FORMAT(created_at, '%Y-%m-%d') as join_date,
+                            created_at
+                          FROM users 
+                          WHERE id = ?";
+            
+            $stmt = $this->conn->prepare($userQuery);
+            $stmt->execute([$this->user_id]);
+            $updated_user = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            // Generate avatar URLs
+            $avatar_urls = [];
+            foreach ($this->avatarSizes as $size => $dimensions) {
+                $avatar_urls[$size] = $this->getAvatarUrl($updated_user['avatar'], $size, $updated_user['full_name']);
+            }
+            
+            $updated_user['avatar_urls'] = $avatar_urls;
+            $updated_user['avatar_url'] = $avatar_urls['large'];
+            
+            echo json_encode([
+                'success' => true,
+                'message' => 'Profile updated successfully',
+                'data' => [
+                    'user' => $updated_user
+                ]
+            ]);
+            
+        } catch (Exception $e) {
+            if ($this->conn->inTransaction()) {
+                $this->conn->rollBack();
+            }
+            throw new Exception('Profile update failed: ' . $e->getMessage());
+        }
+    }
+
+    private function changePassword($data) {
+        try {
+            $required = ['current_password', 'new_password', 'confirm_password'];
+            foreach ($required as $field) {
+                if (empty($data[$field])) {
+                    throw new Exception("$field is required");
+                }
+            }
+            
+            if ($data['new_password'] !== $data['confirm_password']) {
+                throw new Exception('New passwords do not match');
+            }
+            
+            if (strlen($data['new_password']) < 6) {
+                throw new Exception('Password must be at least 6 characters');
+            }
+            
+            // Get current password hash
+            $query = "SELECT password FROM users WHERE id = ? LIMIT 1";
+            $stmt = $this->conn->prepare($query);
+            $stmt->execute([$this->user_id]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$user) {
+                throw new Exception('User not found');
+            }
+            
+            // Verify current password
+            if (!password_verify($data['current_password'], $user['password'])) {
+                throw new Exception('Current password is incorrect');
+            }
+            
+            // Hash new password
+            $new_hash = password_hash($data['new_password'], PASSWORD_DEFAULT);
+            
+            // Update password
+            $updateQuery = "UPDATE users SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+            $stmt = $this->conn->prepare($updateQuery);
+            $stmt->execute([$new_hash, $this->user_id]);
+            
+            echo json_encode([
+                'success' => true,
+                'message' => 'Password changed successfully'
+            ]);
+            
+        } catch (Exception $e) {
+            throw new Exception('Failed to change password: ' . $e->getMessage());
+        }
+    }
+
     private function getUserAddresses() {
         try {
             $query = "SELECT 
                         id, title, address, city, state, zip_code,
                         latitude, longitude, is_default, instructions,
                         address_type,
-                        DATE_FORMAT(created_at, '%Y-%m-%d') as created_date
+                        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') as created_date
                       FROM user_addresses 
                       WHERE user_id = ? 
                       ORDER BY is_default DESC, created_at DESC";
@@ -871,22 +865,17 @@ class ProfileAPI {
                       address_type, is_default, instructions, created_at)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)";
             
-            $state = $data['state'] ?? '';
-            $zip_code = $data['zip_code'] ?? '';
-            $address_type = $data['address_type'] ?? 'other';
-            $instructions = $data['instructions'] ?? '';
-            
             $stmt = $this->conn->prepare($query);
             $stmt->execute([
                 $this->user_id,
                 $data['title'],
                 $data['address'],
                 $data['city'],
-                $state,
-                $zip_code,
-                $address_type,
+                $data['state'] ?? '',
+                $data['zip_code'] ?? '',
+                $data['address_type'] ?? 'other',
                 $is_default,
-                $instructions
+                $data['instructions'] ?? ''
             ]);
             
             $address_id = $this->conn->lastInsertId();
@@ -922,30 +911,27 @@ class ProfileAPI {
             
             $this->conn->beginTransaction();
             
-            try {
-                // Clear all defaults
-                $clearQuery = "UPDATE user_addresses SET is_default = 0 WHERE user_id = ?";
-                $stmt = $this->conn->prepare($clearQuery);
-                $stmt->execute([$this->user_id]);
-                
-                // Set new default
-                $updateQuery = "UPDATE user_addresses SET is_default = 1 WHERE id = ? AND user_id = ?";
-                $stmt = $this->conn->prepare($updateQuery);
-                $stmt->execute([$address_id, $this->user_id]);
-                
-                $this->conn->commit();
-                
-                echo json_encode([
-                    'success' => true,
-                    'message' => 'Default address updated successfully'
-                ]);
-                
-            } catch (Exception $e) {
-                $this->conn->rollBack();
-                throw $e;
-            }
+            // Clear all defaults
+            $clearQuery = "UPDATE user_addresses SET is_default = 0 WHERE user_id = ?";
+            $stmt = $this->conn->prepare($clearQuery);
+            $stmt->execute([$this->user_id]);
+            
+            // Set new default
+            $updateQuery = "UPDATE user_addresses SET is_default = 1 WHERE id = ? AND user_id = ?";
+            $stmt = $this->conn->prepare($updateQuery);
+            $stmt->execute([$address_id, $this->user_id]);
+            
+            $this->conn->commit();
+            
+            echo json_encode([
+                'success' => true,
+                'message' => 'Default address updated successfully'
+            ]);
             
         } catch (Exception $e) {
+            if ($this->conn->inTransaction()) {
+                $this->conn->rollBack();
+            }
             throw new Exception('Failed to set default address: ' . $e->getMessage());
         }
     }
@@ -985,11 +971,10 @@ class ProfileAPI {
                 throw new Exception('No fields to update');
             }
             
-            $updates[] = "updated_at = CURRENT_TIMESTAMP";
-            
-            $sql = "UPDATE user_addresses SET " . implode(", ", $updates) . " WHERE id = ? AND user_id = ?";
             $params[] = $address_id;
             $params[] = $this->user_id;
+            
+            $sql = "UPDATE user_addresses SET " . implode(", ", $updates) . " WHERE id = ? AND user_id = ?";
             
             $stmt = $this->conn->prepare($sql);
             $stmt->execute($params);
@@ -1042,8 +1027,8 @@ class ProfileAPI {
 
     private function getUserOrders() {
         try {
-            $page = isset($_GET['page']) ? intval($_GET['page']) : 1;
-            $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 10;
+            $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+            $limit = isset($_GET['limit']) ? max(1, min(100, intval($_GET['limit']))) : 10;
             $status = $_GET['status'] ?? '';
             
             $offset = ($page - 1) * $limit;
@@ -1052,7 +1037,7 @@ class ProfileAPI {
             $where = "WHERE o.user_id = ?";
             $params = [$this->user_id];
             
-            if (!empty($status)) {
+            if (!empty($status) && $status !== 'all') {
                 $where .= " AND o.status = ?";
                 $params[] = $status;
             }
@@ -1101,56 +1086,6 @@ class ProfileAPI {
             
         } catch (Exception $e) {
             throw new Exception('Failed to get orders: ' . $e->getMessage());
-        }
-    }
-
-    private function changePassword($data) {
-        try {
-            $required = ['current_password', 'new_password', 'confirm_password'];
-            foreach ($required as $field) {
-                if (empty($data[$field])) {
-                    throw new Exception("$field is required");
-                }
-            }
-            
-            if ($data['new_password'] !== $data['confirm_password']) {
-                throw new Exception('New passwords do not match');
-            }
-            
-            if (strlen($data['new_password']) < 6) {
-                throw new Exception('Password must be at least 6 characters');
-            }
-            
-            // Get current password hash
-            $query = "SELECT password FROM users WHERE id = ? LIMIT 1";
-            $stmt = $this->conn->prepare($query);
-            $stmt->execute([$this->user_id]);
-            $user = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$user) {
-                throw new Exception('User not found');
-            }
-            
-            // Verify current password
-            if (!password_verify($data['current_password'], $user['password'])) {
-                throw new Exception('Current password is incorrect');
-            }
-            
-            // Hash new password
-            $new_hash = password_hash($data['new_password'], PASSWORD_DEFAULT);
-            
-            // Update password
-            $updateQuery = "UPDATE users SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?";
-            $stmt = $this->conn->prepare($updateQuery);
-            $stmt->execute([$new_hash, $this->user_id]);
-            
-            echo json_encode([
-                'success' => true,
-                'message' => 'Password changed successfully'
-            ]);
-            
-        } catch (Exception $e) {
-            throw new Exception('Failed to change password: ' . $e->getMessage());
         }
     }
 }
