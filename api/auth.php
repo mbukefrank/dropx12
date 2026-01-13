@@ -1,4 +1,7 @@
 <?php
+// auth.php - UPDATED TO MATCH YOUR DATABASE SCHEMA
+ob_start();
+
 /*********************************
  * CORS (Vercel frontend)
  *********************************/
@@ -65,10 +68,10 @@ function handleGetRequest() {
     $conn = $db->getConnection();
 
     if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
+        // Query ONLY fields that exist in your database
         $stmt = $conn->prepare(
             "SELECT id, username, email, full_name, phone, address, avatar,
-                    wallet_balance, member_level, member_points, total_orders,
-                    rating, verified, join_date, created_at
+                    wallet_balance, member_level, member_points, total_orders
              FROM users WHERE id = :id"
         );
         $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -127,7 +130,7 @@ function loginUser($conn, $data) {
         ResponseHandler::error('Identifier and password required', 400);
     }
 
-    // Check if identifier is phone number (contains only digits, +, spaces, dashes, parentheses)
+    // Check if identifier is phone number
     $isPhone = preg_match('/^[\+\s\-\(\)0-9]+$/', $identifier);
     
     if ($isPhone) {
@@ -164,9 +167,6 @@ function loginUser($conn, $data) {
     $_SESSION['user_id'] = $user['id'];
     $_SESSION['logged_in'] = true;
 
-    // Remove password from response
-    unset($user['password']);
-
     ResponseHandler::success([
         'user' => formatUserData($user)
     ], 'Login successful');
@@ -193,7 +193,7 @@ function cleanPhoneNumber($phone) {
 }
 
 /*********************************
- * REGISTER
+ * REGISTER - UPDATED FOR YOUR DATABASE
  *********************************/
 function registerUser($conn, $data) {
     $username = trim($data['username'] ?? '');
@@ -235,41 +235,54 @@ function registerUser($conn, $data) {
         ResponseHandler::error('User already exists', 409);
     }
 
-    // Prepare SQL with phone field
-    $sqlFields = "username, email, password";
-    $sqlValues = ":u, :e, :p";
+    // Get current date for join_date
+    $join_date = date('Y-m-d');
+    
+    // Prepare SQL with ONLY fields that exist in your database
+    $sqlFields = "username, email, password, full_name, phone, wallet_balance, member_level, member_points, total_orders, join_date, created_at";
+    $sqlValues = ":username, :email, :password, :full_name, :phone, :wallet_balance, :member_level, :member_points, :total_orders, :join_date, NOW()";
+    
     $params = [
-        ':u' => $username,
-        ':e' => $email,
-        ':p' => password_hash($password, PASSWORD_DEFAULT)
+        ':username' => $username,
+        ':email' => $email,
+        ':password' => password_hash($password, PASSWORD_DEFAULT),
+        ':full_name' => $username, // Use username as default full_name
+        ':phone' => $phone,
+        ':wallet_balance' => 0.00,
+        ':member_level' => 'Bronze', // Default to Bronze, not Silver
+        ':member_points' => 0, // Start with 0 points
+        ':total_orders' => 0,
+        ':join_date' => $join_date
     ];
-    
-    if ($phone) {
-        $sqlFields .= ", phone";
-        $sqlValues .= ", :phone";
-        $params[':phone'] = $phone;
-    }
-    
-    $sqlFields .= ", full_name, wallet_balance, member_level, member_points, total_orders, rating, verified, join_date, created_at, updated_at";
-    $sqlValues .= ", :f, 0, 'Silver', 100, 0, 5, 0, :jd, NOW(), NOW()";
-    
-    $params[':f'] = $username;
-    $params[':jd'] = date('F j, Y');
 
     $stmt = $conn->prepare(
         "INSERT INTO users ($sqlFields) VALUES ($sqlValues)"
     );
 
-    $stmt->execute($params);
+    try {
+        $stmt->execute($params);
+        
+        $_SESSION['user_id'] = $conn->lastInsertId();
+        $_SESSION['logged_in'] = true;
 
-    $_SESSION['user_id'] = $conn->lastInsertId();
-    $_SESSION['logged_in'] = true;
-
-    ResponseHandler::success([], 'Registration successful', 201);
+        // Get the newly created user
+        $stmt = $conn->prepare("SELECT * FROM users WHERE id = :id");
+        $stmt->execute([':id' => $_SESSION['user_id']]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        ResponseHandler::success([
+            'user' => formatUserData($user)
+        ], 'Registration successful', 201);
+        
+    } catch (PDOException $e) {
+        // Log the actual error for debugging
+        error_log("Registration error: " . $e->getMessage());
+        ResponseHandler::error('Registration failed. Please try again.', 500);
+    }
 }
 
 /*********************************
- * UPDATE PROFILE
+ * UPDATE PROFILE - UPDATED FOR YOUR DATABASE
  *********************************/
 function updateProfile($conn, $data) {
     if (empty($_SESSION['user_id'])) {
@@ -279,6 +292,7 @@ function updateProfile($conn, $data) {
     $fields = [];
     $params = [':id' => $_SESSION['user_id']];
 
+    // Only update fields that exist in your database
     $allowedFields = ['full_name', 'email', 'phone', 'address', 'avatar'];
     
     foreach ($allowedFields as $field) {
@@ -336,12 +350,24 @@ function updateProfile($conn, $data) {
         }
     }
 
-    $fields[] = "updated_at = NOW()";
-
     $sql = "UPDATE users SET " . implode(', ', $fields) . " WHERE id = :id";
-    $conn->prepare($sql)->execute($params);
-
-    ResponseHandler::success([], 'Profile updated');
+    
+    try {
+        $conn->prepare($sql)->execute($params);
+        
+        // Get updated user
+        $stmt = $conn->prepare("SELECT * FROM users WHERE id = :id");
+        $stmt->execute([':id' => $_SESSION['user_id']]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        ResponseHandler::success([
+            'user' => formatUserData($user)
+        ], 'Profile updated');
+        
+    } catch (PDOException $e) {
+        error_log("Update profile error: " . $e->getMessage());
+        ResponseHandler::error('Failed to update profile', 500);
+    }
 }
 
 /*********************************
@@ -352,56 +378,82 @@ function changePassword($conn, $data) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    if (($data['new_password'] ?? '') !== ($data['confirm_password'] ?? '')) {
+    $current_password = $data['current_password'] ?? '';
+    $new_password = $data['new_password'] ?? '';
+    $confirm_password = $data['confirm_password'] ?? '';
+
+    if (!$current_password || !$new_password || !$confirm_password) {
+        ResponseHandler::error('All password fields are required', 400);
+    }
+
+    if ($new_password !== $confirm_password) {
         ResponseHandler::error('Passwords do not match', 400);
+    }
+
+    if (strlen($new_password) < 6) {
+        ResponseHandler::error('New password must be at least 6 characters', 400);
     }
 
     $stmt = $conn->prepare("SELECT password FROM users WHERE id = :id");
     $stmt->execute([':id' => $_SESSION['user_id']]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$user || !password_verify($data['current_password'], $user['password'])) {
+    if (!$user || !password_verify($current_password, $user['password'])) {
         ResponseHandler::error('Current password incorrect', 401);
     }
 
-    $conn->prepare(
-        "UPDATE users SET password = :p, updated_at = NOW() WHERE id = :id"
-    )->execute([
-        ':p' => password_hash($data['new_password'], PASSWORD_DEFAULT),
-        ':id' => $_SESSION['user_id']
-    ]);
+    try {
+        $conn->prepare(
+            "UPDATE users SET password = :p WHERE id = :id"
+        )->execute([
+            ':p' => password_hash($new_password, PASSWORD_DEFAULT),
+            ':id' => $_SESSION['user_id']
+        ]);
 
-    ResponseHandler::success([], 'Password changed');
+        ResponseHandler::success([], 'Password changed successfully');
+        
+    } catch (PDOException $e) {
+        error_log("Change password error: " . $e->getMessage());
+        ResponseHandler::error('Failed to change password', 500);
+    }
 }
 
 /*********************************
  * LOGOUT
  *********************************/
 function logoutUser() {
+    // Clear session data
+    session_unset();
     session_destroy();
+    
+    // Clear session cookie
+    if (isset($_COOKIE[session_name()])) {
+        setcookie(session_name(), '', time() - 3600, '/');
+    }
+    
     ResponseHandler::success([], 'Logout successful');
 }
 
 /*********************************
- * FORMAT USER RESPONSE
+ * FORMAT USER RESPONSE - UPDATED FOR YOUR DATABASE
  *********************************/
 function formatUserData($u) {
     return [
-        'id' => $u['id'],
-        'username' => $u['username'],
-        'email' => $u['email'],
+        'id' => $u['id'] ?? '',
+        'username' => $u['username'] ?? '',
+        'email' => $u['email'] ?? '',
         'phone' => $u['phone'] ?? '',
-        'name' => $u['full_name'] ?: $u['username'],
-        'full_name' => $u['full_name'] ?: $u['username'],
+        'full_name' => $u['full_name'] ?? $u['username'] ?? '',
         'address' => $u['address'] ?? '',
         'avatar' => $u['avatar'] ?? null,
-        'wallet_balance' => (float) ($u['wallet_balance'] ?? 0),
-        'member_level' => $u['member_level'] ?? 'Silver',
-        'member_points' => (int) ($u['member_points'] ?? 100),
-        'total_orders' => (int) ($u['total_orders'] ?? 0),
-        'rating' => (float) ($u['rating'] ?? 5),
-        'verified' => (bool) ($u['verified'] ?? false),
-        'join_date' => $u['join_date'],
-        'created_at' => $u['created_at']
+        'wallet_balance' => isset($u['wallet_balance']) ? (float) $u['wallet_balance'] : 0.00,
+        'member_level' => $u['member_level'] ?? 'Bronze',
+        'member_points' => isset($u['member_points']) ? (int) $u['member_points'] : 0,
+        'total_orders' => isset($u['total_orders']) ? (int) $u['total_orders'] : 0,
+        // These fields might not exist in your database
+        'rating' => isset($u['rating']) ? (float) $u['rating'] : 0.00,
+        'verified' => isset($u['verified']) ? (bool) $u['verified'] : false,
+        'join_date' => $u['join_date'] ?? date('Y-m-d'),
+        'created_at' => $u['created_at'] ?? ''
     ];
 }
