@@ -67,8 +67,8 @@ function handleGetRequest() {
     if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
         $stmt = $conn->prepare(
             "SELECT id, username, email, full_name, phone, address, avatar,
-                    avatar_updated_at, wallet_balance, member_level, member_points, 
-                    total_orders, rating, verified, join_date, created_at, updated_at
+                    avatar_updated_at, wallet_balance, member_level, member_points, total_orders,
+                    rating, verified, join_date, created_at, updated_at
              FROM users WHERE id = :id"
         );
         $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -107,9 +107,6 @@ function handlePostRequest() {
             break;
         case 'update_profile':
             updateProfile($conn, $input);
-            break;
-        case 'update_avatar':
-            updateAvatar($conn, $input);
             break;
         case 'change_password':
             changePassword($conn, $input);
@@ -253,20 +250,17 @@ function registerUser($conn, $data) {
         $params[':phone'] = $phone;
     }
     
-    // Add default values according to new schema
-    $sqlFields .= ", full_name, wallet_balance, member_level, member_points, total_orders, rating, verified, join_date";
-    $sqlValues .= ", :f, 0.00, 'basic', 0, 0, 0.00, 0, :jd";
+    $sqlFields .= ", full_name, wallet_balance, member_level, member_points, total_orders, rating, verified, join_date, created_at, updated_at";
+    $sqlValues .= ", :f, 0.00, 'basic', 0, 0, 0.00, 0, :jd, NOW(), NOW()";
     
-    $params[':f'] = $username; // Use username as initial full_name
+    $params[':f'] = $username;
     $params[':jd'] = date('F j, Y');
 
     $stmt = $conn->prepare(
         "INSERT INTO users ($sqlFields) VALUES ($sqlValues)"
     );
 
-    if (!$stmt->execute($params)) {
-        ResponseHandler::error('Registration failed: ' . implode(', ', $stmt->errorInfo()), 500);
-    }
+    $stmt->execute($params);
 
     $_SESSION['user_id'] = $conn->lastInsertId();
     $_SESSION['logged_in'] = true;
@@ -285,7 +279,7 @@ function updateProfile($conn, $data) {
     $fields = [];
     $params = [':id' => $_SESSION['user_id']];
 
-    $allowedFields = ['full_name', 'email', 'phone', 'address'];
+    $allowedFields = ['full_name', 'email', 'phone', 'address', 'avatar'];
     
     foreach ($allowedFields as $field) {
         if (isset($data[$field]) && $data[$field] !== '') {
@@ -345,73 +339,9 @@ function updateProfile($conn, $data) {
     $fields[] = "updated_at = NOW()";
 
     $sql = "UPDATE users SET " . implode(', ', $fields) . " WHERE id = :id";
-    $stmt = $conn->prepare($sql);
-    
-    if (!$stmt->execute($params)) {
-        ResponseHandler::error('Update failed', 500);
-    }
+    $conn->prepare($sql)->execute($params);
 
-    // Return updated user data
-    $stmt = $conn->prepare(
-        "SELECT id, username, email, full_name, phone, address, avatar,
-                avatar_updated_at, wallet_balance, member_level, member_points, 
-                total_orders, rating, verified, join_date, created_at, updated_at
-         FROM users WHERE id = :id"
-    );
-    $stmt->execute([':id' => $_SESSION['user_id']]);
-    $user = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    ResponseHandler::success([
-        'user' => formatUserData($user)
-    ], 'Profile updated');
-}
-
-/*********************************
- * UPDATE AVATAR (SEPARATE FUNCTION)
- *********************************/
-function updateAvatar($conn, $data) {
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Unauthorized', 401);
-    }
-
-    $avatarUrl = trim($data['avatar'] ?? '');
-    
-    if (!$avatarUrl) {
-        ResponseHandler::error('Avatar URL is required', 400);
-    }
-    
-    // Validate URL format
-    if (!filter_var($avatarUrl, FILTER_VALIDATE_URL)) {
-        ResponseHandler::error('Invalid avatar URL format', 400);
-    }
-    
-    // Optional: Validate image URL by checking headers
-    $headers = @get_headers($avatarUrl);
-    if (!$headers || strpos($headers[0], '200') === false) {
-        // Don't fail, just log or continue
-        error_log("Avatar URL might not be accessible: $avatarUrl");
-    }
-
-    $sql = "UPDATE users SET avatar = :avatar, avatar_updated_at = NOW(), updated_at = NOW() WHERE id = :id";
-    $stmt = $conn->prepare($sql);
-    
-    if (!$stmt->execute([':avatar' => $avatarUrl, ':id' => $_SESSION['user_id']])) {
-        ResponseHandler::error('Avatar update failed', 500);
-    }
-
-    // Return updated user data
-    $stmt = $conn->prepare(
-        "SELECT id, username, email, full_name, phone, address, avatar,
-                avatar_updated_at, wallet_balance, member_level, member_points, 
-                total_orders, rating, verified, join_date, created_at, updated_at
-         FROM users WHERE id = :id"
-    );
-    $stmt->execute([':id' => $_SESSION['user_id']]);
-    $user = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    ResponseHandler::success([
-        'user' => formatUserData($user)
-    ], 'Avatar updated');
+    ResponseHandler::success([], 'Profile updated');
 }
 
 /*********************************
@@ -422,47 +352,26 @@ function changePassword($conn, $data) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    $current_password = $data['current_password'] ?? '';
-    $new_password = $data['new_password'] ?? '';
-    $confirm_password = $data['confirm_password'] ?? '';
-
-    if (!$current_password || !$new_password || !$confirm_password) {
-        ResponseHandler::error('All password fields are required', 400);
-    }
-
-    if ($new_password !== $confirm_password) {
-        ResponseHandler::error('New passwords do not match', 400);
-    }
-
-    if (strlen($new_password) < 6) {
-        ResponseHandler::error('New password must be at least 6 characters', 400);
+    if (($data['new_password'] ?? '') !== ($data['confirm_password'] ?? '')) {
+        ResponseHandler::error('Passwords do not match', 400);
     }
 
     $stmt = $conn->prepare("SELECT password FROM users WHERE id = :id");
     $stmt->execute([':id' => $_SESSION['user_id']]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$user || !password_verify($current_password, $user['password'])) {
-        ResponseHandler::error('Current password is incorrect', 401);
+    if (!$user || !password_verify($data['current_password'], $user['password'])) {
+        ResponseHandler::error('Current password incorrect', 401);
     }
 
-    // Check if new password is same as old password
-    if (password_verify($new_password, $user['password'])) {
-        ResponseHandler::error('New password cannot be the same as current password', 400);
-    }
-
-    $stmt = $conn->prepare(
+    $conn->prepare(
         "UPDATE users SET password = :p, updated_at = NOW() WHERE id = :id"
-    );
-    
-    if (!$stmt->execute([
-        ':p' => password_hash($new_password, PASSWORD_DEFAULT),
+    )->execute([
+        ':p' => password_hash($data['new_password'], PASSWORD_DEFAULT),
         ':id' => $_SESSION['user_id']
-    ])) {
-        ResponseHandler::error('Password change failed', 500);
-    }
+    ]);
 
-    ResponseHandler::success([], 'Password changed successfully');
+    ResponseHandler::success([], 'Password changed');
 }
 
 /*********************************
@@ -478,7 +387,7 @@ function logoutUser() {
  *********************************/
 function formatUserData($u) {
     return [
-        'id' => (int) $u['id'],
+        'id' => $u['id'],
         'username' => $u['username'],
         'email' => $u['email'],
         'phone' => $u['phone'] ?? '',
@@ -494,7 +403,7 @@ function formatUserData($u) {
         'rating' => (float) ($u['rating'] ?? 0.00),
         'verified' => (bool) ($u['verified'] ?? false),
         'join_date' => $u['join_date'] ?? '',
-        'created_at' => $u['created_at'],
-        'updated_at' => $u['updated_at']
+        'created_at' => $u['created_at'] ?? '',
+        'updated_at' => $u['updated_at'] ?? ''
     ];
 }
