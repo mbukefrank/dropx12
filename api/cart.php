@@ -1,5 +1,5 @@
 <?php
-// api/cart.php - Updated with better session handling
+// api/cart.php - Clean production version
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: https://dropx-frontend-seven.vercel.app');
 header('Access-Control-Allow-Credentials: true');
@@ -29,7 +29,7 @@ function jsonResponse($success, $data = null, $message = '', $code = 200) {
     exit();
 }
 
-// Improved session ID handling
+// Session ID handling
 function getSessionId() {
     // Priority 1: X-Session-ID header
     $sessionId = $_SERVER['HTTP_X_SESSION_ID'] ?? null;
@@ -39,14 +39,8 @@ function getSessionId() {
         $sessionId = $_COOKIE['PHPSESSID'];
     }
     
-    // Priority 3: GET parameter (for debugging)
-    if (!$sessionId && isset($_GET['session_id'])) {
-        $sessionId = $_GET['session_id'];
-    }
-    
-    // Priority 4: Create new
+    // Priority 3: Create new
     if (!$sessionId) {
-        // Match existing formats in your database
         $sessionId = bin2hex(random_bytes(12)); // 24 characters
     }
     
@@ -59,14 +53,6 @@ function getSessionId() {
 $method = $_SERVER['REQUEST_METHOD'];
 $userId = $_SESSION['user_id'] ?? null;
 $sessionId = getSessionId();
-
-// Log for debugging
-error_log("=== CART API REQUEST ===");
-error_log("Method: $method");
-error_log("Session ID: $sessionId");
-error_log("User ID: " . ($userId ?? 'null'));
-error_log("GET Params: " . json_encode($_GET));
-error_log("========================");
 
 try {
     $database = new Database();
@@ -120,7 +106,6 @@ try {
     }
     
 } catch (Exception $e) {
-    error_log("Cart API Error: " . $e->getMessage());
     jsonResponse(false, null, 'Server error: ' . $e->getMessage(), 500);
 }
 
@@ -130,21 +115,16 @@ try {
  * Get cart for user/session
  */
 function getCart($conn, $userId, $sessionId, $merchantId = null) {
-    error_log("getCart called - Session: $sessionId, Merchant: " . ($merchantId ?? 'null'));
-    
     // Try to find cart session
     $cartSession = findCartSession($conn, $userId, $sessionId, $merchantId);
     
     if (!$cartSession) {
-        error_log("No cart session found");
         return [
             'session' => null,
             'items' => [],
             'summary' => getEmptySummary()
         ];
     }
-    
-    error_log("Cart session found: ID=" . $cartSession['id'] . ", Restaurant=" . $cartSession['restaurant_id']);
     
     // Get cart items
     $query = "
@@ -167,17 +147,15 @@ function getCart($conn, $userId, $sessionId, $merchantId = null) {
     $stmt->execute([':session_id' => $cartSession['id']]);
     $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    error_log("Found " . count($items) . " items in cart");
-    
     // Calculate totals
     return calculateCartData($items, $cartSession);
 }
 
 /**
- * Find cart session - SIMPLIFIED VERSION
+ * Find cart session
  */
 function findCartSession($conn, $userId, $sessionId, $merchantId = null) {
-    // Strategy 1: Find by session_id (most reliable)
+    // Strategy 1: Find by session_id
     $query = "
         SELECT * FROM cart_sessions 
         WHERE session_id = :session_id 
@@ -192,14 +170,8 @@ function findCartSession($conn, $userId, $sessionId, $merchantId = null) {
     $session = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if ($session) {
-        error_log("Found session by session_id: " . $session['id']);
-        
         // If merchant specified and doesn't match, create new or return null
         if ($merchantId && $session['restaurant_id'] != $merchantId) {
-            error_log("Merchant mismatch. Session has: " . $session['restaurant_id'] . ", Requested: $merchantId");
-            
-            // Return null to allow creation of new session for different merchant
-            // Or you could return the session anyway and let frontend handle it
             return null;
         }
         
@@ -208,11 +180,9 @@ function findCartSession($conn, $userId, $sessionId, $merchantId = null) {
     
     // Strategy 2: If not found and merchant provided, create new
     if ($merchantId) {
-        error_log("Creating new session for merchant: $merchantId");
         return createCartSession($conn, $userId, $sessionId, $merchantId);
     }
     
-    error_log("No session found and no merchant specified");
     return null;
 }
 
@@ -231,7 +201,6 @@ function createCartSession($conn, $userId, $sessionId, $merchantId) {
     $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$merchant) {
-        error_log("Merchant not found or inactive: $merchantId");
         return null;
     }
     
@@ -264,11 +233,9 @@ function createCartSession($conn, $userId, $sessionId, $merchantId) {
         $getStmt->execute([':id' => $cartSessionId]);
         $session = $getStmt->fetch(PDO::FETCH_ASSOC);
         
-        error_log("Created new cart session: ID=$cartSessionId");
         return $session;
         
     } catch (Exception $e) {
-        error_log("Failed to create cart session: " . $e->getMessage());
         return null;
     }
 }
@@ -334,7 +301,7 @@ function calculateCartData($items, $cartSession) {
 }
 
 /**
- * Add item to cart - SIMPLIFIED
+ * Add item to cart
  */
 function addToCart($conn, $userId, $sessionId, $data) {
     $menuItemId = intval($data['menu_item_id'] ?? 0);
