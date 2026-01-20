@@ -1,5 +1,5 @@
 <?php
-// api/cart.php - FIXED SQL AMBIGUITY ERRORS
+// api/cart.php - FIXED SQL SYNTAX ERRORS
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: https://dropx-frontend-seven.vercel.app');
 header('Access-Control-Allow-Credentials: true');
@@ -125,7 +125,7 @@ function getCart($conn, $userId, $sessionId, $merchantId = null) {
         return getEmptyCartData();
     }
     
-    // Get cart items - FIXED: Specify table aliases for ambiguous columns
+    // Get cart items
     $query = "
         SELECT 
             ci.*,
@@ -167,7 +167,7 @@ function findCartSession($conn, $userId, $sessionId, $merchantId = null) {
         $params[':merchant_id'] = $merchantId;
     }
     
-    // FIXED: Use table alias for status
+    // Use table alias for status
     $conditions[] = "cs.status = 'active'";
     $conditions[] = "cs.expires_at > NOW()";
     
@@ -178,7 +178,7 @@ function findCartSession($conn, $userId, $sessionId, $merchantId = null) {
             r.delivery_time,
             r.image as merchant_image,
             r.address as merchant_address,
-            r.status as restaurant_status  // Add restaurant status separately
+            r.status as restaurant_status
         FROM cart_sessions cs
         LEFT JOIN restaurants r ON cs.restaurant_id = r.id
         WHERE " . implode(' AND ', $conditions) . "
@@ -201,7 +201,7 @@ function findCartSession($conn, $userId, $sessionId, $merchantId = null) {
  * Create new cart session for user
  */
 function createCartSession($conn, $userId, $sessionId, $merchantId) {
-    // Verify merchant exists and is active - FIXED: Table alias
+    // Verify merchant exists and is active
     $merchantQuery = "
         SELECT 
             id, name, delivery_fee, min_order_amount, 
@@ -286,7 +286,7 @@ function addToCart($conn, $userId, $sessionId, $data) {
         jsonResponse(false, null, 'Menu item and merchant are required', 400);
     }
     
-    // Get menu item with validation - FIXED: Table aliases
+    // Get menu item with validation
     $menuQuery = "
         SELECT 
             mi.*, 
@@ -428,7 +428,7 @@ function updateCartItem($conn, $userId, $sessionId, $data) {
         jsonResponse(false, null, 'Cart item ID is required', 400);
     }
     
-    // Get cart item with user validation - FIXED: Table alias
+    // Get cart item with user validation
     $query = "
         SELECT 
             ci.*, 
@@ -509,7 +509,7 @@ function removeFromCart($conn, $userId, $sessionId, $data) {
         jsonResponse(false, null, 'Cart item ID is required', 400);
     }
     
-    // Get cart item with user validation - FIXED: Table alias
+    // Get cart item with user validation
     $query = "
         SELECT 
             cs.restaurant_id as merchant_id,
