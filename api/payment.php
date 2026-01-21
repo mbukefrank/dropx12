@@ -182,6 +182,9 @@ class PaymentAPI {
                 
                 // Calculate balance after payment
                 $balanceAfter = $balanceBefore - $amount;
+                
+                // Convert order_id to integer or null - FIXED
+                $orderIdValue = ($orderId !== null && $orderId !== '' && is_numeric($orderId)) ? (int)$orderId : null;
 
                 // 1. Deduct from user's wallet
                 $stmt = $this->conn->prepare("
@@ -204,7 +207,7 @@ class PaymentAPI {
                 ");
                 
                 $metadata = [
-                    'order_id' => $orderId,
+                    'order_id' => $orderIdValue,
                     'user_id' => $this->user_id,
                     'merchant_id' => $merchantId,
                     'balance_before' => $balanceBefore,
@@ -239,7 +242,7 @@ class PaymentAPI {
                     $referenceId,
                     $balanceBefore,
                     $balanceAfter,
-                    $orderId
+                    $orderIdValue  // Use converted value here
                 ]);
 
                 // 4. Add to merchant's wallet if merchant exists
@@ -248,8 +251,8 @@ class PaymentAPI {
                 }
 
                 // 5. If order ID provided, update order payment status
-                if ($orderId) {
-                    $this->updateOrderPayment($orderId, $paymentId, $referenceId);
+                if ($orderIdValue) {
+                    $this->updateOrderPayment($orderIdValue, $paymentId, $referenceId);
                 }
 
                 $this->conn->commit();
@@ -271,7 +274,7 @@ class PaymentAPI {
                         'balance_after' => $balanceAfter,
                         'current_balance' => $newBalance,
                         'merchant_id' => $merchantId,
-                        'order_id' => $orderId,
+                        'order_id' => $orderIdValue,
                         'timestamp' => date('Y-m-d H:i:s')
                     ]
                 ]);
