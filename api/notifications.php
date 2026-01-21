@@ -79,13 +79,26 @@ class NotificationAPI {
 
     public function handleRequest() {
         $method = $_SERVER['REQUEST_METHOD'];
-        $input = $method === 'GET' ? $_GET : json_decode(file_get_contents('php://input'), true);
         
-        $action = $input['action'] ?? '';
+        // Get input based on method with better handling
+        $input = [];
         
-        if (empty($action)) {
-            $this->sendError('No action specified', 400);
+        if ($method === 'GET') {
+            $input = $_GET;
+        } else {
+            // Handle POST, PUT, DELETE
+            $rawInput = file_get_contents('php://input');
+            if (!empty($rawInput)) {
+                $input = json_decode($rawInput, true);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    // Try form data if JSON fails
+                    parse_str($rawInput, $input);
+                }
+            }
         }
+        
+        // Determine action with intelligent defaults
+        $action = $this->determineAction($method, $input);
 
         try {
             switch ($action) {
@@ -121,6 +134,53 @@ class NotificationAPI {
             }
         } catch (Exception $e) {
             $this->sendError('Request failed: ' . $e->getMessage(), 500);
+        }
+    }
+
+    private function determineAction($method, $input) {
+        // First, check if action is explicitly provided
+        if (!empty($input['action'])) {
+            return $input['action'];
+        }
+        
+        // Determine action based on HTTP method and input
+        switch ($method) {
+            case 'GET':
+                // Check for specific query parameters
+                if (isset($input['count']) && $input['count'] === 'true') {
+                    return 'get_unread_count';
+                }
+                if (isset($input['stats']) && $input['stats'] === 'true') {
+                    return 'get_stats';
+                }
+                if (isset($input['preferences']) && $input['preferences'] === 'true') {
+                    return 'get_preferences';
+                }
+                // Default for GET: get notifications
+                return 'get_notifications';
+                
+            case 'POST':
+                // Check for common patterns from React
+                if (isset($input['markAll']) && $input['markAll'] === true) {
+                    return 'mark_all_as_read';
+                }
+                if (isset($input['mark_all']) && $input['mark_all'] === true) {
+                    return 'mark_all_as_read';
+                }
+                if (!empty($input['notification_id']) || !empty($input['notificationId'])) {
+                    return 'mark_as_read';
+                }
+                if (!empty($input['preferences'])) {
+                    return 'update_preferences';
+                }
+                // Default for POST: create notification
+                return 'create_notification';
+                
+            case 'DELETE':
+                return 'clear_all';
+                
+            default:
+                return '';
         }
     }
 
@@ -201,6 +261,22 @@ class NotificationAPI {
                 ];
             }, $notifications);
             
+            // For header/footer, return a simpler structure
+            $isHeaderRequest = isset($data['header']) && $data['header'] === 'true';
+            $isSimpleRequest = isset($data['simple']) && $data['simple'] === 'true';
+            
+            if ($isHeaderRequest || $isSimpleRequest) {
+                // Return minimal data for header (without pagination)
+                echo json_encode([
+                    'success' => true,
+                    'data' => [
+                        'notifications' => $formattedNotifications
+                    ]
+                ]);
+                return;
+            }
+            
+            // Full response with pagination
             echo json_encode([
                 'success' => true,
                 'data' => [
@@ -245,7 +321,8 @@ class NotificationAPI {
 
     private function markAsRead($data) {
         try {
-            $notificationId = $data['notification_id'] ?? null;
+            // Support both notification_id and notificationId naming
+            $notificationId = $data['notification_id'] ?? $data['notificationId'] ?? null;
             
             if (!$notificationId) {
                 $this->sendError('Notification ID is required', 400);
@@ -440,25 +517,11 @@ class NotificationAPI {
             
             $notificationId = $this->conn->lastInsertId();
             
-            // Get the created notification
-            $stmt = $this->conn->prepare("
-                SELECT * FROM notifications WHERE id = ?
-            ");
-            $stmt->execute([$notificationId]);
-            $notification = $stmt->fetch(PDO::FETCH_ASSOC);
-            
             echo json_encode([
                 'success' => true,
                 'message' => 'Notification created',
                 'data' => [
-                    'notification' => [
-                        'id' => (int)$notification['id'],
-                        'type' => $notification['type'],
-                        'title' => $notification['title'],
-                        'message' => $notification['message'],
-                        'read' => (bool)$notification['is_read'],
-                        'created_at' => $notification['created_at']
-                    ]
+                    'notification_id' => (int)$notificationId
                 ]
             ]);
             
