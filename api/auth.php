@@ -1,19 +1,13 @@
 <?php
 /*********************************
- * CORS (Vercel frontend)
+ * CORS Configuration
  *********************************/
-$frontend = 'https://dropx-frontend-seven.vercel.app';
-
-if (isset($_SERVER['HTTP_ORIGIN']) && $_SERVER['HTTP_ORIGIN'] === $frontend) {
-    header("Access-Control-Allow-Origin: $frontend");
-}
-
+header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
 header("Content-Type: application/json; charset=UTF-8");
 
-// Handle OPTIONS preflight
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit();
@@ -24,19 +18,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
  *********************************/
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
-        'lifetime' => 86400 * 30, // 30 days
+        'lifetime' => 86400 * 30,
         'path' => '/',
         'domain' => '',
-        'secure' => true,        // HTTPS required on Render
+        'secure' => true,
         'httponly' => true,
-        'samesite' => 'None'     // Required for cross-domain cookies
+        'samesite' => 'None'
     ]);
     session_start();
 }
 
-/*********************************
- * DEPENDENCIES
- *********************************/
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
@@ -66,9 +57,9 @@ function handleGetRequest() {
 
     if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
         $stmt = $conn->prepare(
-            "SELECT id, username, email, full_name, phone, address, avatar,
-                    avatar_updated_at, wallet_balance, member_level, member_points, total_orders,
-                    rating, verified, join_date, created_at, updated_at
+            "SELECT id, full_name, email, phone, address, city, gender, avatar,
+                    wallet_balance, member_level, member_points, total_orders,
+                    rating, verified, member_since, created_at, updated_at
              FROM users WHERE id = :id"
         );
         $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -92,7 +83,11 @@ function handlePostRequest() {
     $db = new Database();
     $conn = $db->getConnection();
 
-    $input = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+    $input = json_decode(file_get_contents('php://input'), true);
+    if (!$input) {
+        $input = $_POST;
+    }
+    
     $action = $input['action'] ?? '';
 
     switch ($action) {
@@ -111,42 +106,49 @@ function handlePostRequest() {
         case 'change_password':
             changePassword($conn, $input);
             break;
+        case 'forgot_password':
+            forgotPassword($conn, $input);
+            break;
         default:
             ResponseHandler::error('Invalid action', 400);
     }
 }
 
 /*********************************
- * LOGIN - ACCEPTS EMAIL OR PHONE
+ * LOGIN - EXACTLY AS FLUTTER SENDS
  *********************************/
 function loginUser($conn, $data) {
+    // Your Flutter sends: identifier (email or phone) and password
     $identifier = trim($data['identifier'] ?? '');
     $password = $data['password'] ?? '';
+    $rememberMe = $data['remember_me'] ?? false;
 
     if (!$identifier || !$password) {
-        ResponseHandler::error('Identifier and password required', 400);
+        ResponseHandler::error('Email/phone and password required', 400);
     }
 
-    // Check if identifier is phone number (contains only digits, +, spaces, dashes, parentheses)
-    $isPhone = preg_match('/^[\+\s\-\(\)0-9]+$/', $identifier);
-    
+    // Check if identifier is email or phone (same logic as Flutter)
+    $isPhone = preg_match('/^[\+]?[0-9\s\-\(\)]+$/', $identifier);
+    $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL);
+
+    if (!$isPhone && !$isEmail) {
+        ResponseHandler::error('Please enter a valid email or phone number', 400);
+    }
+
     if ($isPhone) {
-        // Phone login - clean the phone number
+        // Clean phone number (remove all non-digit except leading +)
         $phone = cleanPhoneNumber($identifier);
-        
         if (!$phone || strlen($phone) < 10) {
             ResponseHandler::error('Invalid phone number', 400);
         }
         
-        // Query with phone number
+        // Search by phone
         $stmt = $conn->prepare("SELECT * FROM users WHERE phone = :phone");
         $stmt->execute([':phone' => $phone]);
     } else {
-        // Email/username login
-        $stmt = $conn->prepare(
-            "SELECT * FROM users WHERE email = :id OR username = :id"
-        );
-        $stmt->execute([':id' => $identifier]);
+        // Search by email
+        $stmt = $conn->prepare("SELECT * FROM users WHERE email = :email");
+        $stmt->execute([':email' => $identifier]);
     }
     
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -155,7 +157,6 @@ function loginUser($conn, $data) {
         ResponseHandler::error('Invalid credentials', 401);
     }
     
-    // Verify password
     if (!password_verify($password, $user['password'])) {
         ResponseHandler::error('Invalid credentials', 401);
     }
@@ -163,6 +164,11 @@ function loginUser($conn, $data) {
     // Set session
     $_SESSION['user_id'] = $user['id'];
     $_SESSION['logged_in'] = true;
+
+    // Update last login
+    $conn->prepare(
+        "UPDATE users SET last_login = NOW() WHERE id = :id"
+    )->execute([':id' => $user['id']]);
 
     // Remove password from response
     unset($user['password']);
@@ -173,175 +179,179 @@ function loginUser($conn, $data) {
 }
 
 /*********************************
- * CLEAN PHONE NUMBER
- *********************************/
-function cleanPhoneNumber($phone) {
-    // Remove all non-digit characters except leading +
-    $phone = trim($phone);
-    
-    // If starts with +, keep it
-    $hasPlus = substr($phone, 0, 1) === '+';
-    
-    // Remove all non-digit characters
-    $digits = preg_replace('/\D/', '', $phone);
-    
-    if ($hasPlus) {
-        return '+' . $digits;
-    }
-    
-    return $digits;
-}
-
-/*********************************
- * REGISTER
+ * REGISTER - EXACT FIELDS FROM FLUTTER SIGNUPSCREEN
  *********************************/
 function registerUser($conn, $data) {
-    $username = trim($data['username'] ?? '');
+    // Your Flutter SignUpScreen sends these exact fields:
+    $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
-    $password = $data['password'] ?? '';
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
+    $password = $data['password'] ?? '';
+    $address = trim($data['address'] ?? '');
+    $city = trim($data['city'] ?? '');
+    $gender = $data['gender'] ?? null;
 
-    if (!$username || !$email || !$password) {
-        ResponseHandler::error('Username, email and password required', 400);
+    // Validation (matching Flutter validation)
+    if (!$fullName) {
+        ResponseHandler::error('Full name is required', 400);
     }
-
-    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        ResponseHandler::error('Invalid email format', 400);
+    
+    if (!$email) {
+        ResponseHandler::error('Email address is required', 400);
     }
-
+    
+    if (!$filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        ResponseHandler::error('Enter a valid email address', 400);
+    }
+    
+    if ($phone && strlen($phone) < 10) {
+        ResponseHandler::error('Enter a valid phone number', 400);
+    }
+    
+    if (!$password) {
+        ResponseHandler::error('Password is required', 400);
+    }
+    
     if (strlen($password) < 6) {
         ResponseHandler::error('Password must be at least 6 characters', 400);
     }
 
-    // Check if phone is valid (if provided)
-    if ($phone && strlen($phone) < 10) {
-        ResponseHandler::error('Invalid phone number', 400);
-    }
-
-    // Check for existing user
-    $check = $conn->prepare(
-        "SELECT id FROM users WHERE email = :email OR username = :username"
-        . ($phone ? " OR phone = :phone" : "")
-    );
+    // Check if user already exists (email or phone)
+    $checkSql = "SELECT id FROM users WHERE email = :email";
+    $params = [':email' => $email];
     
-    $params = [':email' => $email, ':username' => $username];
     if ($phone) {
+        $checkSql .= " OR phone = :phone";
         $params[':phone'] = $phone;
     }
     
+    $check = $conn->prepare($checkSql);
     $check->execute($params);
-
-    if ($check->rowCount()) {
-        ResponseHandler::error('User already exists', 409);
+    
+    if ($check->rowCount() > 0) {
+        ResponseHandler::error('User already exists with this email or phone', 409);
     }
 
-    // Prepare SQL with phone field
-    $sqlFields = "username, email, password";
-    $sqlValues = ":u, :e, :p";
-    $params = [
-        ':u' => $username,
-        ':e' => $email,
-        ':p' => password_hash($password, PASSWORD_DEFAULT)
-    ];
-    
-    if ($phone) {
-        $sqlFields .= ", phone";
-        $sqlValues .= ", :phone";
-        $params[':phone'] = $phone;
-    }
-    
-    $sqlFields .= ", full_name, wallet_balance, member_level, member_points, total_orders, rating, verified, join_date, created_at, updated_at";
-    $sqlValues .= ", :f, 0.00, 'basic', 0, 0, 0.00, 0, :jd, NOW(), NOW()";
-    
-    $params[':f'] = $username;
-    $params[':jd'] = date('F j, Y');
-
+    // Create user (no username field, just full_name)
     $stmt = $conn->prepare(
-        "INSERT INTO users ($sqlFields) VALUES ($sqlValues)"
+        "INSERT INTO users (full_name, email, phone, password, address, city, gender, 
+                           wallet_balance, member_level, member_points, total_orders, 
+                           rating, verified, member_since, created_at, updated_at)
+         VALUES (:full_name, :email, :phone, :password, :address, :city, :gender,
+                 0.00, 'basic', 0, 0, 0.00, 0, :member_since, NOW(), NOW())"
     );
+    
+    $stmt->execute([
+        ':full_name' => $fullName,
+        ':email' => $email,
+        ':phone' => $phone,
+        ':password' => password_hash($password, PASSWORD_DEFAULT),
+        ':address' => $address,
+        ':city' => $city,
+        ':gender' => $gender,
+        ':member_since' => date('M d, Y') // Format: Jan 15, 2023 like Flutter
+    ]);
 
-    $stmt->execute($params);
+    // Get the new user
+    $userId = $conn->lastInsertId();
+    $stmt = $conn->prepare(
+        "SELECT id, full_name, email, phone, address, city, gender, avatar,
+                wallet_balance, member_level, member_points, total_orders,
+                rating, verified, member_since, created_at, updated_at
+         FROM users WHERE id = :id"
+    );
+    $stmt->execute([':id' => $userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    $_SESSION['user_id'] = $conn->lastInsertId();
+    // Set session
+    $_SESSION['user_id'] = $userId;
     $_SESSION['logged_in'] = true;
 
-    ResponseHandler::success([], 'Registration successful', 201);
+    ResponseHandler::success([
+        'user' => formatUserData($user)
+    ], 'Registration successful', 201);
 }
 
 /*********************************
- * UPDATE PROFILE
+ * UPDATE PROFILE - MATCHES FLUTTER EDIT PROFILE
  *********************************/
 function updateProfile($conn, $data) {
     if (empty($_SESSION['user_id'])) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    $fields = [];
-    $params = [':id' => $_SESSION['user_id']];
+    // Fields from Flutter EditProfileScreen
+    $fullName = trim($data['full_name'] ?? '');
+    $email = trim($data['email'] ?? '');
+    $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
+    $address = trim($data['address'] ?? '');
+    $city = trim($data['city'] ?? '');
+    $avatar = $data['avatar'] ?? null;
 
-    $allowedFields = ['full_name', 'email', 'phone', 'address', 'avatar'];
+    // Validation
+    if (!$fullName) {
+        ResponseHandler::error('Full name is required', 400);
+    }
     
-    foreach ($allowedFields as $field) {
-        if (isset($data[$field]) && $data[$field] !== '') {
-            $value = trim($data[$field]);
-            
-            // Special handling for phone
-            if ($field === 'phone') {
-                $value = cleanPhoneNumber($value);
-                if ($value && strlen($value) < 10) {
-                    ResponseHandler::error('Invalid phone number', 400);
-                }
-            }
-            
-            // Special handling for email
-            if ($field === 'email' && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
-                ResponseHandler::error('Invalid email format', 400);
-            }
-            
-            $fields[] = "$field = :$field";
-            $params[":$field"] = $value;
-        }
+    if (!$email) {
+        ResponseHandler::error('Email is required', 400);
+    }
+    
+    if (!$filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        ResponseHandler::error('Enter a valid email address', 400);
+    }
+    
+    if ($phone && strlen($phone) < 10) {
+        ResponseHandler::error('Enter a valid phone number', 400);
     }
 
-    if (!$fields) {
-        ResponseHandler::error('Nothing to update', 400);
+    // Check if email or phone already exists (excluding current user)
+    $checkSql = "SELECT id FROM users WHERE (email = :email OR phone = :phone) AND id != :id";
+    $check = $conn->prepare($checkSql);
+    $check->execute([
+        ':email' => $email,
+        ':phone' => $phone,
+        ':id' => $_SESSION['user_id']
+    ]);
+    
+    if ($check->rowCount() > 0) {
+        ResponseHandler::error('Email or phone already in use', 409);
     }
 
-    // Check if new email or phone already exists
-    if (isset($params[':email']) || isset($params[':phone'])) {
-        $checkSql = "SELECT id FROM users WHERE (";
-        $checkParams = [];
-        
-        if (isset($params[':email'])) {
-            $checkSql .= "email = :email";
-            $checkParams[':email'] = $params[':email'];
-        }
-        
-        if (isset($params[':phone'])) {
-            if (isset($params[':email'])) {
-                $checkSql .= " OR ";
-            }
-            $checkSql .= "phone = :phone";
-            $checkParams[':phone'] = $params[':phone'];
-        }
-        
-        $checkSql .= ") AND id != :id";
-        $checkParams[':id'] = $params[':id'];
-        
-        $check = $conn->prepare($checkSql);
-        $check->execute($checkParams);
-        
-        if ($check->rowCount()) {
-            ResponseHandler::error('Email or phone already in use', 409);
-        }
-    }
+    // Update user
+    $stmt = $conn->prepare(
+        "UPDATE users SET 
+            full_name = :full_name,
+            email = :email,
+            phone = :phone,
+            address = :address,
+            city = :city,
+            updated_at = NOW()
+         WHERE id = :id"
+    );
+    
+    $stmt->execute([
+        ':full_name' => $fullName,
+        ':email' => $email,
+        ':phone' => $phone,
+        ':address' => $address,
+        ':city' => $city,
+        ':id' => $_SESSION['user_id']
+    ]);
 
-    $fields[] = "updated_at = NOW()";
+    // Get updated user
+    $stmt = $conn->prepare(
+        "SELECT id, full_name, email, phone, address, city, gender, avatar,
+                wallet_balance, member_level, member_points, total_orders,
+                rating, verified, member_since, created_at, updated_at
+         FROM users WHERE id = :id"
+    );
+    $stmt->execute([':id' => $_SESSION['user_id']]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    $sql = "UPDATE users SET " . implode(', ', $fields) . " WHERE id = :id";
-    $conn->prepare($sql)->execute($params);
-
-    ResponseHandler::success([], 'Profile updated');
+    ResponseHandler::success([
+        'user' => formatUserData($user)
+    ], 'Profile updated successfully');
 }
 
 /*********************************
@@ -352,26 +362,94 @@ function changePassword($conn, $data) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    if (($data['new_password'] ?? '') !== ($data['confirm_password'] ?? '')) {
-        ResponseHandler::error('Passwords do not match', 400);
+    $currentPassword = $data['current_password'] ?? '';
+    $newPassword = $data['new_password'] ?? '';
+    $confirmPassword = $data['confirm_password'] ?? '';
+
+    if (!$currentPassword || !$newPassword || !$confirmPassword) {
+        ResponseHandler::error('All password fields are required', 400);
     }
 
+    if ($newPassword !== $confirmPassword) {
+        ResponseHandler::error('New passwords do not match', 400);
+    }
+
+    if (strlen($newPassword) < 6) {
+        ResponseHandler::error('Password must be at least 6 characters', 400);
+    }
+
+    // Get current user password
     $stmt = $conn->prepare("SELECT password FROM users WHERE id = :id");
     $stmt->execute([':id' => $_SESSION['user_id']]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$user || !password_verify($data['current_password'], $user['password'])) {
-        ResponseHandler::error('Current password incorrect', 401);
+    if (!$user || !password_verify($currentPassword, $user['password'])) {
+        ResponseHandler::error('Current password is incorrect', 401);
     }
 
-    $conn->prepare(
-        "UPDATE users SET password = :p, updated_at = NOW() WHERE id = :id"
-    )->execute([
-        ':p' => password_hash($data['new_password'], PASSWORD_DEFAULT),
+    // Update password
+    $stmt = $conn->prepare(
+        "UPDATE users SET password = :password, updated_at = NOW() WHERE id = :id"
+    );
+    $stmt->execute([
+        ':password' => password_hash($newPassword, PASSWORD_DEFAULT),
         ':id' => $_SESSION['user_id']
     ]);
 
-    ResponseHandler::success([], 'Password changed');
+    ResponseHandler::success([], 'Password changed successfully');
+}
+
+/*********************************
+ * FORGOT PASSWORD
+ *********************************/
+function forgotPassword($conn, $data) {
+    $identifier = trim($data['identifier'] ?? '');
+
+    if (!$identifier) {
+        ResponseHandler::error('Email or phone number is required', 400);
+    }
+
+    // Check if identifier is email or phone
+    $isPhone = preg_match('/^[\+]?[0-9\s\-\(\)]+$/', $identifier);
+    $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL);
+
+    if (!$isPhone && !$isEmail) {
+        ResponseHandler::error('Please enter a valid email or phone number', 400);
+    }
+
+    if ($isPhone) {
+        $phone = cleanPhoneNumber($identifier);
+        $stmt = $conn->prepare("SELECT id, email FROM users WHERE phone = :phone");
+        $stmt->execute([':phone' => $phone]);
+    } else {
+        $stmt = $conn->prepare("SELECT id, email FROM users WHERE email = :email");
+        $stmt->execute([':email' => $identifier]);
+    }
+    
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$user) {
+        // For security, don't reveal if user exists
+        ResponseHandler::success([], 'If your account exists, you will receive reset instructions');
+    }
+
+    // Generate reset token (in production, send actual email/SMS)
+    $resetToken = bin2hex(random_bytes(32));
+    $expiresAt = date('Y-m-d H:i:s', time() + 3600); // 1 hour expiry
+    
+    $stmt = $conn->prepare(
+        "UPDATE users SET 
+            reset_token = :token,
+            reset_token_expires = :expires
+         WHERE id = :id"
+    );
+    $stmt->execute([
+        ':token' => $resetToken,
+        ':expires' => $expiresAt,
+        ':id' => $user['id']
+    ]);
+
+    ResponseHandler::success([], 'Reset instructions sent to your email/phone');
 }
 
 /*********************************
@@ -383,26 +461,41 @@ function logoutUser() {
 }
 
 /*********************************
- * FORMAT USER RESPONSE
+ * CLEAN PHONE NUMBER
+ *********************************/
+function cleanPhoneNumber($phone) {
+    $phone = trim($phone);
+    $hasPlus = substr($phone, 0, 1) === '+';
+    $digits = preg_replace('/\D/', '', $phone);
+    
+    if ($hasPlus) {
+        return '+' . $digits;
+    }
+    
+    return $digits;
+}
+
+/*********************************
+ * FORMAT USER DATA FOR FLUTTER
  *********************************/
 function formatUserData($u) {
     return [
         'id' => $u['id'],
-        'username' => $u['username'],
-        'email' => $u['email'],
+        'name' => $u['full_name'] ?: 'User',
+        'full_name' => $u['full_name'] ?: 'User',
+        'email' => $u['email'] ?? '',
         'phone' => $u['phone'] ?? '',
-        'name' => $u['full_name'] ?: $u['username'],
-        'full_name' => $u['full_name'] ?: $u['username'],
         'address' => $u['address'] ?? '',
+        'city' => $u['city'] ?? '',
+        'gender' => $u['gender'] ?? '',
         'avatar' => $u['avatar'] ?? null,
-        'avatar_updated_at' => $u['avatar_updated_at'] ?? null,
         'wallet_balance' => (float) ($u['wallet_balance'] ?? 0.00),
         'member_level' => $u['member_level'] ?? 'basic',
         'member_points' => (int) ($u['member_points'] ?? 0),
         'total_orders' => (int) ($u['total_orders'] ?? 0),
         'rating' => (float) ($u['rating'] ?? 0.00),
         'verified' => (bool) ($u['verified'] ?? false),
-        'join_date' => $u['join_date'] ?? '',
+        'member_since' => $u['member_since'] ?? date('M d, Y'),
         'created_at' => $u['created_at'] ?? '',
         'updated_at' => $u['updated_at'] ?? ''
     ];
