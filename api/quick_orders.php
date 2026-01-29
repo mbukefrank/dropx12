@@ -127,7 +127,7 @@ function getQuickOrdersList($conn, $baseUrl) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // Get quick orders
+    // Get quick orders - CHANGED: Get single price from items instead of price_range
     $sql = "SELECT 
                 qo.id,
                 qo.title,
@@ -138,7 +138,15 @@ function getQuickOrdersList($conn, $baseUrl) {
                 qo.category,
                 qo.description,
                 qo.delivery_time,
-                qo.price_range,
+                -- Get single price from first/default item instead of price_range
+                COALESCE(
+                    (SELECT qoi.price 
+                     FROM quick_order_items qoi 
+                     WHERE qoi.quick_order_id = qo.id 
+                     AND qoi.is_default = 1 
+                     LIMIT 1),
+                    0.00
+                ) as price,
                 qo.order_count,
                 qo.rating,
                 qo.created_at,
@@ -194,7 +202,15 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl) {
             qo.category,
             qo.description,
             qo.delivery_time,
-            qo.price_range,
+            -- Get single price from first/default item instead of price_range
+            COALESCE(
+                (SELECT qoi.price 
+                 FROM quick_order_items qoi 
+                 WHERE qoi.quick_order_id = qo.id 
+                 AND qoi.is_default = 1 
+                 LIMIT 1),
+                0.00
+            ) as price,
             qo.order_count,
             qo.rating,
             qo.created_at,
@@ -339,9 +355,21 @@ function createQuickOrder($conn, $data) {
         ResponseHandler::error('Delivery address is required', 400);
     }
 
-    // Get quick order details
+    // Get quick order details - CHANGED: Get single price instead of price_range
     $orderStmt = $conn->prepare(
-        "SELECT title, price_range, delivery_time FROM quick_orders WHERE id = :id"
+        "SELECT 
+            qo.title,
+            COALESCE(
+                (SELECT qoi.price 
+                 FROM quick_order_items qoi 
+                 WHERE qoi.quick_order_id = qo.id 
+                 AND qoi.is_default = 1 
+                 LIMIT 1),
+                0.00
+            ) as price,
+            qo.delivery_time 
+        FROM quick_orders qo 
+        WHERE qo.id = :id"
     );
     $orderStmt->execute([':id' => $quickOrderId]);
     $quickOrder = $orderStmt->fetch(PDO::FETCH_ASSOC);
@@ -787,7 +815,7 @@ function formatQuickOrderListData($q, $baseUrl) {
         'category' => $q['category'] ?? '',
         'description' => $q['description'] ?? '',
         'delivery_time' => $q['delivery_time'] ?? '',
-        'price_range' => $q['price_range'] ?? '',
+        'price' => floatval($q['price'] ?? 0), // CHANGED: Single price instead of price_range
         'order_count' => intval($q['order_count'] ?? 0),
         'rating' => floatval($q['rating'] ?? 0),
         'created_at' => $q['created_at'] ?? '',
@@ -820,7 +848,7 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         'category' => $q['category'] ?? '',
         'description' => $q['description'] ?? '',
         'delivery_time' => $q['delivery_time'] ?? '',
-        'price_range' => $q['price_range'] ?? '',
+        'price' => floatval($q['price'] ?? 0), // CHANGED: Single price instead of price_range
         'order_count' => intval($q['order_count'] ?? 0),
         'rating' => floatval($q['rating'] ?? 0),
         'created_at' => $q['created_at'] ?? '',
