@@ -5,7 +5,7 @@
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, Cookie");
 header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -14,9 +14,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /*********************************
- * SESSION CONFIG
+ * SESSION CONFIGURATION
+ * This MUST match your auth.php exactly!
  *********************************/
-if (session_status() === PHP_SESSION_NONE) {
+function initializeSession() {
+    // Check if session token is in headers
+    $sessionToken = null;
+    
+    // 1. Check X-Session-Token header (Flutter sends this)
+    if (isset($_SERVER['HTTP_X_SESSION_TOKEN'])) {
+        $sessionToken = $_SERVER['HTTP_X_SESSION_TOKEN'];
+    }
+    
+    // 2. Check Cookie header for PHPSESSID (Flutter also sends this)
+    if (!$sessionToken && isset($_SERVER['HTTP_COOKIE'])) {
+        $cookies = [];
+        parse_str(str_replace('; ', '&', $_SERVER['HTTP_COOKIE']), $cookies);
+        if (isset($cookies['PHPSESSID'])) {
+            $sessionToken = $cookies['PHPSESSID'];
+        }
+    }
+    
+    // If no session token found, authentication will fail later
+    if (!$sessionToken) {
+        return false;
+    }
+    
+    // Configure session exactly like auth.php
     session_set_cookie_params([
         'lifetime' => 86400 * 30,
         'path' => '/',
@@ -25,7 +49,27 @@ if (session_status() === PHP_SESSION_NONE) {
         'httponly' => true,
         'samesite' => 'None'
     ]);
+    
+    // Use the session token from headers
+    session_id($sessionToken);
     session_start();
+    
+    return true;
+}
+
+/*********************************
+ * AUTHENTICATION CHECK
+ *********************************/
+function checkAuthentication() {
+    // First try to initialize session
+    initializeSession();
+    
+    // Check if user is logged in (same as auth.php)
+    if (empty($_SESSION['user_id']) || empty($_SESSION['logged_in'])) {
+        return null;
+    }
+    
+    return $_SESSION['user_id'];
 }
 
 require_once __DIR__ . '/../config/database.php';
@@ -43,6 +87,8 @@ try {
         handlePostRequest();
     } elseif ($method === 'PUT') {
         handlePutRequest();
+    } elseif ($method === 'DELETE') {
+        handleDeleteRequest();
     } else {
         ResponseHandler::error('Method not allowed', 405);
     }
@@ -58,11 +104,11 @@ function handleGetRequest() {
     $conn = $db->getConnection();
 
     // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
     }
     
-    $userId = $_SESSION['user_id'];
     $notificationId = $_GET['id'] ?? null;
     
     if ($notificationId) {
@@ -98,7 +144,7 @@ function getNotificationsList($conn, $userId) {
 
     if ($isRead !== null) {
         $whereConditions[] = "is_read = :is_read";
-        $params[':is_read'] = $isRead === 'true' ? 1 : 0;
+        $params[':is_read'] = ($isRead === 'true' || $isRead === '1') ? 1 : 0;
     }
 
     if ($search) {
@@ -202,16 +248,6 @@ function getNotificationDetail($conn, $userId, $notificationId) {
         ResponseHandler::error('Notification not found', 404);
     }
 
-    // Mark as read if not already read
-    if (!$notification['is_read']) {
-        $updateStmt = $conn->prepare(
-            "UPDATE notifications 
-             SET is_read = 1, read_at = NOW()
-             WHERE id = :id AND user_id = :user_id"
-        );
-        $updateStmt->execute([':id' => $notificationId, ':user_id' => $userId]);
-    }
-
     ResponseHandler::success([
         'notification' => formatNotificationData($notification)
     ]);
@@ -224,7 +260,12 @@ function handlePostRequest() {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check authentication for certain actions
+    // Check authentication
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
+    }
+    
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         $input = $_POST;
@@ -234,10 +275,10 @@ function handlePostRequest() {
 
     switch ($action) {
         case 'mark_all_read':
-            markAllAsRead($conn, $input);
+            markAllAsRead($conn, $userId, $input);
             break;
         case 'clear_all':
-            clearAllNotifications($conn, $input);
+            clearAllNotifications($conn, $userId, $input);
             break;
         default:
             ResponseHandler::error('Invalid action', 400);
@@ -252,11 +293,10 @@ function handlePutRequest() {
     $conn = $db->getConnection();
 
     // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
     }
-    
-    $userId = $_SESSION['user_id'];
     
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
@@ -270,6 +310,29 @@ function handlePutRequest() {
     }
 
     markAsRead($conn, $userId, $notificationId);
+}
+
+/*********************************
+ * DELETE REQUESTS
+ *********************************/
+function handleDeleteRequest() {
+    $db = new Database();
+    $conn = $db->getConnection();
+
+    // Check authentication
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
+    }
+    
+    $input = json_decode(file_get_contents('php://input'), true);
+    $notificationId = $_GET['id'] ?? ($input['id'] ?? null);
+    
+    if (!$notificationId) {
+        ResponseHandler::error('Notification ID is required', 400);
+    }
+
+    deleteNotification($conn, $userId, $notificationId);
 }
 
 /*********************************
@@ -294,13 +357,7 @@ function markAsRead($conn, $userId, $notificationId) {
 /*********************************
  * MARK ALL AS READ
  *********************************/
-function markAllAsRead($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function markAllAsRead($conn, $userId, $data) {
     $type = $data['type'] ?? '';
 
     $sql = "UPDATE notifications 
@@ -327,13 +384,7 @@ function markAllAsRead($conn, $data) {
 /*********************************
  * CLEAR ALL NOTIFICATIONS
  *********************************/
-function clearAllNotifications($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function clearAllNotifications($conn, $userId, $data) {
     $type = $data['type'] ?? '';
     $olderThan = $data['older_than'] ?? '';
 
@@ -358,6 +409,24 @@ function clearAllNotifications($conn, $data) {
     ResponseHandler::success([
         'deleted_count' => $deletedCount
     ], "Cleared $deletedCount notifications");
+}
+
+/*********************************
+ * DELETE SINGLE NOTIFICATION
+ *********************************/
+function deleteNotification($conn, $userId, $notificationId) {
+    $stmt = $conn->prepare(
+        "DELETE FROM notifications 
+         WHERE id = :id AND user_id = :user_id"
+    );
+    
+    $stmt->execute([':id' => $notificationId, ':user_id' => $userId]);
+    
+    if ($stmt->rowCount() === 0) {
+        ResponseHandler::error('Notification not found', 404);
+    }
+
+    ResponseHandler::success([], 'Notification deleted successfully');
 }
 
 /*********************************
