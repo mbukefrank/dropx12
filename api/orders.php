@@ -5,7 +5,7 @@
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, Cookie");
 header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -14,9 +14,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /*********************************
- * SESSION CONFIG
+ * SESSION CONFIGURATION
  *********************************/
-if (session_status() === PHP_SESSION_NONE) {
+function initializeSession() {
+    // Check if session token is in headers
+    $sessionToken = null;
+    
+    // 1. Check X-Session-Token header (Flutter sends this)
+    if (isset($_SERVER['HTTP_X_SESSION_TOKEN'])) {
+        $sessionToken = $_SERVER['HTTP_X_SESSION_TOKEN'];
+    }
+    
+    // 2. Check Cookie header for PHPSESSID (Flutter also sends this)
+    if (!$sessionToken && isset($_SERVER['HTTP_COOKIE'])) {
+        $cookies = [];
+        parse_str(str_replace('; ', '&', $_SERVER['HTTP_COOKIE']), $cookies);
+        if (isset($cookies['PHPSESSID'])) {
+            $sessionToken = $cookies['PHPSESSID'];
+        }
+    }
+    
+    // If no session token found, authentication will fail
+    if (!$sessionToken) {
+        return false;
+    }
+    
+    // Configure session exactly like auth.php
     session_set_cookie_params([
         'lifetime' => 86400 * 30,
         'path' => '/',
@@ -25,16 +48,36 @@ if (session_status() === PHP_SESSION_NONE) {
         'httponly' => true,
         'samesite' => 'None'
     ]);
+    
+    // Use the session token from headers
+    session_id($sessionToken);
     session_start();
+    
+    return true;
 }
 
-require_once __DIR__ . '/../config/database.php';
-require_once __DIR__ . '/../includes/ResponseHandler.php';
+/*********************************
+ * AUTHENTICATION CHECK
+ *********************************/
+function checkAuthentication() {
+    // Try to initialize session
+    initializeSession();
+    
+    // Check if user is logged in (same as auth.php)
+    if (empty($_SESSION['user_id']) || empty($_SESSION['logged_in'])) {
+        return false;
+    }
+    
+    return $_SESSION['user_id'];
+}
 
 /*********************************
  * BASE URL CONFIGURATION
  *********************************/
 $baseUrl = "https://dropxbackend-production.up.railway.app";
+
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
  * ROUTER
@@ -62,27 +105,26 @@ function handleGetRequest() {
     $db = new Database();
     $conn = $db->getConnection();
 
+    // Check authentication
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
+    }
+    
     // Check if fetching specific order
     $orderId = $_GET['id'] ?? null;
     
     if ($orderId) {
-        getOrderDetails($conn, $orderId);
+        getOrderDetails($conn, $orderId, $userId);
     } else {
-        getOrdersList($conn);
+        getOrdersList($conn, $userId);
     }
 }
 
 /*********************************
  * GET ORDERS LIST
  *********************************/
-function getOrdersList($conn) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-    
+function getOrdersList($conn, $userId) {
     // Get query parameters
     $page = max(1, intval($_GET['page'] ?? 1));
     $limit = min(50, max(1, intval($_GET['limit'] ?? 20)));
@@ -145,6 +187,7 @@ function getOrdersList($conn) {
                 o.special_instructions,
                 o.created_at,
                 o.updated_at,
+                o.merchant_id,
                 m.name as restaurant_name,
                 m.image_url as merchant_image,
                 d.name as driver_name,
@@ -178,8 +221,17 @@ function getOrdersList($conn) {
     
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Get user info for customer name
+    $userStmt = $conn->prepare(
+        "SELECT full_name, phone FROM users WHERE id = :user_id"
+    );
+    $userStmt->execute([':user_id' => $userId]);
+    $user = $userStmt->fetch(PDO::FETCH_ASSOC);
+
     // Format orders data
-    $formattedOrders = array_map('formatOrderData', $orders);
+    $formattedOrders = array_map(function($order) use ($user) {
+        return formatOrderData($order, $user);
+    }, $orders);
 
     ResponseHandler::success([
         'orders' => $formattedOrders,
@@ -195,14 +247,7 @@ function getOrdersList($conn) {
 /*********************************
  * GET ORDER DETAILS
  *********************************/
-function getOrderDetails($conn, $orderId) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-
+function getOrderDetails($conn, $orderId, $userId) {
     // Get order details
     $sql = "SELECT 
                 o.id,
@@ -223,9 +268,11 @@ function getOrderDetails($conn, $orderId) {
                 m.name as restaurant_name,
                 m.address as merchant_address,
                 m.phone as merchant_phone,
+                m.image_url as merchant_image,
                 d.name as driver_name,
                 d.phone as driver_phone,
                 d.email as driver_email,
+                d.image_url as driver_image,
                 ot.estimated_delivery,
                 ot.location_updates,
                 qo.title as quick_order_title,
@@ -281,10 +328,28 @@ function getOrderDetails($conn, $orderId) {
     $trackingStmt->execute([':order_id' => $orderId]);
     $tracking = $trackingStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Get order status history
+    $statusSql = "SELECT 
+                    old_status,
+                    new_status,
+                    changed_by,
+                    changed_by_id,
+                    reason,
+                    notes,
+                    created_at as timestamp
+                FROM order_status_history
+                WHERE order_id = :order_id
+                ORDER BY created_at ASC";
+    
+    $statusStmt = $conn->prepare($statusSql);
+    $statusStmt->execute([':order_id' => $orderId]);
+    $statusHistory = $statusStmt->fetchAll(PDO::FETCH_ASSOC);
+
     // Format the response
     $orderData = formatOrderDetailData($order);
     $orderData['items'] = array_map('formatOrderItemData', $items);
     $orderData['tracking_history'] = array_map('formatTrackingData', $tracking);
+    $orderData['status_history'] = $statusHistory;
 
     ResponseHandler::success([
         'order' => $orderData
@@ -298,6 +363,12 @@ function handlePostRequest() {
     $db = new Database();
     $conn = $db->getConnection();
 
+    // Check authentication
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
+    }
+    
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         $input = $_POST;
@@ -307,19 +378,19 @@ function handlePostRequest() {
 
     switch ($action) {
         case 'create_order':
-            createOrder($conn, $input);
+            createOrder($conn, $input, $userId);
             break;
         case 'cancel_order':
-            cancelOrder($conn, $input);
+            cancelOrder($conn, $input, $userId);
             break;
         case 'create_review':
-            createOrderReview($conn, $input);
+            createOrderReview($conn, $input, $userId);
             break;
         case 'reorder':
-            reorder($conn, $input);
+            reorder($conn, $input, $userId);
             break;
         case 'track_order':
-            trackOrder($conn, $input);
+            trackOrder($conn, $input, $userId);
             break;
         default:
             ResponseHandler::error('Invalid action', 400);
@@ -329,14 +400,7 @@ function handlePostRequest() {
 /*********************************
  * CREATE ORDER
  *********************************/
-function createOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-    
+function createOrder($conn, $data, $userId) {
     // Validate required data
     $requiredFields = ['merchant_id', 'items', 'delivery_address', 'total_amount'];
     foreach ($requiredFields as $field) {
@@ -447,6 +511,24 @@ function createOrder($conn, $data) {
             ':estimated_delivery' => $estimatedDelivery
         ]);
 
+        // Add to order status history
+        $historySql = "INSERT INTO order_status_history (
+            order_id, old_status, new_status, changed_by, 
+            changed_by_id, created_at
+        ) VALUES (
+            :order_id, :old_status, :new_status, :changed_by,
+            :changed_by_id, NOW()
+        )";
+
+        $historyStmt = $conn->prepare($historySql);
+        $historyStmt->execute([
+            ':order_id' => $orderId,
+            ':old_status' => '',
+            ':new_status' => 'pending',
+            ':changed_by' => 'user',
+            ':changed_by_id' => $userId
+        ]);
+
         // Update user's total orders
         $updateUserSql = "UPDATE users SET total_orders = total_orders + 1 WHERE id = :user_id";
         $updateUserStmt = $conn->prepare($updateUserSql);
@@ -483,13 +565,7 @@ function createOrder($conn, $data) {
 /*********************************
  * CANCEL ORDER
  *********************************/
-function cancelOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function cancelOrder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
     $reason = trim($data['reason'] ?? '');
 
@@ -519,56 +595,80 @@ function cancelOrder($conn, $data) {
         ResponseHandler::error('Order cannot be cancelled at this stage', 400);
     }
 
-    // Update order status
-    $updateStmt = $conn->prepare(
-        "UPDATE orders SET 
-            status = 'cancelled',
-            cancellation_reason = :reason,
-            updated_at = NOW()
-         WHERE id = :order_id"
-    );
-    
-    $updateStmt->execute([
-        ':order_id' => $orderId,
-        ':reason' => $reason
-    ]);
+    // Begin transaction
+    $conn->beginTransaction();
 
-    // Update order tracking
-    $trackingStmt = $conn->prepare(
-        "UPDATE order_tracking SET 
-            status = 'Cancelled',
-            updated_at = NOW()
-         WHERE order_id = :order_id"
-    );
-    $trackingStmt->execute([':order_id' => $orderId]);
+    try {
+        // Update order status
+        $updateStmt = $conn->prepare(
+            "UPDATE orders SET 
+                status = 'cancelled',
+                cancellation_reason = :reason,
+                updated_at = NOW()
+             WHERE id = :order_id"
+        );
+        
+        $updateStmt->execute([
+            ':order_id' => $orderId,
+            ':reason' => $reason
+        ]);
 
-    // Log user activity
-    $activityStmt = $conn->prepare(
-        "INSERT INTO user_activities (
-            user_id, activity_type, description, created_at
+        // Update order tracking
+        $trackingStmt = $conn->prepare(
+            "UPDATE order_tracking SET 
+                status = 'Cancelled',
+                updated_at = NOW()
+             WHERE order_id = :order_id"
+        );
+        $trackingStmt->execute([':order_id' => $orderId]);
+
+        // Add to order status history
+        $historySql = "INSERT INTO order_status_history (
+            order_id, old_status, new_status, changed_by, 
+            changed_by_id, reason, created_at
         ) VALUES (
-            :user_id, 'order_cancelled', :description, NOW()
-        )"
-    );
-    
-    $activityStmt->execute([
-        ':user_id' => $userId,
-        ':description' => "Cancelled order #$orderId"
-    ]);
+            :order_id, :old_status, :new_status, :changed_by,
+            :changed_by_id, :reason, NOW()
+        )";
 
-    ResponseHandler::success([], 'Order cancelled successfully');
+        $historyStmt = $conn->prepare($historySql);
+        $historyStmt->execute([
+            ':order_id' => $orderId,
+            ':old_status' => $order['status'],
+            ':new_status' => 'cancelled',
+            ':changed_by' => 'user',
+            ':changed_by_id' => $userId,
+            ':reason' => $reason
+        ]);
+
+        // Log user activity
+        $activityStmt = $conn->prepare(
+            "INSERT INTO user_activities (
+                user_id, activity_type, description, created_at
+            ) VALUES (
+                :user_id, 'order_cancelled', :description, NOW()
+            )"
+        );
+        
+        $activityStmt->execute([
+            ':user_id' => $userId,
+            ':description' => "Cancelled order #$orderId"
+        ]);
+
+        $conn->commit();
+
+        ResponseHandler::success([], 'Order cancelled successfully');
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to cancel order: ' . $e->getMessage(), 500);
+    }
 }
 
 /*********************************
  * CREATE ORDER REVIEW
  *********************************/
-function createOrderReview($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function createOrderReview($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
     $merchantId = $data['merchant_id'] ?? null;
     $rating = intval($data['rating'] ?? 0);
@@ -646,13 +746,7 @@ function createOrderReview($conn, $data) {
 /*********************************
  * REORDER
  *********************************/
-function reorder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function reorder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
 
     if (!$orderId) {
@@ -683,6 +777,21 @@ function reorder($conn, $data) {
         ResponseHandler::error('Order not found', 404);
     }
 
+    // Check if merchant is still active
+    $merchantStmt = $conn->prepare(
+        "SELECT id, is_open, is_active FROM merchants WHERE id = :id"
+    );
+    $merchantStmt->execute([':id' => $order['merchant_id']]);
+    $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant || !$merchant['is_active']) {
+        ResponseHandler::error('Merchant is no longer available', 400);
+    }
+
+    if (!$merchant['is_open']) {
+        ResponseHandler::error('Merchant is currently closed', 400);
+    }
+
     // Parse items data
     $items = [];
     if (!empty($order['items_data'])) {
@@ -705,23 +814,18 @@ function reorder($conn, $data) {
         'items' => $items,
         'delivery_address' => $order['delivery_address'],
         'special_instructions' => $order['special_instructions'],
-        'payment_method' => $order['payment_method']
+        'payment_method' => $order['payment_method'],
+        'total_amount' => $order['total_amount']
     ];
 
     // Call createOrder function
-    createOrder($conn, $reorderData);
+    createOrder($conn, $reorderData, $userId);
 }
 
 /*********************************
  * TRACK ORDER
  *********************************/
-function trackOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function trackOrder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
 
     if (!$orderId) {
@@ -738,6 +842,7 @@ function trackOrder($conn, $data) {
                 d.phone as driver_phone,
                 d.current_latitude as driver_lat,
                 d.current_longitude as driver_lng,
+                d.image_url as driver_image,
                 ot.estimated_delivery,
                 ot.location_updates
             FROM orders o
@@ -767,12 +872,24 @@ function trackOrder($conn, $data) {
         }
     }
 
+    // Format driver image URL
+    global $baseUrl;
+    $driverImage = '';
+    if (!empty($trackingInfo['driver_image'])) {
+        if (strpos($trackingInfo['driver_image'], 'http') === 0) {
+            $driverImage = $trackingInfo['driver_image'];
+        } else {
+            $driverImage = rtrim($baseUrl, '/') . '/uploads/drivers/' . $trackingInfo['driver_image'];
+        }
+    }
+
     $response = [
         'order_number' => $trackingInfo['order_number'],
         'status' => $trackingInfo['status'],
         'merchant_name' => $trackingInfo['merchant_name'],
         'driver_name' => $trackingInfo['driver_name'],
         'driver_phone' => $trackingInfo['driver_phone'],
+        'driver_image' => $driverImage,
         'driver_location' => $trackingInfo['driver_lat'] && $trackingInfo['driver_lng'] 
             ? ['lat' => (float)$trackingInfo['driver_lat'], 'lng' => (float)$trackingInfo['driver_lng']]
             : null,
@@ -793,6 +910,12 @@ function handlePutRequest() {
     $db = new Database();
     $conn = $db->getConnection();
 
+    // Check authentication
+    $userId = checkAuthentication();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required. Please login.', 401);
+    }
+    
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         parse_str(file_get_contents('php://input'), $input);
@@ -802,10 +925,10 @@ function handlePutRequest() {
 
     switch ($action) {
         case 'update_order':
-            updateOrder($conn, $input);
+            updateOrder($conn, $input, $userId);
             break;
         case 'update_delivery_address':
-            updateDeliveryAddress($conn, $input);
+            updateDeliveryAddress($conn, $input, $userId);
             break;
         default:
             ResponseHandler::error('Invalid action', 400);
@@ -815,13 +938,7 @@ function handlePutRequest() {
 /*********************************
  * UPDATE ORDER
  *********************************/
-function updateOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function updateOrder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
 
     if (!$orderId) {
@@ -842,6 +959,12 @@ function updateOrder($conn, $data) {
 
     if (!$order) {
         ResponseHandler::error('Order not found', 404);
+    }
+
+    // Check if order can be modified
+    $modifiableStatuses = ['pending'];
+    if (!in_array($order['status'], $modifiableStatuses)) {
+        ResponseHandler::error('Order cannot be modified at this stage', 400);
     }
 
     // Build update query dynamically based on provided data
@@ -872,13 +995,7 @@ function updateOrder($conn, $data) {
 /*********************************
  * UPDATE DELIVERY ADDRESS
  *********************************/
-function updateDeliveryAddress($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function updateDeliveryAddress($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
     $newAddress = trim($data['delivery_address'] ?? '');
 
@@ -908,26 +1025,51 @@ function updateDeliveryAddress($conn, $data) {
         ResponseHandler::error('Delivery address cannot be changed at this stage', 400);
     }
 
-    // Update address
-    $updateStmt = $conn->prepare(
-        "UPDATE orders SET 
-            delivery_address = :address,
-            updated_at = NOW()
-         WHERE id = :order_id"
-    );
-    
-    $updateStmt->execute([
-        ':order_id' => $orderId,
-        ':address' => $newAddress
-    ]);
+    // Begin transaction
+    $conn->beginTransaction();
 
-    ResponseHandler::success([], 'Delivery address updated successfully');
+    try {
+        // Update address
+        $updateStmt = $conn->prepare(
+            "UPDATE orders SET 
+                delivery_address = :address,
+                updated_at = NOW()
+             WHERE id = :order_id"
+        );
+        
+        $updateStmt->execute([
+            ':order_id' => $orderId,
+            ':address' => $newAddress
+        ]);
+
+        // Log the change
+        $logStmt = $conn->prepare(
+            "INSERT INTO user_activities (
+                user_id, activity_type, description, created_at
+            ) VALUES (
+                :user_id, 'address_changed', :description, NOW()
+            )"
+        );
+        
+        $logStmt->execute([
+            ':user_id' => $userId,
+            ':description' => "Changed delivery address for order #$orderId"
+        ]);
+
+        $conn->commit();
+
+        ResponseHandler::success([], 'Delivery address updated successfully');
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to update address: ' . $e->getMessage(), 500);
+    }
 }
 
 /*********************************
  * FORMAT ORDER DATA
  *********************************/
-function formatOrderData($order) {
+function formatOrderData($order, $user) {
     global $baseUrl;
     
     // Parse items data
@@ -952,23 +1094,15 @@ function formatOrderData($order) {
     // Format merchant image URL
     $merchantImage = '';
     if (!empty($order['merchant_image'])) {
-        if (strpos($order['merchant_image'], 'http') === 0) {
-            $merchantImage = $order['merchant_image'];
-        } else {
-            $merchantImage = rtrim($baseUrl, '/') . '/uploads/' . $order['merchant_image'];
-        }
+        $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
     }
-
-    // Determine order type based on quick_order_id presence
-    $orderType = $order['quick_order_title'] ? 'Quick Order' : 'Regular Order';
 
     return [
         'id' => $order['id'],
         'order_number' => $order['order_number'],
         'status' => $order['status'],
-        'order_type' => $orderType,
-        'customer_name' => '', // Will be populated from session
-        'customer_phone' => '', // Will be populated from session
+        'customer_name' => $user['full_name'] ?? '',
+        'customer_phone' => $user['phone'] ?? '',
         'delivery_address' => $order['delivery_address'],
         'total_amount' => (float)$order['total_amount'],
         'delivery_fee' => (float)$order['delivery_fee'],
@@ -978,13 +1112,13 @@ function formatOrderData($order) {
         'order_date' => $order['created_at'],
         'estimated_delivery' => $order['estimated_delivery'],
         'payment_method' => $order['payment_method'],
-        'payment_status' => 'paid', // This would come from payment system
+        'payment_status' => getPaymentStatus($order['status']),
         'restaurant_name' => $order['restaurant_name'],
         'merchant_id' => $order['merchant_id'] ?? null,
         'merchant_image' => $merchantImage,
-        'driver_name' => $order['driver_name'],
-        'driver_phone' => $order['driver_phone'],
-        'special_instructions' => $order['special_instructions'],
+        'driver_name' => $order['driver_name'] ?? '',
+        'driver_phone' => $order['driver_phone'] ?? '',
+        'special_instructions' => $order['special_instructions'] ?? '',
         'created_at' => $order['created_at'],
         'updated_at' => $order['updated_at']
     ];
@@ -997,24 +1131,13 @@ function formatOrderDetailData($order) {
     global $baseUrl;
     
     // Format merchant image URL
-    $merchantImage = '';
-    if (!empty($order['merchant_image'])) {
-        if (strpos($order['merchant_image'], 'http') === 0) {
-            $merchantImage = $order['merchant_image'];
-        } else {
-            $merchantImage = rtrim($baseUrl, '/') . '/uploads/' . $order['merchant_image'];
-        }
-    }
-
+    $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
+    
+    // Format driver image URL
+    $driverImage = formatImageUrl($order['driver_image'], $baseUrl, 'drivers');
+    
     // Format quick order image URL
-    $quickOrderImage = '';
-    if (!empty($order['quick_order_image'])) {
-        if (strpos($order['quick_order_image'], 'http') === 0) {
-            $quickOrderImage = $order['quick_order_image'];
-        } else {
-            $quickOrderImage = rtrim($baseUrl, '/') . '/uploads/quick_orders/' . $order['quick_order_image'];
-        }
-    }
+    $quickOrderImage = formatImageUrl($order['quick_order_image'], $baseUrl, 'quick_orders');
 
     return [
         'id' => $order['id'],
@@ -1030,7 +1153,7 @@ function formatOrderDetailData($order) {
         'order_date' => $order['created_at'],
         'estimated_delivery' => $order['estimated_delivery'],
         'payment_method' => $order['payment_method'],
-        'payment_status' => 'paid', // This would come from payment system
+        'payment_status' => getPaymentStatus($order['status']),
         'restaurant_name' => $order['restaurant_name'],
         'merchant_address' => $order['merchant_address'],
         'merchant_phone' => $order['merchant_phone'],
@@ -1038,6 +1161,7 @@ function formatOrderDetailData($order) {
         'driver_name' => $order['driver_name'],
         'driver_phone' => $order['driver_phone'],
         'driver_email' => $order['driver_email'],
+        'driver_image' => $driverImage,
         'special_instructions' => $order['special_instructions'],
         'cancellation_reason' => $order['cancellation_reason'],
         'quick_order_title' => $order['quick_order_title'],
@@ -1072,6 +1196,52 @@ function formatTrackingData($tracking) {
         'created_at' => $tracking['created_at'],
         'updated_at' => $tracking['updated_at']
     ];
+}
+
+/*********************************
+ * FORMAT IMAGE URL
+ *********************************/
+function formatImageUrl($imagePath, $baseUrl, $type = '') {
+    if (empty($imagePath)) {
+        return '';
+    }
+    
+    // If it's already a full URL, use it as is
+    if (strpos($imagePath, 'http') === 0) {
+        return $imagePath;
+    }
+    
+    // Otherwise, build the full URL
+    $folder = '';
+    switch ($type) {
+        case 'merchants':
+            $folder = 'uploads/merchants';
+            break;
+        case 'drivers':
+            $folder = 'uploads/drivers';
+            break;
+        case 'quick_orders':
+            $folder = 'uploads/quick_orders';
+            break;
+        default:
+            $folder = 'uploads';
+    }
+    
+    return rtrim($baseUrl, '/') . '/' . $folder . '/' . ltrim($imagePath, '/');
+}
+
+/*********************************
+ * GET PAYMENT STATUS
+ *********************************/
+function getPaymentStatus($orderStatus) {
+    // This is a simplified version - in reality, this should come from your payment system
+    $paidStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived', 'delivered'];
+    
+    if (in_array($orderStatus, $paidStatuses)) {
+        return 'paid';
+    }
+    
+    return $orderStatus === 'cancelled' ? 'refunded' : 'pending';
 }
 
 /*********************************
