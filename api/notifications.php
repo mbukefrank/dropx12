@@ -5,8 +5,12 @@
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, X-Device-ID, X-Platform, X-App-Version");
 header("Content-Type: application/json; charset=UTF-8");
+
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -14,55 +18,146 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /*********************************
- * SESSION CONFIG - MUST MATCH auth.php EXACTLY
+ * SESSION CONFIG - MATCHING FLUTTER
  *********************************/
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
-        'lifetime' => 86400 * 30,
+        'lifetime' => 86400 * 30, // 30 days - matches Flutter
         'path' => '/',
         'domain' => '',
-        'secure' => true,
+        'secure' => isset($_SERVER['HTTPS']), // Auto-detect for Railway
         'httponly' => true,
-        'samesite' => 'None'
+        'samesite' => 'Lax' // Better compatibility
     ]);
     session_start();
-}
-
-/*********************************
- * AUTHENTICATION CHECK - SIMPLIFIED
- *********************************/
-function checkAuthentication() {
-    // Simple check - same as auth.php
-    if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
-        return $_SESSION['user_id'];
-    }
-    return null;
 }
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
+ * AUTHENTICATION HELPER
+ *********************************/
+function checkAuthentication($conn) {
+    // Start by logging current auth state for debugging
+    error_log("=== NOTIFICATIONS AUTH CHECK ===");
+    error_log("Session ID: " . session_id());
+    
+    // 1. PRIMARY: Check PHP Session (Flutter sends cookies)
+    if (!empty($_SESSION['user_id'])) {
+        error_log("Auth Method: PHP Session - User ID: " . $_SESSION['user_id']);
+        return $_SESSION['user_id'];
+    }
+    
+    // 2. SECONDARY: Check Authorization Bearer Token
+    $headers = getallheaders();
+    $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+    
+    if (strpos($authHeader, 'Bearer ') === 0) {
+        $token = substr($authHeader, 7);
+        error_log("Auth Method: Bearer Token");
+        
+        // Check in users table for API token
+        $stmt = $conn->prepare(
+            "SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()"
+        );
+        $stmt->execute([':token' => $token]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($user) {
+            $_SESSION['user_id'] = $user['id'];
+            error_log("Bearer Token Valid - User ID: " . $user['id']);
+            return $user['id'];
+        }
+    }
+    
+    // 3. TERTIARY: Check X-Session-Token header (Flutter custom header)
+    $sessionToken = $headers['X-Session-Token'] ?? '';
+    if ($sessionToken) {
+        error_log("Auth Method: X-Session-Token");
+        
+        // Try to validate session token
+        $stmt = $conn->prepare(
+            "SELECT user_id FROM user_sessions 
+             WHERE session_token = :token AND expires_at > NOW()"
+        );
+        $stmt->execute([':token' => $sessionToken]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($result) {
+            $_SESSION['user_id'] = $result['user_id'];
+            error_log("Session Token Valid - User ID: " . $result['user_id']);
+            return $result['user_id'];
+        }
+        
+        // Fallback: check if it's the PHP session token
+        if (session_id() !== $sessionToken) {
+            // Try to restore session from token
+            session_id($sessionToken);
+            session_start();
+            
+            if (!empty($_SESSION['user_id'])) {
+                error_log("Session Restored from Token - User ID: " . $_SESSION['user_id']);
+                return $_SESSION['user_id'];
+            }
+        }
+    }
+    
+    // 4. FALLBACK: Check for PHPSESSID cookie directly
+    if (!empty($_COOKIE['PHPSESSID'])) {
+        error_log("Auth Method: PHPSESSID Cookie");
+        
+        if (session_id() !== $_COOKIE['PHPSESSID']) {
+            // Restart session with cookie ID
+            session_id($_COOKIE['PHPSESSID']);
+            session_start();
+            
+            if (!empty($_SESSION['user_id'])) {
+                error_log("Session Restored from Cookie - User ID: " . $_SESSION['user_id']);
+                return $_SESSION['user_id'];
+            }
+        }
+    }
+    
+    error_log("=== AUTH CHECK FAILED ===");
+    return false;
+}
+
+/*********************************
  * ROUTER
  *********************************/
 try {
     $method = $_SERVER['REQUEST_METHOD'];
+    
+    // Get input data
+    $input = json_decode(file_get_contents('php://input'), true);
+    if (!$input && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $input = $_POST;
+    }
 
-    // Check authentication first for all requests
-    $userId = checkAuthentication();
+    // Check database connection first
+    $db = new Database();
+    $conn = $db->getConnection();
+    
+    if (!$conn) {
+        ResponseHandler::error('Database connection failed', 500);
+    }
+
+    // ALL notification requests require authentication
+    $userId = checkAuthentication($conn);
     if (!$userId) {
         ResponseHandler::error('Authentication required. Please login.', 401);
     }
 
     // Route authenticated requests
     if ($method === 'GET') {
-        handleGetRequest($userId);
+        handleGetRequest($conn, $userId);
     } elseif ($method === 'POST') {
-        handlePostRequest($userId);
+        handlePostRequest($conn, $userId, $input);
     } elseif ($method === 'PUT') {
-        handlePutRequest($userId);
+        handlePutRequest($conn, $userId, $input);
     } elseif ($method === 'DELETE') {
-        handleDeleteRequest($userId);
+        handleDeleteRequest($conn, $userId, $input);
     } else {
         ResponseHandler::error('Method not allowed', 405);
     }
@@ -73,10 +168,7 @@ try {
 /*********************************
  * GET REQUESTS
  *********************************/
-function handleGetRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
+function handleGetRequest($conn, $userId) {
     $notificationId = $_GET['id'] ?? null;
     $action = $_GET['action'] ?? null;
     
@@ -84,6 +176,8 @@ function handleGetRequest($userId) {
         getNotificationDetail($conn, $userId, $notificationId);
     } elseif ($action === 'statistics') {
         getNotificationStatistics($conn, $userId);
+    } elseif ($action === 'preferences') {
+        getNotificationPreferences($conn, $userId);
     } else {
         getNotificationsList($conn, $userId);
     }
@@ -126,7 +220,7 @@ function getNotificationsList($conn, $userId) {
     $whereClause = "WHERE " . implode(" AND ", $whereConditions);
 
     // Validate sort options
-    $allowedSortColumns = ['created_at', 'sent_at', 'title'];
+    $allowedSortColumns = ['created_at', 'sent_at', 'title', 'is_read'];
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
     $sortOrder = $sortOrder === 'ASC' ? 'ASC' : 'DESC';
 
@@ -181,13 +275,16 @@ function getNotificationsList($conn, $userId) {
     $unreadCount = $unreadStmt->fetch(PDO::FETCH_ASSOC)['unread_count'];
 
     ResponseHandler::success([
-        'notifications' => $formattedNotifications,
-        'unread_count' => $unreadCount,
-        'pagination' => [
-            'current_page' => $page,
-            'per_page' => $limit,
-            'total_items' => $totalCount,
-            'total_pages' => ceil($totalCount / $limit)
+        'success' => true,
+        'data' => [
+            'notifications' => $formattedNotifications,
+            'unread_count' => intval($unreadCount),
+            'pagination' => [
+                'current_page' => $page,
+                'per_page' => $limit,
+                'total_items' => intval($totalCount),
+                'total_pages' => ceil($totalCount / $limit)
+            ]
         ]
     ]);
 }
@@ -230,7 +327,10 @@ function getNotificationDetail($conn, $userId, $notificationId) {
     }
 
     ResponseHandler::success([
-        'notification' => formatNotificationData($notification)
+        'success' => true,
+        'data' => [
+            'notification' => formatNotificationData($notification)
+        ]
     ]);
 }
 
@@ -245,7 +345,9 @@ function getNotificationStatistics($conn, $userId) {
             COUNT(CASE WHEN type = 'order' THEN 1 END) as order_notifications,
             COUNT(CASE WHEN type = 'promotion' THEN 1 END) as promotion_notifications,
             COUNT(CASE WHEN type = 'delivery' THEN 1 END) as delivery_notifications,
-            COUNT(CASE WHEN type = 'system' THEN 1 END) as system_notifications
+            COUNT(CASE WHEN type = 'system' THEN 1 END) as system_notifications,
+            COUNT(CASE WHEN type = 'payment' THEN 1 END) as payment_notifications,
+            COUNT(CASE WHEN type = 'update' THEN 1 END) as update_notifications
          FROM notifications 
          WHERE user_id = :user_id"
     );
@@ -253,15 +355,62 @@ function getNotificationStatistics($conn, $userId) {
     $stats = $stmt->fetch(PDO::FETCH_ASSOC);
     
     ResponseHandler::success([
-        'statistics' => [
-            'total' => intval($stats['total'] ?? 0),
-            'unread' => intval($stats['unread'] ?? 0),
-            'by_type' => [
-                'order' => intval($stats['order_notifications'] ?? 0),
-                'promotion' => intval($stats['promotion_notifications'] ?? 0),
-                'delivery' => intval($stats['delivery_notifications'] ?? 0),
-                'system' => intval($stats['system_notifications'] ?? 0)
+        'success' => true,
+        'data' => [
+            'statistics' => [
+                'total' => intval($stats['total'] ?? 0),
+                'unread' => intval($stats['unread'] ?? 0),
+                'by_type' => [
+                    'order' => intval($stats['order_notifications'] ?? 0),
+                    'promotion' => intval($stats['promotion_notifications'] ?? 0),
+                    'delivery' => intval($stats['delivery_notifications'] ?? 0),
+                    'system' => intval($stats['system_notifications'] ?? 0),
+                    'payment' => intval($stats['payment_notifications'] ?? 0),
+                    'update' => intval($stats['update_notifications'] ?? 0)
+                ]
             ]
+        ]
+    ]);
+}
+
+/*********************************
+ * GET NOTIFICATION PREFERENCES
+ *********************************/
+function getNotificationPreferences($conn, $userId) {
+    $stmt = $conn->prepare(
+        "SELECT 
+            push_enabled,
+            email_enabled,
+            sms_enabled,
+            order_updates,
+            promotional_offers,
+            new_merchants,
+            special_offers,
+            created_at,
+            updated_at
+        FROM user_notification_settings 
+        WHERE user_id = :user_id"
+    );
+    $stmt->execute([':user_id' => $userId]);
+    $preferences = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$preferences) {
+        // Return default preferences if not set
+        $preferences = [
+            'push_enabled' => true,
+            'email_enabled' => true,
+            'sms_enabled' => false,
+            'order_updates' => true,
+            'promotional_offers' => true,
+            'new_merchants' => true,
+            'special_offers' => true
+        ];
+    }
+    
+    ResponseHandler::success([
+        'success' => true,
+        'data' => [
+            'preferences' => $preferences
         ]
     ]);
 }
@@ -269,15 +418,7 @@ function getNotificationStatistics($conn, $userId) {
 /*********************************
  * POST REQUESTS
  *********************************/
-function handlePostRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
-    $input = json_decode(file_get_contents('php://input'), true);
-    if (!$input) {
-        $input = $_POST;
-    }
-    
+function handlePostRequest($conn, $userId, $input) {
     $action = $input['action'] ?? '';
 
     switch ($action) {
@@ -293,23 +434,18 @@ function handlePostRequest($userId) {
         case 'update_preferences':
             updateNotificationPreferences($conn, $userId, $input);
             break;
+        case 'debug_auth':
+            debugAuth($conn);
+            break;
         default:
-            ResponseHandler::error('Invalid action', 400);
+            ResponseHandler::error('Invalid action: ' . $action, 400);
     }
 }
 
 /*********************************
  * PUT REQUESTS
  *********************************/
-function handlePutRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
-    $input = json_decode(file_get_contents('php://input'), true);
-    if (!$input) {
-        parse_str(file_get_contents('php://input'), $input);
-    }
-    
+function handlePutRequest($conn, $userId, $input) {
     $notificationId = $input['id'] ?? null;
     
     if (!$notificationId) {
@@ -322,18 +458,34 @@ function handlePutRequest($userId) {
 /*********************************
  * DELETE REQUESTS
  *********************************/
-function handleDeleteRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
-    $input = json_decode(file_get_contents('php://input'), true);
-    $notificationId = $_GET['id'] ?? ($input['id'] ?? null);
+function handleDeleteRequest($conn, $userId, $input) {
+    $notificationId = $input['id'] ?? null;
     
     if (!$notificationId) {
         ResponseHandler::error('Notification ID is required', 400);
     }
 
     deleteNotification($conn, $userId, $notificationId);
+}
+
+/*********************************
+ * DEBUG AUTH ENDPOINT
+ *********************************/
+function debugAuth($conn) {
+    $headers = getallheaders();
+    
+    ResponseHandler::success([
+        'success' => true,
+        'data' => [
+            'session_id' => session_id(),
+            'session_user_id' => $_SESSION['user_id'] ?? null,
+            'session_status' => session_status(),
+            'session_name' => session_name(),
+            'all_headers' => $headers,
+            'all_cookies' => $_COOKIE,
+            'session_data' => $_SESSION
+        ]
+    ]);
 }
 
 /*********************************
@@ -352,7 +504,10 @@ function markAsRead($conn, $userId, $notificationId) {
         ResponseHandler::error('Notification not found', 404);
     }
 
-    ResponseHandler::success([], 'Notification marked as read');
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Notification marked as read'
+    ]);
 }
 
 /*********************************
@@ -378,8 +533,12 @@ function markAllAsRead($conn, $userId, $data) {
     $affectedRows = $stmt->rowCount();
     
     ResponseHandler::success([
-        'marked_count' => $affectedRows
-    ], "Marked $affectedRows notifications as read");
+        'success' => true,
+        'data' => [
+            'marked_count' => $affectedRows
+        ],
+        'message' => "Marked $affectedRows notifications as read"
+    ]);
 }
 
 /*********************************
@@ -408,8 +567,12 @@ function clearAllNotifications($conn, $userId, $data) {
     $deletedCount = $stmt->rowCount();
     
     ResponseHandler::success([
-        'deleted_count' => $deletedCount
-    ], "Cleared $deletedCount notifications");
+        'success' => true,
+        'data' => [
+            'deleted_count' => $deletedCount
+        ],
+        'message' => "Cleared $deletedCount notifications"
+    ]);
 }
 
 /*********************************
@@ -427,7 +590,10 @@ function deleteNotification($conn, $userId, $notificationId) {
         ResponseHandler::error('Notification not found', 404);
     }
 
-    ResponseHandler::success([], 'Notification deleted successfully');
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Notification deleted successfully'
+    ]);
 }
 
 /*********************************
@@ -464,17 +630,25 @@ function batchUpdateNotifications($conn, $userId, $data) {
     $affectedRows = $stmt->rowCount();
     
     ResponseHandler::success([
-        'affected_count' => $affectedRows
-    ], "Successfully processed $affectedRows notifications");
+        'success' => true,
+        'data' => [
+            'affected_count' => $affectedRows
+        ],
+        'message' => "Successfully processed $affectedRows notifications"
+    ]);
 }
 
 /*********************************
  * UPDATE NOTIFICATION PREFERENCES
  *********************************/
 function updateNotificationPreferences($conn, $userId, $data) {
-    $pushEnabled = $data['push_enabled'] ?? null;
-    $emailEnabled = $data['email_enabled'] ?? null;
-    $smsEnabled = $data['sms_enabled'] ?? null;
+    $pushEnabled = $data['push_notifications'] ?? null;
+    $emailEnabled = $data['email_notifications'] ?? null;
+    $smsEnabled = $data['sms_notifications'] ?? null;
+    $orderUpdates = $data['order_updates'] ?? null;
+    $promotionalOffers = $data['promotional_offers'] ?? null;
+    $newMerchants = $data['new_merchants'] ?? null;
+    $specialOffers = $data['special_offers'] ?? null;
     
     // Check if settings exist
     $checkStmt = $conn->prepare(
@@ -502,6 +676,26 @@ function updateNotificationPreferences($conn, $userId, $data) {
             $params[':sms'] = $smsEnabled ? 1 : 0;
         }
         
+        if ($orderUpdates !== null) {
+            $updateFields[] = 'order_updates = :order_updates';
+            $params[':order_updates'] = $orderUpdates ? 1 : 0;
+        }
+        
+        if ($promotionalOffers !== null) {
+            $updateFields[] = 'promotional_offers = :promotional_offers';
+            $params[':promotional_offers'] = $promotionalOffers ? 1 : 0;
+        }
+        
+        if ($newMerchants !== null) {
+            $updateFields[] = 'new_merchants = :new_merchants';
+            $params[':new_merchants'] = $newMerchants ? 1 : 0;
+        }
+        
+        if ($specialOffers !== null) {
+            $updateFields[] = 'special_offers = :special_offers';
+            $params[':special_offers'] = $specialOffers ? 1 : 0;
+        }
+        
         if (!empty($updateFields)) {
             $sql = "UPDATE user_notification_settings SET " . 
                    implode(', ', $updateFields) . 
@@ -514,19 +708,40 @@ function updateNotificationPreferences($conn, $userId, $data) {
         // Create new
         $insertStmt = $conn->prepare(
             "INSERT INTO user_notification_settings 
-                (user_id, push_enabled, email_enabled, sms_enabled, created_at)
-             VALUES (:user_id, :push, :email, :sms, NOW())"
+                (user_id, push_enabled, email_enabled, sms_enabled, 
+                 order_updates, promotional_offers, new_merchants, special_offers, 
+                 created_at, updated_at)
+             VALUES (:user_id, :push, :email, :sms, 
+                     :order_updates, :promotional_offers, :new_merchants, :special_offers,
+                     NOW(), NOW())"
         );
         
         $insertStmt->execute([
             ':user_id' => $userId,
             ':push' => $pushEnabled !== null ? ($pushEnabled ? 1 : 0) : 1,
             ':email' => $emailEnabled !== null ? ($emailEnabled ? 1 : 0) : 1,
-            ':sms' => $smsEnabled !== null ? ($smsEnabled ? 1 : 0) : 0
+            ':sms' => $smsEnabled !== null ? ($smsEnabled ? 1 : 0) : 0,
+            ':order_updates' => $orderUpdates !== null ? ($orderUpdates ? 1 : 0) : 1,
+            ':promotional_offers' => $promotionalOffers !== null ? ($promotionalOffers ? 1 : 0) : 1,
+            ':new_merchants' => $newMerchants !== null ? ($newMerchants ? 1 : 0) : 1,
+            ':special_offers' => $specialOffers !== null ? ($specialOffers ? 1 : 0) : 1
         ]);
     }
 
-    ResponseHandler::success([], 'Notification preferences updated');
+    // Get updated preferences
+    $stmt = $conn->prepare(
+        "SELECT * FROM user_notification_settings WHERE user_id = :user_id"
+    );
+    $stmt->execute([':user_id' => $userId]);
+    $preferences = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    ResponseHandler::success([
+        'success' => true,
+        'data' => [
+            'preferences' => $preferences
+        ],
+        'message' => 'Notification preferences updated successfully'
+    ]);
 }
 
 /*********************************
@@ -535,10 +750,10 @@ function updateNotificationPreferences($conn, $userId, $data) {
 function formatNotificationData($notification) {
     $type = $notification['type'] ?? 'order';
     
-    // Map types to icons
+    // Map types to icons (matching Flutter expectations)
     $iconMap = [
-        'order' => 'assignment',
-        'delivery' => 'delivery_dining',
+        'order' => 'shopping_bag',
+        'delivery' => 'local_shipping',
         'promotion' => 'local_offer',
         'payment' => 'payment',
         'system' => 'info',
@@ -555,8 +770,12 @@ function formatNotificationData($notification) {
     // Parse data JSON
     $data = [];
     if (!empty($notification['data'])) {
-        $data = json_decode($notification['data'], true);
-        if (!is_array($data)) {
+        try {
+            $data = json_decode($notification['data'], true);
+            if (!is_array($data)) {
+                $data = [];
+            }
+        } catch (Exception $e) {
             $data = [];
         }
     }
@@ -564,6 +783,11 @@ function formatNotificationData($notification) {
     // Format time ago
     $createdAt = $notification['created_at'] ?? '';
     $timeAgo = formatTimeAgo($createdAt);
+    
+    // Format dates for Flutter
+    $readAt = $notification['read_at'] ?? null;
+    $sentAt = $notification['sent_at'] ?? null;
+    $createdAtFormatted = $createdAt ? date('Y-m-d H:i:s', strtotime($createdAt)) : null;
 
     return [
         'id' => intval($notification['id']),
@@ -572,10 +796,10 @@ function formatNotificationData($notification) {
         'message' => $notification['message'] ?? '',
         'data' => $data,
         'is_read' => boolval($notification['is_read'] ?? false),
-        'read_at' => $notification['read_at'] ?? null,
+        'read_at' => $readAt,
         'sent_via' => $notification['sent_via'] ?? 'in_app',
-        'sent_at' => $notification['sent_at'] ?? null,
-        'created_at' => $createdAt,
+        'sent_at' => $sentAt,
+        'created_at' => $createdAtFormatted,
         'time_ago' => $timeAgo,
         'icon' => $icon
     ];
@@ -597,7 +821,10 @@ function formatTimeAgo($datetime) {
         } elseif ($interval->m > 0) {
             return $interval->m . ' month' . ($interval->m > 1 ? 's' : '') . ' ago';
         } elseif ($interval->d > 0) {
-            return $interval->d . ' day' . ($interval->d > 1 ? 's' : '') . ' ago';
+            if ($interval->d == 1) return 'Yesterday';
+            if ($interval->d < 7) return $interval->d . ' days ago';
+            if ($interval->d == 7) return '1 week ago';
+            if ($interval->d < 30) return floor($interval->d / 7) . ' weeks ago';
         } elseif ($interval->h > 0) {
             return $interval->h . ' hour' . ($interval->h > 1 ? 's' : '') . ' ago';
         } elseif ($interval->i > 0) {
