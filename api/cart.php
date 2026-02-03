@@ -227,7 +227,7 @@ function getCurrentCart($conn, $baseUrl, $userId) {
             'cart' => [
                 'id' => $cart['id'],
                 'user_id' => $cart['user_id'],
-                'status' => $cart['status'],
+                'status' => $cart['status'] ?? 'active', // Default if not set
                 'created_at' => $cart['created_at'],
                 'updated_at' => $cart['updated_at']
             ],
@@ -367,14 +367,14 @@ function getOrCreateUserCart($conn, $userId) {
 }
 
 /*********************************
- * GET CART ITEMS BY CART ID
+ * GET CART ITEMS BY CART ID - FIXED VERSION
  *********************************/
 function getCartItemsByCartId($conn, $cartId, $baseUrl) {
     $stmt = $conn->prepare(
         "SELECT 
             ci.id,
             ci.cart_id,
-            ci.item_id,
+            ci.menu_item_id as item_id,  // FIXED: Use menu_item_id with alias
             mi.name as item_name,
             mi.description as item_description,
             mi.price,
@@ -393,7 +393,7 @@ function getCartItemsByCartId($conn, $cartId, $baseUrl) {
                 ELSE 0 
             END as is_dropx
         FROM cart_items ci
-        LEFT JOIN menu_items mi ON ci.item_id = mi.id
+        LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id  // FIXED: Use menu_item_id
         LEFT JOIN merchants m ON mi.merchant_id = m.id
         WHERE ci.cart_id = :cart_id
         AND ci.is_active = 1
@@ -409,7 +409,7 @@ function getCartItemsByCartId($conn, $cartId, $baseUrl) {
 }
 
 /*********************************
- * CALCULATE CART TOTALS
+ * CALCULATE CART TOTALS - FIXED VERSION
  *********************************/
 function calculateCartTotals($conn, $cartId, $userId) {
     // Get subtotal from cart items
@@ -419,7 +419,7 @@ function calculateCartTotals($conn, $cartId, $userId) {
             COUNT(ci.id) as item_count,
             SUM(ci.quantity) as total_quantity
         FROM cart_items ci
-        LEFT JOIN menu_items mi ON ci.item_id = mi.id
+        LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id  // FIXED: Use menu_item_id
         WHERE ci.cart_id = :cart_id
         AND ci.is_active = 1"
     );
@@ -637,7 +637,7 @@ function handlePostRequest($path, $data) {
 }
 
 /*********************************
- * ADD ITEM TO CART
+ * ADD ITEM TO CART - FIXED VERSION
  *********************************/
 function addItemToCart($conn, $data, $userId) {
     $menuItemId = $data['menu_item_id'] ?? null;
@@ -674,12 +674,12 @@ function addItemToCart($conn, $data, $userId) {
     // Get or create user cart
     $cart = getOrCreateUserCart($conn, $userId);
     
-    // Check if item already exists in cart
+    // Check if item already exists in cart - FIXED VERSION
     $existingStmt = $conn->prepare(
         "SELECT id, quantity, special_instructions 
          FROM cart_items 
          WHERE cart_id = :cart_id 
-         AND item_id = :item_id 
+         AND menu_item_id = :item_id  // FIXED: Use menu_item_id
          AND is_active = 1"
     );
     
@@ -713,10 +713,10 @@ function addItemToCart($conn, $data, $userId) {
         $message = 'Item quantity updated in cart';
         $cartItemId = $existingItem['id'];
     } else {
-        // Add new item to cart
+        // Add new item to cart - FIXED VERSION
         $insertStmt = $conn->prepare(
             "INSERT INTO cart_items 
-                (cart_id, item_id, quantity, special_instructions, customizations, is_active, created_at, updated_at)
+                (cart_id, menu_item_id, quantity, special_instructions, customizations, is_active, created_at, updated_at)  // FIXED: Use menu_item_id
              VALUES (:cart_id, :item_id, :quantity, :instructions, :customizations, 1, NOW(), NOW())"
         );
         
@@ -1139,7 +1139,7 @@ function mergeCart($conn, $data, $userId) {
         // Add item to cart
         $insertStmt = $conn->prepare(
             "INSERT INTO cart_items 
-                (cart_id, item_id, quantity, is_active, created_at, updated_at)
+                (cart_id, menu_item_id, quantity, is_active, created_at, updated_at)  // FIXED: Use menu_item_id
              VALUES (:cart_id, :item_id, :quantity, 1, NOW(), NOW())
              ON DUPLICATE KEY UPDATE 
                 quantity = quantity + VALUES(quantity),
@@ -1179,7 +1179,7 @@ function mergeCart($conn, $data, $userId) {
 }
 
 /*********************************
- * VALIDATE CART ITEMS
+ * VALIDATE CART ITEMS - FIXED VERSION
  *********************************/
 function validateCartItems($conn, $cartId) {
     $issues = [];
@@ -1187,7 +1187,7 @@ function validateCartItems($conn, $cartId) {
     $stmt = $conn->prepare(
         "SELECT 
             ci.id,
-            ci.item_id,
+            ci.menu_item_id as item_id,  // FIXED: Use menu_item_id with alias
             mi.name as item_name,
             mi.is_available,
             m.id as merchant_id,
@@ -1196,7 +1196,7 @@ function validateCartItems($conn, $cartId) {
             m.is_open as merchant_open,
             m.min_order as merchant_min_order
         FROM cart_items ci
-        LEFT JOIN menu_items mi ON ci.item_id = mi.id
+        LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id  // FIXED: Use menu_item_id
         LEFT JOIN merchants m ON mi.merchant_id = m.id
         WHERE ci.cart_id = :cart_id
         AND ci.is_active = 1"
@@ -1407,10 +1407,10 @@ function handleDeleteRequest($path, $data) {
 function removeCartItem($conn, $userId, $cartItemId) {
     // Verify cart item belongs to user
     $verifyStmt = $conn->prepare(
-        "SELECT ci.id, ci.cart_id, ci.item_id, mi.name as item_name
+        "SELECT ci.id, ci.cart_id, ci.menu_item_id, mi.name as item_name  // FIXED: Use menu_item_id
          FROM cart_items ci
          JOIN carts c ON ci.cart_id = c.id
-         JOIN menu_items mi ON ci.item_id = mi.id
+         JOIN menu_items mi ON ci.menu_item_id = mi.id  // FIXED: Use menu_item_id
          WHERE ci.id = :cart_item_id
          AND c.user_id = :user_id
          AND ci.is_active = 1"
