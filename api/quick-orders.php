@@ -5,7 +5,7 @@
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, X-Device-ID, X-Platform, X-App-Version");
 header("Content-Type: application/json; charset=UTF-8");
 
 // Enable error reporting for debugging
@@ -18,16 +18,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /*********************************
- * SESSION CONFIG
+ * SESSION CONFIG - MATCHING FLUTTER
  *********************************/
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
-        'lifetime' => 86400 * 30,
+        'lifetime' => 86400 * 30, // 30 days - matches Flutter
         'path' => '/',
         'domain' => '',
-        'secure' => true,
+        'secure' => isset($_SERVER['HTTPS']), // Auto-detect for Railway
         'httponly' => true,
-        'samesite' => 'None'
+        'samesite' => 'Lax' // Changed from 'None' for better compatibility
     ]);
     session_start();
 }
@@ -36,9 +36,101 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
+ * AUTHENTICATION HELPER
+ *********************************/
+function checkAuthentication($conn) {
+    // Start by logging current auth state for debugging
+    error_log("=== AUTH CHECK START ===");
+    error_log("Session ID: " . session_id());
+    error_log("Session User ID: " . ($_SESSION['user_id'] ?? 'NOT SET'));
+    
+    // 1. PRIMARY: Check PHP Session (Flutter sends cookies)
+    if (!empty($_SESSION['user_id'])) {
+        error_log("Auth Method: PHP Session");
+        return $_SESSION['user_id'];
+    }
+    
+    // 2. SECONDARY: Check Authorization Bearer Token
+    $headers = getallheaders();
+    $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+    
+    if (strpos($authHeader, 'Bearer ') === 0) {
+        $token = substr($authHeader, 7);
+        error_log("Auth Method: Bearer Token - $token");
+        
+        // Check in users table for API token
+        $stmt = $conn->prepare(
+            "SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()"
+        );
+        $stmt->execute([':token' => $token]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($user) {
+            $_SESSION['user_id'] = $user['id'];
+            error_log("Bearer Token Valid - User ID: " . $user['id']);
+            return $user['id'];
+        }
+    }
+    
+    // 3. TERTIARY: Check X-Session-Token header (Flutter custom header)
+    $sessionToken = $headers['X-Session-Token'] ?? '';
+    if ($sessionToken) {
+        error_log("Auth Method: X-Session-Token - $sessionToken");
+        
+        // Try to validate session token
+        $stmt = $conn->prepare(
+            "SELECT user_id FROM user_sessions 
+             WHERE session_token = :token AND expires_at > NOW()"
+        );
+        $stmt->execute([':token' => $sessionToken]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($result) {
+            $_SESSION['user_id'] = $result['user_id'];
+            error_log("Session Token Valid - User ID: " . $result['user_id']);
+            return $result['user_id'];
+        }
+        
+        // Fallback: check if it's the PHP session token
+        if (session_id() !== $sessionToken) {
+            // Try to restore session from token
+            session_id($sessionToken);
+            session_start();
+            
+            if (!empty($_SESSION['user_id'])) {
+                error_log("Session Restored from Token - User ID: " . $_SESSION['user_id']);
+                return $_SESSION['user_id'];
+            }
+        }
+    }
+    
+    // 4. FALLBACK: Check for PHPSESSID cookie directly
+    if (!empty($_COOKIE['PHPSESSID'])) {
+        error_log("Auth Method: PHPSESSID Cookie");
+        
+        if (session_id() !== $_COOKIE['PHPSESSID']) {
+            // Restart session with cookie ID
+            session_id($_COOKIE['PHPSESSID']);
+            session_start();
+            
+            if (!empty($_SESSION['user_id'])) {
+                error_log("Session Restored from Cookie - User ID: " . $_SESSION['user_id']);
+                return $_SESSION['user_id'];
+            }
+        }
+    }
+    
+    // 5. DEBUG: Log all headers for troubleshooting
+    error_log("All Headers: " . json_encode($headers));
+    error_log("All Cookies: " . json_encode($_COOKIE));
+    
+    error_log("=== AUTH CHECK FAILED ===");
+    return false;
+}
+
+/*********************************
  * BASE URL CONFIGURATION
  *********************************/
-// Update this with your actual backend URL
 $baseUrl = "https://dropxbackend-production.up.railway.app";
 
 /*********************************
@@ -70,20 +162,24 @@ function handleGetRequest() {
         ResponseHandler::error('Database connection failed', 500);
     }
 
+    // For GET requests, authentication is OPTIONAL
+    // Public endpoints don't require auth, but will provide user-specific data if authenticated
+    $userId = checkAuthentication($conn);
+    
     // Check for specific quick order ID
     $orderId = $_GET['id'] ?? null;
     
     if ($orderId) {
-        getQuickOrderDetails($conn, $orderId, $baseUrl);
+        getQuickOrderDetails($conn, $orderId, $baseUrl, $userId);
     } else {
-        getQuickOrdersList($conn, $baseUrl);
+        getQuickOrdersList($conn, $baseUrl, $userId);
     }
 }
 
 /*********************************
  * GET QUICK ORDERS LIST
  *********************************/
-function getQuickOrdersList($conn, $baseUrl) {
+function getQuickOrdersList($conn, $baseUrl, $userId = null) {
     // Get query parameters
     $page = max(1, intval($_GET['page'] ?? 1));
     $limit = min(50, max(1, intval($_GET['limit'] ?? 20)));
@@ -95,7 +191,7 @@ function getQuickOrdersList($conn, $baseUrl) {
     $sortOrder = strtoupper($_GET['sort_order'] ?? 'DESC');
     $isPopular = $_GET['is_popular'] ?? null;
 
-    // Build WHERE clause - REMOVED qo.is_active = 1 since column doesn't exist
+    // Build WHERE clause
     $whereConditions = [];
     $params = [];
 
@@ -127,7 +223,7 @@ function getQuickOrdersList($conn, $baseUrl) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // Get quick orders - CHANGED: Get single price from items instead of price_range
+    // Get quick orders
     $sql = "SELECT 
                 qo.id,
                 qo.title,
@@ -138,7 +234,6 @@ function getQuickOrdersList($conn, $baseUrl) {
                 qo.category,
                 qo.description,
                 qo.delivery_time,
-                -- Get single price from first/default item instead of price_range
                 COALESCE(
                     (SELECT qoi.price 
                      FROM quick_order_items qoi 
@@ -176,7 +271,7 @@ function getQuickOrdersList($conn, $baseUrl) {
         return formatQuickOrderListData($q, $baseUrl);
     }, $quickOrders);
 
-    ResponseHandler::success([
+    $response = [
         'quick_orders' => $formattedOrders,
         'pagination' => [
             'current_page' => $page,
@@ -184,13 +279,23 @@ function getQuickOrdersList($conn, $baseUrl) {
             'total_items' => $totalCount,
             'total_pages' => ceil($totalCount / $limit)
         ]
-    ]);
+    ];
+
+    // Add user-specific data if authenticated
+    if ($userId) {
+        $response['user_authenticated'] = true;
+        $response['user_id'] = $userId;
+    } else {
+        $response['user_authenticated'] = false;
+    }
+
+    ResponseHandler::success($response);
 }
 
 /*********************************
  * GET QUICK ORDER DETAILS
  *********************************/
-function getQuickOrderDetails($conn, $orderId, $baseUrl) {
+function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $stmt = $conn->prepare(
         "SELECT 
             qo.id,
@@ -202,7 +307,6 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl) {
             qo.category,
             qo.description,
             qo.delivery_time,
-            -- Get single price from first/default item instead of price_range
             COALESCE(
                 (SELECT qoi.price 
                  FROM quick_order_items qoi 
@@ -216,7 +320,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl) {
             qo.created_at,
             qo.updated_at
         FROM quick_orders qo
-        WHERE qo.id = :id" // Removed AND qo.is_active = 1
+        WHERE qo.id = :id"
     );
     
     $stmt->execute([':id' => $orderId]);
@@ -275,9 +379,32 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl) {
         return formatQuickOrderMerchantData($merchant, $baseUrl);
     }, $merchants);
 
-    ResponseHandler::success([
+    $response = [
         'quick_order' => $orderData
-    ]);
+    ];
+
+    // Add user-specific data if authenticated
+    if ($userId) {
+        $response['user_authenticated'] = true;
+        $response['user_id'] = $userId;
+        
+        // Check if user has favorited this quick order
+        $favoriteStmt = $conn->prepare(
+            "SELECT id FROM user_favorites 
+             WHERE user_id = :user_id AND quick_order_id = :quick_order_id"
+        );
+        $favoriteStmt->execute([
+            ':user_id' => $userId,
+            ':quick_order_id' => $orderId
+        ]);
+        
+        $response['quick_order']['is_favorited'] = $favoriteStmt->rowCount() > 0;
+    } else {
+        $response['user_authenticated'] = false;
+        $response['quick_order']['is_favorited'] = false;
+    }
+
+    ResponseHandler::success($response);
 }
 
 /*********************************
@@ -304,18 +431,31 @@ function handlePostRequest() {
     
     $action = $input['action'] ?? '';
 
+    // Check authentication for POST actions (all POST actions require auth)
+    $userId = checkAuthentication($conn);
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+
     switch ($action) {
         case 'create_order':
-            createQuickOrder($conn, $input);
+            createQuickOrder($conn, $input, $userId);
             break;
         case 'get_order_history':
-            getQuickOrderHistory($conn, $input, $baseUrl);
+            getQuickOrderHistory($conn, $input, $baseUrl, $userId);
             break;
         case 'cancel_order':
-            cancelQuickOrder($conn, $input);
+            cancelQuickOrder($conn, $input, $userId);
             break;
         case 'rate_order':
-            rateQuickOrder($conn, $input);
+            rateQuickOrder($conn, $input, $userId);
+            break;
+        case 'debug_auth':
+            // Debug endpoint to check authentication
+            debugAuth($conn);
+            break;
+        case 'toggle_favorite':
+            toggleQuickOrderFavorite($conn, $input, $userId);
             break;
         default:
             ResponseHandler::error('Invalid action: ' . $action, 400);
@@ -323,15 +463,80 @@ function handlePostRequest() {
 }
 
 /*********************************
- * CREATE QUICK ORDER
+ * DEBUG AUTH ENDPOINT
  *********************************/
-function createQuickOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
+function debugAuth($conn) {
+    $headers = getallheaders();
+    
+    ResponseHandler::success([
+        'session_id' => session_id(),
+        'session_user_id' => $_SESSION['user_id'] ?? null,
+        'session_status' => session_status(),
+        'session_name' => session_name(),
+        'all_headers' => $headers,
+        'all_cookies' => $_COOKIE,
+        'session_data' => $_SESSION,
+        'server_software' => $_SERVER['SERVER_SOFTWARE'] ?? 'Unknown'
+    ]);
+}
+
+/*********************************
+ * TOGGLE QUICK ORDER FAVORITE
+ *********************************/
+function toggleQuickOrderFavorite($conn, $data, $userId) {
+    $quickOrderId = $data['quick_order_id'] ?? null;
+    
+    if (!$quickOrderId) {
+        ResponseHandler::error('Quick order ID is required', 400);
     }
     
-    $userId = $_SESSION['user_id'];
+    // Check if already favorited
+    $checkStmt = $conn->prepare(
+        "SELECT id FROM user_favorites 
+         WHERE user_id = :user_id AND quick_order_id = :quick_order_id"
+    );
+    $checkStmt->execute([
+        ':user_id' => $userId,
+        ':quick_order_id' => $quickOrderId
+    ]);
+    
+    if ($checkStmt->rowCount() > 0) {
+        // Remove from favorites
+        $deleteStmt = $conn->prepare(
+            "DELETE FROM user_favorites 
+             WHERE user_id = :user_id AND quick_order_id = :quick_order_id"
+        );
+        $deleteStmt->execute([
+            ':user_id' => $userId,
+            ':quick_order_id' => $quickOrderId
+        ]);
+        
+        ResponseHandler::success([
+            'is_favorited' => false,
+            'message' => 'Removed from favorites'
+        ]);
+    } else {
+        // Add to favorites
+        $insertStmt = $conn->prepare(
+            "INSERT INTO user_favorites (user_id, quick_order_id, created_at)
+             VALUES (:user_id, :quick_order_id, NOW())"
+        );
+        $insertStmt->execute([
+            ':user_id' => $userId,
+            ':quick_order_id' => $quickOrderId
+        ]);
+        
+        ResponseHandler::success([
+            'is_favorited' => true,
+            'message' => 'Added to favorites'
+        ]);
+    }
+}
+
+/*********************************
+ * CREATE QUICK ORDER
+ *********************************/
+function createQuickOrder($conn, $data, $userId) {
     $quickOrderId = $data['quick_order_id'] ?? null;
     $merchantId = $data['merchant_id'] ?? null;
     $items = $data['items'] ?? [];
@@ -355,7 +560,7 @@ function createQuickOrder($conn, $data) {
         ResponseHandler::error('Delivery address is required', 400);
     }
 
-    // Get quick order details - CHANGED: Get single price instead of price_range
+    // Get quick order details
     $orderStmt = $conn->prepare(
         "SELECT 
             qo.title,
@@ -512,13 +717,7 @@ function createQuickOrder($conn, $data) {
 /*********************************
  * GET QUICK ORDER HISTORY
  *********************************/
-function getQuickOrderHistory($conn, $data, $baseUrl) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function getQuickOrderHistory($conn, $data, $baseUrl, $userId) {
     $page = max(1, intval($data['page'] ?? 1));
     $limit = min(50, max(1, intval($data['limit'] ?? 20)));
     $offset = ($page - 1) * $limit;
@@ -600,13 +799,7 @@ function getQuickOrderHistory($conn, $data, $baseUrl) {
 /*********************************
  * CANCEL QUICK ORDER
  *********************************/
-function cancelQuickOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function cancelQuickOrder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
     $reason = trim($data['reason'] ?? '');
 
@@ -656,13 +849,7 @@ function cancelQuickOrder($conn, $data) {
 /*********************************
  * RATE QUICK ORDER
  *********************************/
-function rateQuickOrder($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
+function rateQuickOrder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
     $rating = intval($data['rating'] ?? 0);
     $comment = trim($data['comment'] ?? '');
@@ -791,16 +978,14 @@ function updateQuickOrderRating($conn, $quickOrderId) {
 }
 
 /*********************************
- * FORMAT QUICK ORDER LIST DATA
+ * FORMATTING FUNCTIONS (Keep existing)
  *********************************/
 function formatQuickOrderListData($q, $baseUrl) {
     $imageUrl = '';
     if (!empty($q['image_url'])) {
-        // If it's already a full URL, use it as is
         if (strpos($q['image_url'], 'http') === 0) {
             $imageUrl = $q['image_url'];
         } else {
-            // Otherwise, build the full URL
             $imageUrl = rtrim($baseUrl, '/') . '/uploads/' . $q['image_url'];
         }
     }
@@ -815,7 +1000,7 @@ function formatQuickOrderListData($q, $baseUrl) {
         'category' => $q['category'] ?? '',
         'description' => $q['description'] ?? '',
         'delivery_time' => $q['delivery_time'] ?? '',
-        'price' => floatval($q['price'] ?? 0), // CHANGED: Single price instead of price_range
+        'price' => floatval($q['price'] ?? 0),
         'order_count' => intval($q['order_count'] ?? 0),
         'rating' => floatval($q['rating'] ?? 0),
         'created_at' => $q['created_at'] ?? '',
@@ -823,17 +1008,12 @@ function formatQuickOrderListData($q, $baseUrl) {
     ];
 }
 
-/*********************************
- * FORMAT QUICK ORDER DETAIL DATA
- *********************************/
 function formatQuickOrderDetailData($q, $baseUrl) {
     $imageUrl = '';
     if (!empty($q['image_url'])) {
-        // If it's already a full URL, use it as is
         if (strpos($q['image_url'], 'http') === 0) {
             $imageUrl = $q['image_url'];
         } else {
-            // Otherwise, build the full URL
             $imageUrl = rtrim($baseUrl, '/') . '/uploads/' . $q['image_url'];
         }
     }
@@ -848,7 +1028,7 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         'category' => $q['category'] ?? '',
         'description' => $q['description'] ?? '',
         'delivery_time' => $q['delivery_time'] ?? '',
-        'price' => floatval($q['price'] ?? 0), // CHANGED: Single price instead of price_range
+        'price' => floatval($q['price'] ?? 0),
         'order_count' => intval($q['order_count'] ?? 0),
         'rating' => floatval($q['rating'] ?? 0),
         'created_at' => $q['created_at'] ?? '',
@@ -856,17 +1036,12 @@ function formatQuickOrderDetailData($q, $baseUrl) {
     ];
 }
 
-/*********************************
- * FORMAT QUICK ORDER ITEM DATA
- *********************************/
 function formatQuickOrderItemData($item, $baseUrl) {
     $imageUrl = '';
     if (!empty($item['image_url'])) {
-        // If it's already a full URL, use it as is
         if (strpos($item['image_url'], 'http') === 0) {
             $imageUrl = $item['image_url'];
         } else {
-            // Otherwise, build the full URL
             $imageUrl = rtrim($baseUrl, '/') . '/uploads/' . $item['image_url'];
         }
     }
@@ -882,17 +1057,12 @@ function formatQuickOrderItemData($item, $baseUrl) {
     ];
 }
 
-/*********************************
- * FORMAT QUICK ORDER MERCHANT DATA
- *********************************/
 function formatQuickOrderMerchantData($merchant, $baseUrl) {
     $imageUrl = '';
     if (!empty($merchant['image_url'])) {
-        // If it's already a full URL, use it as is
         if (strpos($merchant['image_url'], 'http') === 0) {
             $imageUrl = $merchant['image_url'];
         } else {
-            // Otherwise, build the full URL
             $imageUrl = rtrim($baseUrl, '/') . '/uploads/' . $merchant['image_url'];
         }
     }
@@ -910,30 +1080,23 @@ function formatQuickOrderMerchantData($merchant, $baseUrl) {
     ];
 }
 
-/*********************************
- * FORMAT ORDER DATA
- *********************************/
 function formatOrderData($order) {
     global $baseUrl;
     
     $quickOrderImage = '';
     if (!empty($order['quick_order_image'])) {
-        // If it's already a full URL, use it as is
         if (strpos($order['quick_order_image'], 'http') === 0) {
             $quickOrderImage = $order['quick_order_image'];
         } else {
-            // Otherwise, build the full URL
             $quickOrderImage = rtrim($baseUrl, '/') . '/uploads/' . $order['quick_order_image'];
         }
     }
     
     $merchantImage = '';
     if (!empty($order['merchant_image'])) {
-        // If it's already a full URL, use it as is
         if (strpos($order['merchant_image'], 'http') === 0) {
             $merchantImage = $order['merchant_image'];
         } else {
-            // Otherwise, build the full URL
             $merchantImage = rtrim($baseUrl, '/') . '/uploads/' . $order['merchant_image'];
         }
     }
@@ -959,28 +1122,21 @@ function formatOrderData($order) {
     ];
 }
 
-/*********************************
- * FORMAT ORDER HISTORY DATA
- *********************************/
 function formatOrderHistoryData($order, $baseUrl) {
     $quickOrderImage = '';
     if (!empty($order['quick_order_image'])) {
-        // If it's already a full URL, use it as is
         if (strpos($order['quick_order_image'], 'http') === 0) {
             $quickOrderImage = $order['quick_order_image'];
         } else {
-            // Otherwise, build the full URL
             $quickOrderImage = rtrim($baseUrl, '/') . '/uploads/' . $order['quick_order_image'];
         }
     }
     
     $merchantImage = '';
     if (!empty($order['merchant_image'])) {
-        // If it's already a full URL, use it as is
         if (strpos($order['merchant_image'], 'http') === 0) {
             $merchantImage = $order['merchant_image'];
         } else {
-            // Otherwise, build the full URL
             $merchantImage = rtrim($baseUrl, '/') . '/uploads/' . $order['merchant_image'];
         }
     }

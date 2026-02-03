@@ -5,8 +5,12 @@
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, X-Device-ID, X-Platform, X-App-Version");
 header("Content-Type: application/json; charset=UTF-8");
+
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -14,22 +18,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /*********************************
- * SESSION CONFIG
+ * SESSION CONFIG - MATCHING FLUTTER
  *********************************/
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
-        'lifetime' => 86400 * 30,
+        'lifetime' => 86400 * 30, // 30 days - matches Flutter
         'path' => '/',
         'domain' => '',
-        'secure' => true,
+        'secure' => isset($_SERVER['HTTPS']), // Auto-detect for Railway
         'httponly' => true,
-        'samesite' => 'None'
+        'samesite' => 'Lax' // Better compatibility
     ]);
     session_start();
 }
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
+
+/*********************************
+ * AUTHENTICATION HELPER
+ *********************************/
+function checkAuthentication($conn) {
+    // Start by logging current auth state for debugging
+    error_log("=== CART AUTH CHECK ===");
+    error_log("Session ID: " . session_id());
+    
+    // 1. PRIMARY: Check PHP Session (Flutter sends cookies)
+    if (!empty($_SESSION['user_id'])) {
+        error_log("Auth Method: PHP Session - User ID: " . $_SESSION['user_id']);
+        return $_SESSION['user_id'];
+    }
+    
+    // 2. SECONDARY: Check Authorization Bearer Token
+    $headers = getallheaders();
+    $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+    
+    if (strpos($authHeader, 'Bearer ') === 0) {
+        $token = substr($authHeader, 7);
+        error_log("Auth Method: Bearer Token");
+        
+        // Check in users table for API token
+        $stmt = $conn->prepare(
+            "SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()"
+        );
+        $stmt->execute([':token' => $token]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($user) {
+            $_SESSION['user_id'] = $user['id'];
+            error_log("Bearer Token Valid - User ID: " . $user['id']);
+            return $user['id'];
+        }
+    }
+    
+    // 3. TERTIARY: Check X-Session-Token header (Flutter custom header)
+    $sessionToken = $headers['X-Session-Token'] ?? '';
+    if ($sessionToken) {
+        error_log("Auth Method: X-Session-Token");
+        
+        // Try to validate session token
+        $stmt = $conn->prepare(
+            "SELECT user_id FROM user_sessions 
+             WHERE session_token = :token AND expires_at > NOW()"
+        );
+        $stmt->execute([':token' => $sessionToken]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($result) {
+            $_SESSION['user_id'] = $result['user_id'];
+            error_log("Session Token Valid - User ID: " . $result['user_id']);
+            return $result['user_id'];
+        }
+        
+        // Fallback: check if it's the PHP session token
+        if (session_id() !== $sessionToken) {
+            // Try to restore session from token
+            session_id($sessionToken);
+            session_start();
+            
+            if (!empty($_SESSION['user_id'])) {
+                error_log("Session Restored from Token - User ID: " . $_SESSION['user_id']);
+                return $_SESSION['user_id'];
+            }
+        }
+    }
+    
+    // 4. FALLBACK: Check for PHPSESSID cookie directly
+    if (!empty($_COOKIE['PHPSESSID'])) {
+        error_log("Auth Method: PHPSESSID Cookie");
+        
+        if (session_id() !== $_COOKIE['PHPSESSID']) {
+            // Restart session with cookie ID
+            session_id($_COOKIE['PHPSESSID']);
+            session_start();
+            
+            if (!empty($_SESSION['user_id'])) {
+                error_log("Session Restored from Cookie - User ID: " . $_SESSION['user_id']);
+                return $_SESSION['user_id'];
+            }
+        }
+    }
+    
+    error_log("=== AUTH CHECK FAILED ===");
+    return false;
+}
 
 /*********************************
  * BASE URL CONFIGURATION
@@ -77,17 +169,30 @@ function handleGetRequest($path, $queryParams) {
     $db = new Database();
     $conn = $db->getConnection();
 
+    if (!$conn) {
+        ResponseHandler::error('Database connection failed', 500);
+    }
+
+    // ALL cart GET requests require authentication
+    $userId = checkAuthentication($conn);
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+
     // Check for cart endpoint
     if (strpos($path, '/cart') !== false) {
         $cartId = $queryParams['cart_id'] ?? null;
+        $action = $queryParams['action'] ?? '';
         
-        if ($cartId) {
-            getCartDetails($conn, $cartId, $baseUrl);
+        if ($action === 'count') {
+            getCartItemCount($conn, $userId);
+        } elseif ($cartId) {
+            getCartDetails($conn, $cartId, $baseUrl, $userId);
         } else {
-            getCurrentCart($conn, $baseUrl);
+            getCurrentCart($conn, $baseUrl, $userId);
         }
     } elseif (strpos($path, '/cart/items') !== false) {
-        getCartItems($conn, $baseUrl);
+        getCartItems($conn, $baseUrl, $userId);
     } else {
         ResponseHandler::error('Endpoint not found', 404);
     }
@@ -96,14 +201,7 @@ function handleGetRequest($path, $queryParams) {
 /*********************************
  * GET CURRENT CART
  *********************************/
-function getCurrentCart($conn, $baseUrl) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-    
+function getCurrentCart($conn, $baseUrl, $userId) {
     // First, get or create a cart for the user
     $cart = getOrCreateUserCart($conn, $userId);
     
@@ -120,26 +218,108 @@ function getCurrentCart($conn, $baseUrl) {
     // Get applicable promotions
     $promotions = getApplicablePromotions($conn, $userId, $totals['subtotal']);
     
+    // Get applied promotion if any
+    $appliedPromotion = getAppliedPromotion($conn, $cart['id']);
+    
     ResponseHandler::success([
-        'cart' => [
-            'id' => $cart['id'],
-            'user_id' => $cart['user_id'],
-            'created_at' => $cart['created_at'],
-            'updated_at' => $cart['updated_at']
-        ],
-        'items' => $cartItems,
-        'summary' => [
-            'subtotal' => $totals['subtotal'],
-            'delivery_fee' => $totals['delivery_fee'],
-            'service_fee' => $totals['service_fee'],
-            'tax_amount' => $totals['tax_amount'],
-            'total_amount' => $totals['total_amount'],
-            'item_count' => $totals['item_count'],
-            'unique_item_count' => count($cartItems)
-        ],
-        'promotions' => $promotions,
-        'is_eligible_for_checkout' => $totals['item_count'] > 0
+        'success' => true,
+        'data' => [
+            'cart' => [
+                'id' => $cart['id'],
+                'user_id' => $cart['user_id'],
+                'status' => $cart['status'],
+                'created_at' => $cart['created_at'],
+                'updated_at' => $cart['updated_at']
+            ],
+            'items' => $cartItems,
+            'summary' => [
+                'subtotal' => $totals['subtotal'],
+                'delivery_fee' => $totals['delivery_fee'],
+                'service_fee' => $totals['service_fee'],
+                'tax_amount' => $totals['tax_amount'],
+                'total_amount' => $totals['total_amount'],
+                'item_count' => $totals['item_count'],
+                'total_quantity' => $totals['total_quantity']
+            ],
+            'promotions' => $promotions,
+            'applied_promotion' => $appliedPromotion,
+            'is_eligible_for_checkout' => $totals['item_count'] > 0
+        ]
     ]);
+}
+
+/*********************************
+ * GET CART ITEM COUNT
+ *********************************/
+function getCartItemCount($conn, $userId) {
+    $cart = getOrCreateUserCart($conn, $userId);
+    
+    if (!$cart) {
+        ResponseHandler::success([
+            'success' => true,
+            'data' => [
+                'item_count' => 0,
+                'total_quantity' => 0,
+                'has_cart' => false
+            ]
+        ]);
+    }
+    
+    $stmt = $conn->prepare(
+        "SELECT 
+            COUNT(ci.id) as item_count,
+            SUM(ci.quantity) as total_quantity
+        FROM cart_items ci
+        WHERE ci.cart_id = :cart_id
+        AND ci.is_active = 1"
+    );
+    
+    $stmt->execute([':cart_id' => $cart['id']]);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    ResponseHandler::success([
+        'success' => true,
+        'data' => [
+            'item_count' => intval($result['item_count'] ?? 0),
+            'total_quantity' => intval($result['total_quantity'] ?? 0),
+            'has_cart' => true,
+            'cart_id' => $cart['id']
+        ]
+    ]);
+}
+
+/*********************************
+ * GET APPLIED PROMOTION
+ *********************************/
+function getAppliedPromotion($conn, $cartId) {
+    $stmt = $conn->prepare(
+        "SELECT 
+            c.applied_promotion_id,
+            c.applied_discount,
+            p.code,
+            p.name,
+            p.discount_type,
+            p.discount_value
+        FROM carts c
+        LEFT JOIN promotions p ON c.applied_promotion_id = p.id
+        WHERE c.id = :cart_id"
+    );
+    
+    $stmt->execute([':cart_id' => $cartId]);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$result || !$result['applied_promotion_id']) {
+        return null;
+    }
+    
+    return [
+        'promotion_id' => $result['applied_promotion_id'],
+        'code' => $result['code'],
+        'name' => $result['name'],
+        'discount_type' => $result['discount_type'],
+        'discount_value' => floatval($result['discount_value']),
+        'applied_discount' => floatval($result['applied_discount'])
+    ];
 }
 
 /*********************************
@@ -148,7 +328,7 @@ function getCurrentCart($conn, $baseUrl) {
 function getOrCreateUserCart($conn, $userId) {
     // Check for existing active cart
     $stmt = $conn->prepare(
-        "SELECT id, user_id, created_at, updated_at 
+        "SELECT id, user_id, status, created_at, updated_at 
          FROM carts 
          WHERE user_id = :user_id 
          AND status = 'active'
@@ -169,16 +349,21 @@ function getOrCreateUserCart($conn, $userId) {
          VALUES (:user_id, 'active', NOW(), NOW())"
     );
     
-    $insertStmt->execute([':user_id' => $userId]);
-    $cartId = $conn->lastInsertId();
-    
-    return [
-        'id' => $cartId,
-        'user_id' => $userId,
-        'status' => 'active',
-        'created_at' => date('Y-m-d H:i:s'),
-        'updated_at' => date('Y-m-d H:i:s')
-    ];
+    try {
+        $insertStmt->execute([':user_id' => $userId]);
+        $cartId = $conn->lastInsertId();
+        
+        return [
+            'id' => $cartId,
+            'user_id' => $userId,
+            'status' => 'active',
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s')
+        ];
+    } catch (Exception $e) {
+        error_log("Failed to create cart: " . $e->getMessage());
+        return false;
+    }
 }
 
 /*********************************
@@ -246,6 +431,18 @@ function calculateCartTotals($conn, $cartId, $userId) {
     $itemCount = intval($result['item_count'] ?? 0);
     $totalQuantity = intval($result['total_quantity'] ?? 0);
     
+    // Get applied promotion discount
+    $promoStmt = $conn->prepare(
+        "SELECT applied_discount FROM carts WHERE id = :cart_id"
+    );
+    $promoStmt->execute([':cart_id' => $cartId]);
+    $promoResult = $promoStmt->fetch(PDO::FETCH_ASSOC);
+    $promotionDiscount = floatval($promoResult['applied_discount'] ?? 0);
+    
+    // Apply promotion discount
+    $adjustedSubtotal = $subtotal - $promotionDiscount;
+    if ($adjustedSubtotal < 0) $adjustedSubtotal = 0;
+    
     // Get user's default address for delivery fee calculation
     $addressStmt = $conn->prepare(
         "SELECT a.*, dz.delivery_fee, dz.min_delivery_amount
@@ -267,18 +464,18 @@ function calculateCartTotals($conn, $cartId, $userId) {
     }
     
     // Apply minimum delivery amount
-    if ($subtotal > 0 && $address && !empty($address['min_delivery_amount'])) {
+    if ($adjustedSubtotal > 0 && $address && !empty($address['min_delivery_amount'])) {
         $minAmount = floatval($address['min_delivery_amount']);
-        if ($subtotal < $minAmount) {
+        if ($adjustedSubtotal < $minAmount) {
             $deliveryFee += 2.00; // Additional fee for small orders
         }
     }
     
     // Calculate service fee (2% of subtotal, min $1.50)
-    $serviceFee = max(1.50, $subtotal * 0.02);
+    $serviceFee = max(1.50, $adjustedSubtotal * 0.02);
     
     // Calculate tax (10% of subtotal + delivery + service)
-    $taxableAmount = $subtotal + $deliveryFee + $serviceFee;
+    $taxableAmount = $adjustedSubtotal + $deliveryFee + $serviceFee;
     $taxAmount = $taxableAmount * 0.10;
     
     // Total amount
@@ -286,6 +483,8 @@ function calculateCartTotals($conn, $cartId, $userId) {
     
     return [
         'subtotal' => round($subtotal, 2),
+        'promotion_discount' => round($promotionDiscount, 2),
+        'adjusted_subtotal' => round($adjustedSubtotal, 2),
         'delivery_fee' => round($deliveryFee, 2),
         'service_fee' => round($serviceFee, 2),
         'tax_amount' => round($taxAmount, 2),
@@ -366,9 +565,21 @@ function getApplicablePromotions($conn, $userId, $subtotal) {
             $discountAmount = $promotion['discount_value'];
         }
         
-        $promotion['discount_amount'] = round($discountAmount, 2);
-        $promotion['user_usage_count'] = $userUsageCount;
-        $applicablePromotions[] = $promotion;
+        $applicablePromotions[] = [
+            'id' => $promotion['id'],
+            'code' => $promotion['code'],
+            'name' => $promotion['name'],
+            'description' => $promotion['description'],
+            'discount_type' => $promotion['discount_type'],
+            'discount_value' => floatval($promotion['discount_value']),
+            'discount_amount' => round($discountAmount, 2),
+            'min_order_amount' => floatval($promotion['min_order_amount'] ?? 0),
+            'max_discount_amount' => floatval($promotion['max_discount_amount'] ?? 0),
+            'usage_limit' => $promotion['usage_limit'],
+            'user_usage_count' => $userUsageCount,
+            'applicable_to' => $promotion['applicable_to'],
+            'applicable_ids' => $promotion['applicable_ids']
+        ];
     }
     
     return $applicablePromotions;
@@ -382,36 +593,60 @@ function handlePostRequest($path, $data) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Route based on path
-    if (strpos($path, '/cart/items/add') !== false) {
-        addItemToCart($conn, $data);
-    } elseif (strpos($path, '/cart/apply-promotion') !== false) {
-        applyPromotionToCart($conn, $data);
-    } elseif (strpos($path, '/cart/clear') !== false) {
-        clearCart($conn, $data);
-    } elseif (strpos($path, '/cart/checkout') !== false) {
-        prepareCheckout($conn, $data);
-    } else {
-        ResponseHandler::error('Endpoint not found', 404);
+    if (!$conn) {
+        ResponseHandler::error('Database connection failed', 500);
+    }
+
+    // ALL cart POST requests require authentication
+    $userId = checkAuthentication($conn);
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+
+    $action = $data['action'] ?? '';
+    
+    // Route based on action parameter (Flutter style)
+    switch ($action) {
+        case 'add_item':
+            addItemToCart($conn, $data, $userId);
+            break;
+        case 'apply_promo':
+            applyPromotionToCart($conn, $data, $userId);
+            break;
+        case 'remove_promo':
+            removePromotionFromCart($conn, $data, $userId);
+            break;
+        case 'clear_cart':
+            clearCart($conn, $data, $userId);
+            break;
+        case 'validate_cart':
+            validateCart($conn, $data, $userId);
+            break;
+        case 'prepare_checkout':
+            prepareCheckout($conn, $data, $userId);
+            break;
+        case 'merge_cart':
+            mergeCart($conn, $data, $userId);
+            break;
+        case 'debug_auth':
+            debugAuth($conn);
+            break;
+        default:
+            ResponseHandler::error('Invalid action: ' . $action, 400);
     }
 }
 
 /*********************************
  * ADD ITEM TO CART
  *********************************/
-function addItemToCart($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-    $itemId = $data['item_id'] ?? null;
+function addItemToCart($conn, $data, $userId) {
+    $menuItemId = $data['menu_item_id'] ?? null;
     $quantity = intval($data['quantity'] ?? 1);
     $specialInstructions = trim($data['special_instructions'] ?? '');
+    $customizations = $data['customizations'] ?? [];
     
-    if (!$itemId) {
-        ResponseHandler::error('Item ID is required', 400);
+    if (!$menuItemId) {
+        ResponseHandler::error('Menu item ID is required', 400);
     }
     
     if ($quantity < 1) {
@@ -429,7 +664,7 @@ function addItemToCart($conn, $data) {
          AND m.is_active = 1"
     );
     
-    $itemCheckStmt->execute([':item_id' => $itemId]);
+    $itemCheckStmt->execute([':item_id' => $menuItemId]);
     $item = $itemCheckStmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$item) {
@@ -450,7 +685,7 @@ function addItemToCart($conn, $data) {
     
     $existingStmt->execute([
         ':cart_id' => $cart['id'],
-        ':item_id' => $itemId
+        ':item_id' => $menuItemId
     ]);
     
     $existingItem = $existingStmt->fetch(PDO::FETCH_ASSOC);
@@ -463,6 +698,7 @@ function addItemToCart($conn, $data) {
             "UPDATE cart_items 
              SET quantity = :quantity, 
                  special_instructions = :instructions,
+                 customizations = :customizations,
                  updated_at = NOW()
              WHERE id = :id"
         );
@@ -470,26 +706,30 @@ function addItemToCart($conn, $data) {
         $updateStmt->execute([
             ':quantity' => $newQuantity,
             ':instructions' => $specialInstructions ?: $existingItem['special_instructions'],
+            ':customizations' => json_encode($customizations),
             ':id' => $existingItem['id']
         ]);
         
         $message = 'Item quantity updated in cart';
+        $cartItemId = $existingItem['id'];
     } else {
         // Add new item to cart
         $insertStmt = $conn->prepare(
             "INSERT INTO cart_items 
-                (cart_id, item_id, quantity, special_instructions, is_active, created_at, updated_at)
-             VALUES (:cart_id, :item_id, :quantity, :instructions, 1, NOW(), NOW())"
+                (cart_id, item_id, quantity, special_instructions, customizations, is_active, created_at, updated_at)
+             VALUES (:cart_id, :item_id, :quantity, :instructions, :customizations, 1, NOW(), NOW())"
         );
         
         $insertStmt->execute([
             ':cart_id' => $cart['id'],
-            ':item_id' => $itemId,
+            ':item_id' => $menuItemId,
             ':quantity' => $quantity,
-            ':instructions' => $specialInstructions
+            ':instructions' => $specialInstructions,
+            ':customizations' => json_encode($customizations)
         ]);
         
         $message = 'Item added to cart';
+        $cartItemId = $conn->lastInsertId();
     }
     
     // Update cart timestamp
@@ -498,38 +738,31 @@ function addItemToCart($conn, $data) {
     );
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
-    // Log activity
-    logUserActivity($conn, $userId, 'cart_update', "Added item $itemId to cart", [
-        'item_id' => $itemId,
-        'quantity' => $quantity,
-        'merchant_id' => $item['merchant_id']
-    ]);
-    
     // Get updated cart summary
     $cartItems = getCartItemsByCartId($conn, $cart['id'], $GLOBALS['baseUrl']);
     $totals = calculateCartTotals($conn, $cart['id'], $userId);
     
     ResponseHandler::success([
+        'success' => true,
         'message' => $message,
-        'cart_item_count' => count($cartItems),
-        'cart_total_quantity' => $totals['total_quantity'],
-        'cart_subtotal' => $totals['subtotal']
-    ], $message);
+        'data' => [
+            'cart_item_id' => $cartItemId,
+            'cart_id' => $cart['id'],
+            'cart_item_count' => count($cartItems),
+            'cart_total_quantity' => $totals['total_quantity'],
+            'cart_subtotal' => $totals['subtotal'],
+            'cart_total_amount' => $totals['total_amount']
+        ]
+    ]);
 }
 
 /*********************************
  * APPLY PROMOTION TO CART
  *********************************/
-function applyPromotionToCart($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
+function applyPromotionToCart($conn, $data, $userId) {
+    $promoCode = trim($data['promo_code'] ?? '');
     
-    $userId = $_SESSION['user_id'];
-    $promotionCode = trim($data['promotion_code'] ?? '');
-    
-    if (!$promotionCode) {
+    if (!$promoCode) {
         ResponseHandler::error('Promotion code is required', 400);
     }
     
@@ -549,7 +782,7 @@ function applyPromotionToCart($conn, $data) {
     );
     
     $promoStmt->execute([
-        ':code' => $promotionCode,
+        ':code' => $promoCode,
         ':current_date' => $currentDate
     ]);
     
@@ -601,7 +834,7 @@ function applyPromotionToCart($conn, $data) {
     
     $discountAmount = round($discountAmount, 2);
     
-    // Store applied promotion in cart (simplified - would need cart_promotions table)
+    // Store applied promotion in cart
     $updateStmt = $conn->prepare(
         "UPDATE carts 
          SET applied_promotion_id = :promotion_id,
@@ -616,46 +849,61 @@ function applyPromotionToCart($conn, $data) {
         ':cart_id' => $cart['id']
     ]);
     
-    // Log activity
-    logUserActivity($conn, $userId, 'promotion_applied', "Applied promotion $promotionCode", [
-        'promotion_id' => $promotion['id'],
-        'discount_amount' => $discountAmount,
-        'cart_id' => $cart['id']
-    ]);
-    
-    // Calculate new total
-    $newTotal = $totals['total_amount'] - $discountAmount;
-    if ($newTotal < 0) $newTotal = 0;
+    // Calculate new totals with promotion
+    $newTotals = calculateCartTotals($conn, $cart['id'], $userId);
     
     ResponseHandler::success([
-        'promotion' => [
-            'code' => $promotion['code'],
-            'name' => $promotion['name'],
-            'discount_amount' => $discountAmount,
-            'discount_type' => $promotion['discount_type']
-        ],
-        'original_total' => $totals['total_amount'],
-        'new_total' => round($newTotal, 2),
-        'savings' => $discountAmount
-    ], 'Promotion applied successfully');
+        'success' => true,
+        'message' => 'Promotion applied successfully',
+        'data' => [
+            'promotion' => [
+                'id' => $promotion['id'],
+                'code' => $promotion['code'],
+                'name' => $promotion['name'],
+                'discount_type' => $promotion['discount_type'],
+                'discount_value' => floatval($promotion['discount_value']),
+                'discount_amount' => $discountAmount
+            ],
+            'cart_totals' => $newTotals,
+            'savings' => $discountAmount
+        ]
+    ]);
+}
+
+/*********************************
+ * REMOVE PROMOTION FROM CART
+ *********************************/
+function removePromotionFromCart($conn, $data, $userId) {
+    // Get user's active cart
+    $cart = getOrCreateUserCart($conn, $userId);
+    
+    // Remove applied promotion
+    $updateStmt = $conn->prepare(
+        "UPDATE carts 
+         SET applied_promotion_id = NULL,
+             applied_discount = NULL,
+             updated_at = NOW()
+         WHERE id = :cart_id"
+    );
+    
+    $updateStmt->execute([':cart_id' => $cart['id']]);
+    
+    // Calculate new totals without promotion
+    $newTotals = calculateCartTotals($conn, $cart['id'], $userId);
+    
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Promotion removed successfully',
+        'data' => [
+            'cart_totals' => $newTotals
+        ]
+    ]);
 }
 
 /*********************************
  * CLEAR CART
  *********************************/
-function clearCart($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-    $confirmation = $data['confirmation'] ?? false;
-    
-    if (!$confirmation) {
-        ResponseHandler::error('Confirmation required', 400);
-    }
-    
+function clearCart($conn, $data, $userId) {
     // Get user's active cart
     $cartStmt = $conn->prepare(
         "SELECT id FROM carts 
@@ -683,40 +931,85 @@ function clearCart($conn, $data) {
     $clearStmt->execute([':cart_id' => $cart['id']]);
     $itemsCleared = $clearStmt->rowCount();
     
-    // Update cart
+    // Remove applied promotion
     $updateCartStmt = $conn->prepare(
         "UPDATE carts 
-         SET updated_at = NOW()
+         SET applied_promotion_id = NULL,
+             applied_discount = NULL,
+             updated_at = NOW()
          WHERE id = :cart_id"
     );
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
-    // Log activity
-    logUserActivity($conn, $userId, 'cart_cleared', "Cleared cart of $itemsCleared items", [
-        'cart_id' => $cart['id'],
-        'items_cleared' => $itemsCleared
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Cart cleared successfully',
+        'data' => [
+            'items_cleared' => $itemsCleared,
+            'cart_id' => $cart['id']
+        ]
     ]);
+}
+
+/*********************************
+ * VALIDATE CART
+ *********************************/
+function validateCart($conn, $data, $userId) {
+    // Get user's active cart
+    $cart = getOrCreateUserCart($conn, $userId);
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], $GLOBALS['baseUrl']);
+    
+    if (empty($cartItems)) {
+        ResponseHandler::error('Cart is empty', 400);
+    }
+    
+    // Check if all items are still available
+    $issues = [];
+    foreach ($cartItems as $item) {
+        $checkStmt = $conn->prepare(
+            "SELECT mi.is_available, m.is_active, m.is_open
+             FROM menu_items mi
+             LEFT JOIN merchants m ON mi.merchant_id = m.id
+             WHERE mi.id = :item_id"
+        );
+        
+        $checkStmt->execute([':item_id' => $item['item_id']]);
+        $status = $checkStmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$status || !$status['is_available']) {
+            $issues[] = "{$item['name']} is no longer available";
+        } elseif (!$status['is_active']) {
+            $issues[] = "{$item['merchant_name']} is no longer active";
+        } elseif (!$status['is_open']) {
+            $issues[] = "{$item['merchant_name']} is currently closed";
+        }
+    }
+    
+    if (!empty($issues)) {
+        ResponseHandler::error('Cart validation failed', 400, [
+            'issues' => $issues
+        ]);
+    }
     
     ResponseHandler::success([
-        'items_cleared' => $itemsCleared,
-        'cart_id' => $cart['id']
-    ], 'Cart cleared successfully');
+        'success' => true,
+        'message' => 'Cart is valid',
+        'data' => [
+            'is_valid' => true,
+            'item_count' => count($cartItems),
+            'issues' => $issues
+        ]
+    ]);
 }
 
 /*********************************
  * PREPARE CHECKOUT
  *********************************/
-function prepareCheckout($conn, $data) {
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
-    $userId = $_SESSION['user_id'];
-    $addressId = $data['address_id'] ?? null;
-    $paymentMethod = $data['payment_method'] ?? 'cash';
+function prepareCheckout($conn, $data, $userId) {
+    $deliveryAddressId = $data['delivery_address_id'] ?? null;
+    $specialInstructions = trim($data['special_instructions'] ?? '');
     $tipAmount = floatval($data['tip_amount'] ?? 0);
-    $scheduleDelivery = $data['schedule_delivery'] ?? null;
+    $paymentMethod = $data['payment_method'] ?? 'cash';
     
     // Get user's active cart
     $cart = getOrCreateUserCart($conn, $userId);
@@ -729,7 +1022,7 @@ function prepareCheckout($conn, $data) {
     
     // Validate address
     $address = null;
-    if ($addressId) {
+    if ($deliveryAddressId) {
         $addressStmt = $conn->prepare(
             "SELECT * FROM addresses 
              WHERE id = :address_id 
@@ -737,7 +1030,7 @@ function prepareCheckout($conn, $data) {
         );
         
         $addressStmt->execute([
-            ':address_id' => $addressId,
+            ':address_id' => $deliveryAddressId,
             ':user_id' => $userId
         ]);
         
@@ -761,76 +1054,17 @@ function prepareCheckout($conn, $data) {
         ResponseHandler::error('Please select a delivery address', 400);
     }
     
-    // Calculate final totals with address-based delivery fee
+    // Calculate final totals
     $totals = calculateCartTotals($conn, $cart['id'], $userId);
     
-    // Apply stored promotion if any
-    $appliedPromotion = null;
-    $appliedDiscount = 0;
+    // Add tip to total
+    $finalTotal = $totals['total_amount'] + $tipAmount;
     
-    $promoStmt = $conn->prepare(
-        "SELECT applied_promotion_id, applied_discount 
-         FROM carts 
-         WHERE id = :cart_id"
-    );
-    
-    $promoStmt->execute([':cart_id' => $cart['id']]);
-    $cartPromo = $promoStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if ($cartPromo && $cartPromo['applied_promotion_id']) {
-        $appliedDiscount = floatval($cartPromo['applied_discount'] ?? 0);
-        $appliedPromotion = $cartPromo['applied_promotion_id'];
-    }
-    
-    // Final total with promotion
-    $finalSubtotal = $totals['subtotal'] - $appliedDiscount;
-    if ($finalSubtotal < 0) $finalSubtotal = 0;
-    
-    $finalTotal = $finalSubtotal + $totals['delivery_fee'] + 
-                  $totals['service_fee'] + $totals['tax_amount'] + $tipAmount;
-    
-    // Group items by merchant for order creation
-    $merchantGroups = [];
-    foreach ($cartItems as $item) {
-        $merchantId = $item['merchant_id'];
-        if (!isset($merchantGroups[$merchantId])) {
-            $merchantGroups[$merchantId] = [
-                'merchant_id' => $merchantId,
-                'merchant_name' => $item['merchant_name'],
-                'items' => [],
-                'subtotal' => 0
-            ];
-        }
-        $merchantGroups[$merchantId]['items'][] = $item;
-        $merchantGroups[$merchantId]['subtotal'] += $item['total'];
-    }
-    
-    // Check merchant availability and minimum orders
-    $merchantIssues = [];
-    foreach ($merchantGroups as $merchantId => $group) {
-        $merchantStmt = $conn->prepare(
-            "SELECT m.*, mdz.custom_delivery_fee
-             FROM merchants m
-             LEFT JOIN merchant_delivery_zones mdz ON m.id = mdz.merchant_id
-             WHERE m.id = :merchant_id
-             AND m.is_active = 1
-             AND m.is_open = 1"
-        );
-        
-        $merchantStmt->execute([':merchant_id' => $merchantId]);
-        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-        
-        if (!$merchant) {
-            $merchantIssues[] = "$group[merchant_name] is currently unavailable";
-        } elseif ($merchant['min_order'] && $group['subtotal'] < floatval($merchant['min_order'])) {
-            $minOrder = number_format(floatval($merchant['min_order']), 2);
-            $merchantIssues[] = "$group[merchant_name] requires minimum order of $$minOrder";
-        }
-    }
-    
-    if (!empty($merchantIssues)) {
-        ResponseHandler::error('Checkout issues', 400, [
-            'issues' => $merchantIssues
+    // Validate cart items
+    $validation = validateCartItems($conn, $cart['id']);
+    if (!$validation['is_valid']) {
+        ResponseHandler::error('Cart validation failed', 400, [
+            'issues' => $validation['issues']
         ]);
     }
     
@@ -840,73 +1074,229 @@ function prepareCheckout($conn, $data) {
         'address' => formatAddressData($address),
         'payment_method' => $paymentMethod,
         'tip_amount' => round($tipAmount, 2),
-        'schedule_delivery' => $scheduleDelivery,
         'summary' => [
-            'items_subtotal' => round($totals['subtotal'], 2),
-            'promotion_discount' => round($appliedDiscount, 2),
-            'adjusted_subtotal' => round($finalSubtotal, 2),
-            'delivery_fee' => round($totals['delivery_fee'], 2),
-            'service_fee' => round($totals['service_fee'], 2),
-            'tax_amount' => round($totals['tax_amount'], 2),
+            'items_subtotal' => $totals['subtotal'],
+            'promotion_discount' => $totals['promotion_discount'],
+            'adjusted_subtotal' => $totals['adjusted_subtotal'],
+            'delivery_fee' => $totals['delivery_fee'],
+            'service_fee' => $totals['service_fee'],
+            'tax_amount' => $totals['tax_amount'],
             'tip_amount' => round($tipAmount, 2),
             'total_amount' => round($finalTotal, 2)
         ],
-        'merchant_orders' => array_values($merchantGroups),
+        'items' => $cartItems,
         'item_count' => $totals['item_count'],
         'total_quantity' => $totals['total_quantity']
     ];
     
-    // Store checkout data in session for order creation
-    $_SESSION['checkout_data'] = $checkoutData;
+    // Store checkout data temporarily
+    $checkoutSessionKey = 'checkout_data_' . $cart['id'];
+    $_SESSION[$checkoutSessionKey] = $checkoutData;
     
-    ResponseHandler::success($checkoutData, 'Checkout prepared successfully');
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Checkout prepared successfully',
+        'data' => $checkoutData
+    ]);
 }
 
 /*********************************
- * PUT REQUESTS - Update Cart Items
+ * MERGE CART
+ *********************************/
+function mergeCart($conn, $data, $userId) {
+    $guestItems = $data['guest_items'] ?? [];
+    
+    if (empty($guestItems)) {
+        ResponseHandler::error('No guest items to merge', 400);
+    }
+    
+    // Get user's active cart
+    $cart = getOrCreateUserCart($conn, $userId);
+    
+    $mergedCount = 0;
+    $skippedCount = 0;
+    
+    foreach ($guestItems as $guestItem) {
+        $menuItemId = $guestItem['menu_item_id'] ?? null;
+        $quantity = intval($guestItem['quantity'] ?? 1);
+        
+        if (!$menuItemId || $quantity < 1) {
+            $skippedCount++;
+            continue;
+        }
+        
+        // Check if item exists
+        $itemCheckStmt = $conn->prepare(
+            "SELECT id FROM menu_items WHERE id = :item_id AND is_available = 1"
+        );
+        $itemCheckStmt->execute([':item_id' => $menuItemId]);
+        
+        if (!$itemCheckStmt->fetch()) {
+            $skippedCount++;
+            continue;
+        }
+        
+        // Add item to cart
+        $insertStmt = $conn->prepare(
+            "INSERT INTO cart_items 
+                (cart_id, item_id, quantity, is_active, created_at, updated_at)
+             VALUES (:cart_id, :item_id, :quantity, 1, NOW(), NOW())
+             ON DUPLICATE KEY UPDATE 
+                quantity = quantity + VALUES(quantity),
+                updated_at = NOW()"
+        );
+        
+        $insertStmt->execute([
+            ':cart_id' => $cart['id'],
+            ':item_id' => $menuItemId,
+            ':quantity' => $quantity
+        ]);
+        
+        $mergedCount++;
+    }
+    
+    // Update cart timestamp
+    $updateCartStmt = $conn->prepare(
+        "UPDATE carts SET updated_at = NOW() WHERE id = :cart_id"
+    );
+    $updateCartStmt->execute([':cart_id' => $cart['id']]);
+    
+    // Get updated cart summary
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], $GLOBALS['baseUrl']);
+    $totals = calculateCartTotals($conn, $cart['id'], $userId);
+    
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Cart merged successfully',
+        'data' => [
+            'merged_count' => $mergedCount,
+            'skipped_count' => $skippedCount,
+            'cart_item_count' => count($cartItems),
+            'cart_total_quantity' => $totals['total_quantity'],
+            'cart_subtotal' => $totals['subtotal']
+        ]
+    ]);
+}
+
+/*********************************
+ * VALIDATE CART ITEMS
+ *********************************/
+function validateCartItems($conn, $cartId) {
+    $issues = [];
+    
+    $stmt = $conn->prepare(
+        "SELECT 
+            ci.id,
+            ci.item_id,
+            mi.name as item_name,
+            mi.is_available,
+            m.id as merchant_id,
+            m.name as merchant_name,
+            m.is_active as merchant_active,
+            m.is_open as merchant_open,
+            m.min_order as merchant_min_order
+        FROM cart_items ci
+        LEFT JOIN menu_items mi ON ci.item_id = mi.id
+        LEFT JOIN merchants m ON mi.merchant_id = m.id
+        WHERE ci.cart_id = :cart_id
+        AND ci.is_active = 1"
+    );
+    
+    $stmt->execute([':cart_id' => $cartId]);
+    $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    foreach ($items as $item) {
+        if (!$item['is_available']) {
+            $issues[] = "{$item['item_name']} is no longer available";
+        }
+        if (!$item['merchant_active']) {
+            $issues[] = "{$item['merchant_name']} is no longer active";
+        }
+        if (!$item['merchant_open']) {
+            $issues[] = "{$item['merchant_name']} is currently closed";
+        }
+    }
+    
+    return [
+        'is_valid' => empty($issues),
+        'issues' => $issues
+    ];
+}
+
+/*********************************
+ * DEBUG AUTH ENDPOINT
+ *********************************/
+function debugAuth($conn) {
+    $headers = getallheaders();
+    
+    ResponseHandler::success([
+        'success' => true,
+        'data' => [
+            'session_id' => session_id(),
+            'session_user_id' => $_SESSION['user_id'] ?? null,
+            'session_status' => session_status(),
+            'session_name' => session_name(),
+            'all_headers' => $headers,
+            'all_cookies' => $_COOKIE,
+            'session_data' => $_SESSION
+        ]
+    ]);
+}
+
+/*********************************
+ * PUT REQUESTS
  *********************************/
 function handlePutRequest($path, $data) {
     global $baseUrl;
     $db = new Database();
     $conn = $db->getConnection();
     
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
+    if (!$conn) {
+        ResponseHandler::error('Database connection failed', 500);
+    }
+    
+    // ALL cart PUT requests require authentication
+    $userId = checkAuthentication($conn);
+    if (!$userId) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    $userId = $_SESSION['user_id'];
-    
-    if (strpos($path, '/cart/items/') !== false) {
-        // Extract item ID from path
-        $parts = explode('/', $path);
-        $itemId = end($parts);
-        
-        if (is_numeric($itemId)) {
-            updateCartItem($conn, $userId, $itemId, $data);
-        } else {
-            ResponseHandler::error('Invalid item ID', 400);
-        }
+    // Handle update item action
+    $action = $data['action'] ?? '';
+    if ($action === 'update_item') {
+        updateCartItem($conn, $data, $userId);
     } else {
-        ResponseHandler::error('Endpoint not found', 404);
+        ResponseHandler::error('Invalid action for PUT request', 400);
     }
 }
 
 /*********************************
  * UPDATE CART ITEM
  *********************************/
-function updateCartItem($conn, $userId, $cartItemId, $data) {
+function updateCartItem($conn, $data, $userId) {
+    $cartItemId = $data['cart_item_id'] ?? null;
     $quantity = isset($data['quantity']) ? intval($data['quantity']) : null;
     $specialInstructions = isset($data['special_instructions']) ? 
                           trim($data['special_instructions']) : null;
+    $customizations = $data['customizations'] ?? null;
     
-    if ($quantity === null && $specialInstructions === null) {
+    if (!$cartItemId) {
+        ResponseHandler::error('Cart item ID is required', 400);
+    }
+    
+    if ($quantity === null && $specialInstructions === null && $customizations === null) {
         ResponseHandler::error('No update data provided', 400);
+    }
+    
+    // If quantity is 0, remove the item
+    if ($quantity === 0) {
+        removeCartItem($conn, $userId, $cartItemId);
+        return;
     }
     
     // Verify cart item belongs to user
     $verifyStmt = $conn->prepare(
-        "SELECT ci.id, ci.quantity, ci.special_instructions
+        "SELECT ci.id, ci.quantity, ci.special_instructions, ci.cart_id
          FROM cart_items ci
          JOIN carts c ON ci.cart_id = c.id
          WHERE ci.id = :cart_item_id
@@ -942,6 +1332,11 @@ function updateCartItem($conn, $userId, $cartItemId, $data) {
         $params[':instructions'] = $specialInstructions;
     }
     
+    if ($customizations !== null) {
+        $updates[] = 'customizations = :customizations';
+        $params[':customizations'] = json_encode($customizations);
+    }
+    
     if (empty($updates)) {
         ResponseHandler::error('No valid updates provided', 400);
     }
@@ -954,58 +1349,55 @@ function updateCartItem($conn, $userId, $cartItemId, $data) {
     
     // Update cart timestamp
     $cartUpdateStmt = $conn->prepare(
-        "UPDATE carts c
-         JOIN cart_items ci ON c.id = ci.cart_id
-         SET c.updated_at = NOW()
-         WHERE ci.id = :cart_item_id"
+        "UPDATE carts SET updated_at = NOW() WHERE id = :cart_id"
     );
-    $cartUpdateStmt->execute([':cart_item_id' => $cartItemId]);
+    $cartUpdateStmt->execute([':cart_id' => $cartItem['cart_id']]);
     
-    // Log activity
-    $action = $quantity !== null ? 'updated_quantity' : 'updated_instructions';
-    logUserActivity($conn, $userId, 'cart_item_updated', "Updated cart item $cartItemId", [
-        'cart_item_id' => $cartItemId,
-        'old_quantity' => $cartItem['quantity'],
-        'new_quantity' => $quantity,
-        'action' => $action
-    ]);
+    // Get updated cart summary
+    $cartItems = getCartItemsByCartId($conn, $cartItem['cart_id'], $GLOBALS['baseUrl']);
+    $totals = calculateCartTotals($conn, $cartItem['cart_id'], $userId);
     
     ResponseHandler::success([
-        'cart_item_id' => $cartItemId,
-        'updated_fields' => array_keys(array_filter([
-            'quantity' => $quantity !== null,
-            'special_instructions' => $specialInstructions !== null
-        ]))
-    ], 'Cart item updated successfully');
+        'success' => true,
+        'message' => 'Cart item updated successfully',
+        'data' => [
+            'cart_item_id' => $cartItemId,
+            'cart_item_count' => count($cartItems),
+            'cart_total_quantity' => $totals['total_quantity'],
+            'cart_subtotal' => $totals['subtotal']
+        ]
+    ]);
 }
 
 /*********************************
- * DELETE REQUESTS - Remove Cart Items
+ * DELETE REQUESTS
  *********************************/
 function handleDeleteRequest($path, $data) {
     global $baseUrl;
     $db = new Database();
     $conn = $db->getConnection();
     
-    // Check authentication
-    if (empty($_SESSION['user_id'])) {
+    if (!$conn) {
+        ResponseHandler::error('Database connection failed', 500);
+    }
+    
+    // ALL cart DELETE requests require authentication
+    $userId = checkAuthentication($conn);
+    if (!$userId) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    $userId = $_SESSION['user_id'];
-    
-    if (strpos($path, '/cart/items/') !== false) {
-        // Extract item ID from path
-        $parts = explode('/', $path);
-        $itemId = end($parts);
-        
-        if (is_numeric($itemId)) {
-            removeCartItem($conn, $userId, $itemId);
+    // Handle remove item action
+    $action = $data['action'] ?? '';
+    if ($action === 'remove_item') {
+        $cartItemId = $data['cart_item_id'] ?? null;
+        if ($cartItemId) {
+            removeCartItem($conn, $userId, $cartItemId);
         } else {
-            ResponseHandler::error('Invalid item ID', 400);
+            ResponseHandler::error('Cart item ID is required', 400);
         }
     } else {
-        ResponseHandler::error('Endpoint not found', 404);
+        ResponseHandler::error('Invalid action for DELETE request', 400);
     }
 }
 
@@ -1015,7 +1407,7 @@ function handleDeleteRequest($path, $data) {
 function removeCartItem($conn, $userId, $cartItemId) {
     // Verify cart item belongs to user
     $verifyStmt = $conn->prepare(
-        "SELECT ci.id, ci.item_id, mi.name as item_name
+        "SELECT ci.id, ci.cart_id, ci.item_id, mi.name as item_name
          FROM cart_items ci
          JOIN carts c ON ci.cart_id = c.id
          JOIN menu_items mi ON ci.item_id = mi.id
@@ -1046,24 +1438,25 @@ function removeCartItem($conn, $userId, $cartItemId) {
     
     // Update cart timestamp
     $cartUpdateStmt = $conn->prepare(
-        "UPDATE carts c
-         JOIN cart_items ci ON c.id = ci.cart_id
-         SET c.updated_at = NOW()
-         WHERE ci.id = :cart_item_id"
+        "UPDATE carts SET updated_at = NOW() WHERE id = :cart_id"
     );
-    $cartUpdateStmt->execute([':cart_item_id' => $cartItemId]);
+    $cartUpdateStmt->execute([':cart_id' => $cartItem['cart_id']]);
     
-    // Log activity
-    logUserActivity($conn, $userId, 'cart_item_removed', "Removed item from cart", [
-        'cart_item_id' => $cartItemId,
-        'item_id' => $cartItem['item_id'],
-        'item_name' => $cartItem['item_name']
-    ]);
+    // Get updated cart summary
+    $cartItems = getCartItemsByCartId($conn, $cartItem['cart_id'], $GLOBALS['baseUrl']);
+    $totals = calculateCartTotals($conn, $cartItem['cart_id'], $userId);
     
     ResponseHandler::success([
-        'cart_item_id' => $cartItemId,
-        'item_name' => $cartItem['item_name']
-    ], 'Item removed from cart');
+        'success' => true,
+        'message' => 'Item removed from cart',
+        'data' => [
+            'cart_item_id' => $cartItemId,
+            'item_name' => $cartItem['item_name'],
+            'cart_item_count' => count($cartItems),
+            'cart_total_quantity' => $totals['total_quantity'],
+            'cart_subtotal' => $totals['subtotal']
+        ]
+    ]);
 }
 
 /*********************************
@@ -1130,27 +1523,4 @@ function formatAddressData($address) {
         'is_default' => boolval($address['is_default'] ?? false)
     ];
 }
-
-function logUserActivity($conn, $userId, $activityType, $description, $metadata = []) {
-    try {
-        $stmt = $conn->prepare(
-            "INSERT INTO user_activities 
-                (user_id, activity_type, description, ip_address, user_agent, metadata, created_at)
-             VALUES (:user_id, :activity_type, :description, :ip_address, :user_agent, :metadata, NOW())"
-        );
-        
-        $stmt->execute([
-            ':user_id' => $userId,
-            ':activity_type' => $activityType,
-            ':description' => $description,
-            ':ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
-            ':user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
-            ':metadata' => json_encode($metadata)
-        ]);
-    } catch (Exception $e) {
-        // Log error but don't fail the main request
-        error_log('Failed to log user activity: ' . $e->getMessage());
-    }
-}
-
 ?>
