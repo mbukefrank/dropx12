@@ -96,7 +96,7 @@ function checkAuthentication($endpoint = null) {
  * BASE URL CONFIGURATION
  *********************************/
 // Update this with your actual backend URL
-$baseUrl = "https://dropxbackend-production.up.railway.app";
+$baseUrl = "https://dropx-production-6373.up.railway.app";
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';

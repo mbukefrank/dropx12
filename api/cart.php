@@ -100,7 +100,7 @@ function checkAuthentication($conn) {
 /*********************************
  * BASE URL CONFIGURATION
  *********************************/
-$baseUrl = "https://dropxbackend-production.up.railway.app";
+$baseUrl = "https://dropx-production-6373.up.railway.app";
 
 /*********************************
  * ROUTER
