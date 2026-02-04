@@ -382,14 +382,14 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
 
     $categoriesStmt = $conn->prepare(
         "SELECT DISTINCT 
-            category as name,
+            COALESCE(NULLIF(category, ''), 'Uncategorized') as name,
             COUNT(*) as item_count
         FROM menu_items 
         WHERE merchant_id = :merchant_id
         AND is_active = 1
         AND is_available = 1
-        GROUP BY category
-        ORDER BY category
+        GROUP BY COALESCE(NULLIF(category, ''), 'Uncategorized')
+        ORDER BY name
         LIMIT 10"
     );
     
@@ -403,7 +403,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
             mi.description,
             mi.price,
             mi.image_url,
-            mi.category,
+            COALESCE(NULLIF(mi.category, ''), 'Uncategorized') as category,
             mi.item_type,
             mi.unit_type,
             mi.unit_value,
@@ -525,19 +525,19 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
         error_log("DEBUG - Found " . count($quickOrderItems) . " quick order items");
     }
 
-    // Get categories from menu items
+    // Get categories from menu items - FIXED: Handle NULL/empty categories
     $categoriesStmt = $conn->prepare(
         "SELECT DISTINCT 
-            category as name,
+            COALESCE(NULLIF(category, ''), 'Uncategorized') as name,
             COUNT(*) as item_count
         FROM menu_items 
         WHERE merchant_id = :merchant_id
         AND is_active = 1
         AND is_available = 1
-        AND category IS NOT NULL
-        AND category != ''
-        GROUP BY category
-        ORDER BY category ASC"
+        GROUP BY COALESCE(NULLIF(category, ''), 'Uncategorized')
+        ORDER BY 
+            CASE WHEN COALESCE(NULLIF(category, ''), 'Uncategorized') = 'Uncategorized' THEN 1 ELSE 0 END,
+            name ASC"
     );
     
     $categoriesStmt->execute([':merchant_id' => $merchantId]);
@@ -548,12 +548,13 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     $displayOrder = 1;
     $categories = [];
     foreach ($uniqueCategories as $cat) {
+        $isUncategorized = ($cat['name'] === 'Uncategorized');
         $categories[] = [
             'id' => 0,
             'name' => $cat['name'],
             'description' => '',
             'image_url' => null,
-            'display_order' => $displayOrder++,
+            'display_order' => $isUncategorized ? 9999 : $displayOrder++,
             'item_count' => intval($cat['item_count']),
             'is_quick_order' => false
         ];
@@ -563,7 +564,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     if (!empty($quickOrderItems)) {
         $quickOrderCategories = [];
         foreach ($quickOrderItems as $item) {
-            $catName = $item['category'] ?: 'Quick Orders';
+            $catName = !empty($item['category']) ? $item['category'] . ' (Quick Order)' : 'Quick Orders';
             if (!isset($quickOrderCategories[$catName])) {
                 $quickOrderCategories[$catName] = 0;
             }
@@ -573,7 +574,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
         foreach ($quickOrderCategories as $catName => $count) {
             $categories[] = [
                 'id' => -1,
-                'name' => $catName . ' (Quick Order)',
+                'name' => $catName,
                 'description' => 'Pre-configured quick orders',
                 'image_url' => null,
                 'display_order' => 999,
@@ -583,7 +584,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
         }
     }
 
-    // Get menu items
+    // Get menu items - FIXED: Handle NULL categories
     $menuStmt = $conn->prepare(
         "SELECT 
             mi.id,
@@ -591,7 +592,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
             mi.description,
             mi.price,
             mi.image_url,
-            mi.category,
+            COALESCE(NULLIF(mi.category, ''), 'Uncategorized') as category,
             mi.item_type,
             mi.subcategory,
             mi.unit_type,
@@ -612,16 +613,38 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
         WHERE mi.merchant_id = :merchant_id
         AND mi.is_active = 1
         AND mi.is_available = 1
-        ORDER BY mi.category ASC, mi.display_order ASC, mi.name ASC"
+        ORDER BY 
+            CASE WHEN COALESCE(NULLIF(mi.category, ''), 'Uncategorized') = 'Uncategorized' THEN 1 ELSE 0 END,
+            mi.category ASC, 
+            mi.display_order ASC, 
+            mi.name ASC"
     );
     
     $menuStmt->execute([':merchant_id' => $merchantId]);
     $menuItems = $menuStmt->fetchAll(PDO::FETCH_ASSOC);
     
     error_log("DEBUG - Found " . count($menuItems) . " menu items");
+    
+    // Debug: Show first few items
+    if (!empty($menuItems)) {
+        error_log("DEBUG - First menu item: " . json_encode($menuItems[0]));
+    }
 
     $allItems = array_merge($menuItems, $quickOrderItems);
     error_log("DEBUG - Total items: " . count($allItems));
+
+    // If no categories found but we have items, create a default category
+    if (empty($categories) && !empty($allItems)) {
+        $categories[] = [
+            'id' => 0,
+            'name' => 'All Items',
+            'description' => 'All available items',
+            'image_url' => null,
+            'display_order' => 1,
+            'item_count' => count($allItems),
+            'is_quick_order' => false
+        ];
+    }
 
     // Organize items by category
     $itemsByCategory = [];
@@ -634,29 +657,16 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
             'items' => []
         ];
     }
-    
-    // Add uncategorized category
-    $itemsByCategory['Uncategorized'] = [
-        'category_info' => [
-            'id' => 0,
-            'name' => 'Uncategorized',
-            'description' => 'Items without category',
-            'image_url' => null,
-            'display_order' => 9999,
-            'item_count' => 0,
-            'is_quick_order' => false,
-            'item_types' => []
-        ],
-        'items' => []
-    ];
 
     // Distribute items to categories
     foreach ($allItems as $item) {
-        $categoryName = $item['category'] ?: 'Uncategorized';
+        $categoryName = $item['category'] ?? 'Uncategorized';
         
         // Handle quick order items
         if ($item['source'] === 'quick_order' && !empty($item['category'])) {
             $categoryName = $item['category'] . ' (Quick Order)';
+        } elseif ($item['source'] === 'quick_order') {
+            $categoryName = 'Quick Orders';
         }
         
         // Create category if it doesn't exist
@@ -730,17 +740,15 @@ function getMerchantCategories($conn, $merchantId, $baseUrl) {
 
     $categoriesStmt = $conn->prepare(
         "SELECT 
-            category as name,
+            COALESCE(NULLIF(category, ''), 'Uncategorized') as name,
             COUNT(*) as item_count,
             GROUP_CONCAT(DISTINCT item_type) as item_types
         FROM menu_items 
         WHERE merchant_id = :merchant_id
         AND is_active = 1
         AND is_available = 1
-        AND category IS NOT NULL
-        AND category != ''
-        GROUP BY category
-        ORDER BY category ASC"
+        GROUP BY COALESCE(NULLIF(category, ''), 'Uncategorized')
+        ORDER BY name ASC"
     );
     
     $categoriesStmt->execute([':merchant_id' => $merchantId]);
@@ -764,15 +772,15 @@ function getMerchantCategories($conn, $merchantId, $baseUrl) {
 
     $quickOrderCategoriesStmt = $conn->prepare(
         "SELECT 
-            qo.category as name,
+            COALESCE(NULLIF(qo.category, ''), 'Quick Orders') as name,
             COUNT(*) as item_count,
             GROUP_CONCAT(DISTINCT qo.item_type) as item_types
         FROM quick_orders qo
         INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
         WHERE qom.merchant_id = :merchant_id
         AND qom.is_active = 1
-        GROUP BY qo.category
-        ORDER BY qo.category ASC"
+        GROUP BY COALESCE(NULLIF(qo.category, ''), 'Quick Orders')
+        ORDER BY name ASC"
     );
     
     $quickOrderCategoriesStmt->execute([':merchant_id' => $merchantId]);
@@ -831,7 +839,7 @@ function getMerchantQuickOrders($conn, $merchantId, $baseUrl) {
     $params = [':merchant_id' => $merchantId];
 
     if ($category) {
-        $whereConditions[] = "qo.category = :category";
+        $whereConditions[] = "COALESCE(NULLIF(qo.category, ''), 'Quick Orders') = :category";
         $params[':category'] = $category;
     }
 
@@ -854,7 +862,7 @@ function getMerchantQuickOrders($conn, $merchantId, $baseUrl) {
                 qo.id,
                 qo.title,
                 qo.description,
-                qo.category,
+                COALESCE(NULLIF(qo.category, ''), 'Quick Orders') as category,
                 qo.item_type,
                 qo.image_url,
                 qo.price,
@@ -890,12 +898,12 @@ function getMerchantQuickOrders($conn, $merchantId, $baseUrl) {
     }, $quickOrders);
 
     $categoryStmt = $conn->prepare(
-        "SELECT DISTINCT qo.category 
+        "SELECT DISTINCT COALESCE(NULLIF(qo.category, ''), 'Quick Orders') as category
          FROM quick_orders qo
          INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
          WHERE qom.merchant_id = :merchant_id
          AND qom.is_active = 1
-         ORDER BY qo.category"
+         ORDER BY category"
     );
     $categoryStmt->execute([':merchant_id' => $merchantId]);
     $availableCategories = $categoryStmt->fetchAll(PDO::FETCH_COLUMN);
@@ -1201,7 +1209,7 @@ function searchMenuItems($conn, $data, $baseUrl) {
     }
 
     if ($category) {
-        $whereConditions[] = "mi.category = :category";
+        $whereConditions[] = "COALESCE(NULLIF(mi.category, ''), 'Uncategorized') = :category";
         $params[':category'] = $category;
     }
 
@@ -1227,7 +1235,7 @@ function searchMenuItems($conn, $data, $baseUrl) {
                 mi.description,
                 mi.price,
                 mi.image_url,
-                mi.category,
+                COALESCE(NULLIF(mi.category, ''), 'Uncategorized') as category,
                 mi.item_type,
                 mi.unit_type,
                 mi.unit_value,
