@@ -50,58 +50,165 @@ function getBaseUrl() {
 }
 
 /*********************************
- * ROUTER
+ * ROUTER - UPDATED WITH ALL ENDPOINTS
  *********************************/
 try {
     $method = $_SERVER['REQUEST_METHOD'];
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+    $queryString = parse_url($_SERVER['REQUEST_URI'], PHP_URL_QUERY);
+    
+    // Parse query parameters
+    parse_str($queryString ?? '', $queryParams);
     
     $pathParts = explode('/', trim($path, '/'));
-    $merchantId = null;
     
-    if (count($pathParts) >= 2 && $pathParts[0] === 'merchants') {
-        $merchantId = intval($pathParts[1]);
+    // Handle path-based routing
+    if (count($pathParts) >= 3) {
+        $firstPart = $pathParts[0];
+        
+        // Check if URL starts with merchants
+        if ($firstPart === 'merchants') {
+            $merchantId = intval($pathParts[1]);
+            $action = $pathParts[2];
+            
+            if ($method === 'GET') {
+                $conn = initDatabase();
+                $baseUrl = getBaseUrl();
+                
+                switch ($action) {
+                    case 'menu':
+                        $includeQuickOrders = isset($queryParams['include_quick_orders']) 
+                            ? filter_var($queryParams['include_quick_orders'], FILTER_VALIDATE_BOOLEAN)
+                            : true;
+                        getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders);
+                        break;
+                        
+                    case 'categories':
+                        getMerchantCategories($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'quick-orders':
+                        getMerchantQuickOrders($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'stats':
+                        getMerchantStats($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'hours':
+                        getMerchantOperatingHours($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'promotions':
+                        getMerchantPromotions($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'reviews':
+                        getMerchantReviews($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'item-types':
+                        getMerchantItemTypes($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    case 'payment-methods':
+                        getMerchantPaymentMethods($conn, $merchantId, $baseUrl);
+                        break;
+                        
+                    default:
+                        ResponseHandler::error('Invalid action specified', 400);
+                }
+                exit();
+            }
+        }
     }
-
+    
+    // Handle /merchants/{id}
+    if (count($pathParts) >= 2) {
+        $firstPart = $pathParts[0];
+        if ($firstPart === 'merchants') {
+            $merchantId = intval($pathParts[1]);
+            
+            if ($method === 'GET') {
+                $conn = initDatabase();
+                $baseUrl = getBaseUrl();
+                getMerchantDetails($conn, $merchantId, $baseUrl);
+                exit();
+            }
+        }
+    }
+    
+    // Default: handle GET or POST requests
     if ($method === 'GET') {
-        handleGetRequest($merchantId, $pathParts);
+        // Handle GET requests to /merchants (list)
+        if (empty($pathParts) || $pathParts[0] === 'merchants') {
+            $conn = initDatabase();
+            $baseUrl = getBaseUrl();
+            getMerchantsList($conn, $baseUrl);
+            exit();
+        }
     } elseif ($method === 'POST') {
         handlePostRequest();
     } else {
         ResponseHandler::error('Method not allowed', 405);
     }
+    
+    // If no route matched
+    ResponseHandler::error('Endpoint not found', 404);
+    
 } catch (Exception $e) {
+    error_log("Router Error: " . $e->getMessage() . "\n" . $e->getTraceAsString());
     ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
 }
 
 /*********************************
- * GET REQUESTS
+ * POST REQUEST HANDLER - UPDATED
  *********************************/
-function handleGetRequest($merchantId = null, $pathParts = []) {
+function handlePostRequest() {
     $conn = initDatabase();
     $baseUrl = getBaseUrl();
+
+    $input = json_decode(file_get_contents('php://input'), true);
+    if (!$input) {
+        $input = $_POST;
+    }
     
-    if ($merchantId) {
-        if (isset($pathParts[2]) && $pathParts[2] === 'menu') {
-            getMerchantMenu($conn, $merchantId, $baseUrl);
-        }
-        elseif (isset($pathParts[2]) && $pathParts[2] === 'categories') {
-            getMerchantCategories($conn, $merchantId, $baseUrl);
-        }
-        elseif (isset($pathParts[2]) && $pathParts[2] === 'quick-orders') {
-            getMerchantQuickOrders($conn, $merchantId, $baseUrl);
-        }
-        else {
-            getMerchantDetails($conn, $merchantId, $baseUrl);
-        }
-    } else {
-        getMerchantsList($conn, $baseUrl);
+    $action = $input['action'] ?? '';
+
+    switch ($action) {
+        case 'create_review':
+            createMerchantReview($conn, $input);
+            break;
+        case 'toggle_favorite':
+            toggleMerchantFavorite($conn, $input);
+            break;
+        case 'get_favorites':
+            getFavoriteMerchants($conn, $input, $baseUrl);
+            break;
+        case 'report_merchant':
+            reportMerchant($conn, $input);
+            break;
+        case 'search_menu':
+            searchMenuItems($conn, $input, $baseUrl);
+            break;
+        case 'check_availability':
+            checkMerchantAvailability($conn, $input);
+            break;
+        case 'check_delivery':
+            checkDeliveryAvailability($conn, $input);
+            break;
+        case 'get_multiple':
+            getMultipleMerchants($conn, $input, $baseUrl);
+            break;
+        default:
+            ResponseHandler::error('Invalid action', 400);
     }
 }
 
 /*********************************
- * GET MERCHANTS LIST
+ * EXISTING MERCHANT FUNCTIONS
  *********************************/
+
 function getMerchantsList($conn, $baseUrl) {
     $page = max(1, intval($_GET['page'] ?? 1));
     $limit = min(50, max(1, intval($_GET['limit'] ?? 20)));
@@ -244,31 +351,6 @@ function getMerchantsList($conn, $baseUrl) {
     ]);
 }
 
-function getBusinessTypeCounts($conn) {
-    $counts = [];
-    
-    $stmt = $conn->prepare(
-        "SELECT 
-            business_type,
-            COUNT(*) as count
-        FROM merchants 
-        WHERE business_type IS NOT NULL
-        AND is_active = 1
-        GROUP BY business_type"
-    );
-    $stmt->execute();
-    
-    $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    foreach ($results as $row) {
-        $counts[$row['business_type']] = intval($row['count']);
-    }
-    
-    return $counts;
-}
-
-/*********************************
- * GET MERCHANT DETAILS
- *********************************/
 function getMerchantDetails($conn, $merchantId, $baseUrl) {
     $stmt = $conn->prepare(
         "SELECT 
@@ -429,33 +511,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
     ]);
 }
 
-function formatQuickOrderForMerchant($order, $baseUrl) {
-    $imageUrl = '';
-    if (!empty($order['image_url'])) {
-        if (strpos($order['image_url'], 'http') === 0) {
-            $imageUrl = $order['image_url'];
-        } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick-orders/' . $order['image_url'];
-        }
-    }
-    
-    return [
-        'id' => $order['id'] ?? null,
-        'title' => $order['title'] ?? '',
-        'description' => $order['description'] ?? '',
-        'category' => $order['category'] ?? '',
-        'item_type' => $order['item_type'] ?? 'food',
-        'image_url' => $imageUrl,
-        'price' => floatval($order['price'] ?? 0),
-        'formatted_price' => 'MK ' . number_format(floatval($order['price'] ?? 0), 2),
-        'rating' => floatval($order['rating'] ?? 0)
-    ];
-}
-
-/*********************************
- * GET MERCHANT MENU
- *********************************/
-function getMerchantMenu($conn, $merchantId, $baseUrl) {
+function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = true) {
     $checkStmt = $conn->prepare(
         "SELECT id, name, business_type FROM merchants 
          WHERE id = :id AND is_active = 1"
@@ -466,8 +522,6 @@ function getMerchantMenu($conn, $merchantId, $baseUrl) {
     if (!$merchant) {
         ResponseHandler::error('Merchant not found or inactive', 404);
     }
-
-    $includeQuickOrders = $_GET['include_quick_orders'] ?? true;
 
     $quickOrderItems = [];
     if ($includeQuickOrders) {
@@ -669,9 +723,95 @@ function getMerchantMenu($conn, $merchantId, $baseUrl) {
     ]);
 }
 
-/*********************************
- * GET MERCHANT QUICK ORDERS
- *********************************/
+function getMerchantCategories($conn, $merchantId, $baseUrl) {
+    $checkStmt = $conn->prepare(
+        "SELECT id, name FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $categoriesStmt = $conn->prepare(
+        "SELECT 
+            category as name,
+            COUNT(*) as item_count,
+            GROUP_CONCAT(DISTINCT item_type) as item_types
+        FROM menu_items 
+        WHERE merchant_id = :merchant_id
+        AND is_active = 1
+        AND is_available = 1
+        AND category IS NOT NULL
+        AND category != ''
+        GROUP BY category
+        ORDER BY category ASC"
+    );
+    
+    $categoriesStmt->execute([':merchant_id' => $merchantId]);
+    $uniqueCategories = $categoriesStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    $displayOrder = 1;
+    $categories = [];
+    foreach ($uniqueCategories as $cat) {
+        $itemTypes = !empty($cat['item_types']) ? explode(',', $cat['item_types']) : [];
+        $categories[] = [
+            'id' => 0,
+            'name' => $cat['name'],
+            'description' => '',
+            'display_order' => $displayOrder++,
+            'image_url' => null,
+            'is_active' => true,
+            'item_count' => intval($cat['item_count']),
+            'item_types' => $itemTypes
+        ];
+    }
+
+    $quickOrderCategoriesStmt = $conn->prepare(
+        "SELECT 
+            qo.category as name,
+            COUNT(*) as item_count,
+            GROUP_CONCAT(DISTINCT qo.item_type) as item_types
+        FROM quick_orders qo
+        INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
+        WHERE qom.merchant_id = :merchant_id
+        AND qom.is_active = 1
+        GROUP BY qo.category
+        ORDER BY qo.category ASC"
+    );
+    
+    $quickOrderCategoriesStmt->execute([':merchant_id' => $merchantId]);
+    $quickOrderCategories = $quickOrderCategoriesStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    foreach ($quickOrderCategories as $cat) {
+        $itemTypes = !empty($cat['item_types']) ? explode(',', $cat['item_types']) : [];
+        $categories[] = [
+            'id' => -1,
+            'name' => $cat['name'] . ' (Quick Order)',
+            'description' => 'Pre-configured quick orders',
+            'display_order' => 999,
+            'image_url' => null,
+            'is_active' => true,
+            'item_count' => intval($cat['item_count']),
+            'item_types' => $itemTypes,
+            'is_quick_order' => true
+        ];
+    }
+
+    $formattedCategories = array_map(function($cat) use ($baseUrl) {
+        return formatCategoryData($cat, $baseUrl);
+    }, $categories);
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'categories' => $formattedCategories,
+        'total_categories' => count($formattedCategories)
+    ]);
+}
+
 function getMerchantQuickOrders($conn, $merchantId, $baseUrl) {
     $checkStmt = $conn->prepare(
         "SELECT id, name FROM merchants 
@@ -780,6 +920,706 @@ function getMerchantQuickOrders($conn, $merchantId, $baseUrl) {
     ]);
 }
 
+/*********************************
+ * NEW ENDPOINTS TO MATCH DART CODE
+ *********************************/
+
+// Get merchant statistics (dashboard)
+function getMerchantStats($conn, $merchantId, $baseUrl) {
+    if (empty($_SESSION['user_id'])) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+    
+    $checkStmt = $conn->prepare(
+        "SELECT id, name FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    // Check if user has access to merchant stats (admin or merchant owner)
+    $accessStmt = $conn->prepare(
+        "SELECT role FROM users WHERE id = :user_id"
+    );
+    $accessStmt->execute([':user_id' => $_SESSION['user_id']]);
+    $user = $accessStmt->fetch(PDO::FETCH_ASSOC);
+    
+    // For now, allow only admins
+    if ($user['role'] !== 'admin') {
+        ResponseHandler::error('Unauthorized access', 403);
+    }
+
+    // Get total orders
+    $ordersStmt = $conn->prepare(
+        "SELECT 
+            COUNT(*) as total_orders,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_orders,
+            SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
+            AVG(CASE WHEN status = 'completed' THEN total_amount END) as avg_order_value,
+            SUM(CASE WHEN status = 'completed' THEN total_amount END) as total_revenue
+        FROM orders 
+        WHERE merchant_id = :merchant_id
+        AND DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)"
+    );
+    $ordersStmt->execute([':merchant_id' => $merchantId]);
+    $orderStats = $ordersStmt->fetch(PDO::FETCH_ASSOC);
+
+    // Get recent reviews
+    $reviewsStmt = $conn->prepare(
+        "SELECT 
+            COUNT(*) as total_reviews,
+            AVG(rating) as avg_rating
+        FROM merchant_reviews 
+        WHERE merchant_id = :merchant_id
+        AND DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)"
+    );
+    $reviewsStmt->execute([':merchant_id' => $merchantId]);
+    $reviewStats = $reviewsStmt->fetch(PDO::FETCH_ASSOC);
+
+    // Get popular items
+    $itemsStmt = $conn->prepare(
+        "SELECT 
+            mi.name,
+            COUNT(oi.id) as order_count
+        FROM order_items oi
+        JOIN menu_items mi ON oi.menu_item_id = mi.id
+        JOIN orders o ON oi.order_id = o.id
+        WHERE o.merchant_id = :merchant_id
+        AND o.status = 'completed'
+        AND DATE(o.created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+        GROUP BY mi.id
+        ORDER BY order_count DESC
+        LIMIT 5"
+    );
+    $itemsStmt->execute([':merchant_id' => $merchantId]);
+    $popularItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'statistics' => [
+            'orders' => [
+                'total' => intval($orderStats['total_orders'] ?? 0),
+                'completed' => intval($orderStats['completed_orders'] ?? 0),
+                'cancelled' => intval($orderStats['cancelled_orders'] ?? 0),
+                'completion_rate' => $orderStats['total_orders'] > 0 
+                    ? round(($orderStats['completed_orders'] / $orderStats['total_orders']) * 100, 2)
+                    : 0,
+                'avg_order_value' => floatval($orderStats['avg_order_value'] ?? 0),
+                'total_revenue' => floatval($orderStats['total_revenue'] ?? 0)
+            ],
+            'reviews' => [
+                'total' => intval($reviewStats['total_reviews'] ?? 0),
+                'avg_rating' => floatval($reviewStats['avg_rating'] ?? 0)
+            ],
+            'popular_items' => $popularItems
+        ],
+        'period' => 'last_30_days',
+        'generated_at' => date('Y-m-d H:i:s')
+    ]);
+}
+
+// Get merchant operating hours
+function getMerchantOperatingHours($conn, $merchantId, $baseUrl) {
+    $checkStmt = $conn->prepare(
+        "SELECT id, name, operating_hours FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $operatingHours = [];
+    if (!empty($merchant['operating_hours'])) {
+        try {
+            $operatingHours = json_decode($merchant['operating_hours'], true);
+            if (!is_array($operatingHours)) {
+                $operatingHours = [];
+            }
+        } catch (Exception $e) {
+            $operatingHours = [];
+        }
+    }
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'operating_hours' => $operatingHours,
+        'is_open' => isMerchantOpen($operatingHours)
+    ]);
+}
+
+function isMerchantOpen($operatingHours) {
+    if (empty($operatingHours)) {
+        return true; // Default to open if no hours specified
+    }
+
+    $currentDay = strtolower(date('l')); // Monday, Tuesday, etc.
+    $currentTime = date('H:i');
+
+    foreach ($operatingHours as $day => $hours) {
+        if (strtolower($day) === $currentDay) {
+            if (empty($hours) || $hours === 'closed') {
+                return false;
+            }
+
+            $timeSlots = is_array($hours) ? $hours : explode('-', $hours);
+            foreach ($timeSlots as $slot) {
+                if (is_array($slot)) {
+                    $openTime = $slot['open'] ?? '';
+                    $closeTime = $slot['close'] ?? '';
+                    
+                    if ($openTime && $closeTime && $currentTime >= $openTime && $currentTime <= $closeTime) {
+                        return true;
+                    }
+                } else {
+                    list($openTime, $closeTime) = explode('-', $slot);
+                    if ($currentTime >= $openTime && $currentTime <= $closeTime) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+// Get merchant promotions
+function getMerchantPromotions($conn, $merchantId, $baseUrl) {
+    $checkStmt = $conn->prepare(
+        "SELECT id, name FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $promotionsStmt = $conn->prepare(
+        "SELECT 
+            p.id,
+            p.title,
+            p.description,
+            p.discount_type,
+            p.discount_value,
+            p.min_order_amount,
+            p.max_discount,
+            p.valid_from,
+            p.valid_until,
+            p.code,
+            p.image_url,
+            p.is_active,
+            p.created_at
+        FROM promotions p
+        WHERE p.merchant_id = :merchant_id
+        AND p.is_active = 1
+        AND (p.valid_until IS NULL OR p.valid_until >= CURDATE())
+        ORDER BY p.priority DESC, p.created_at DESC"
+    );
+    
+    $promotionsStmt->execute([':merchant_id' => $merchantId]);
+    $promotions = $promotionsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $formattedPromotions = array_map(function($promotion) use ($baseUrl) {
+        $imageUrl = '';
+        if (!empty($promotion['image_url'])) {
+            if (strpos($promotion['image_url'], 'http') === 0) {
+                $imageUrl = $promotion['image_url'];
+            } else {
+                $imageUrl = rtrim($baseUrl, '/') . '/uploads/promotions/' . $promotion['image_url'];
+            }
+        }
+        
+        return [
+            'id' => $promotion['id'],
+            'title' => $promotion['title'],
+            'description' => $promotion['description'],
+            'discount_type' => $promotion['discount_type'] ?? 'percentage',
+            'discount_value' => floatval($promotion['discount_value'] ?? 0),
+            'min_order_amount' => floatval($promotion['min_order_amount'] ?? 0),
+            'max_discount' => floatval($promotion['max_discount'] ?? 0),
+            'valid_from' => $promotion['valid_from'],
+            'valid_until' => $promotion['valid_until'],
+            'code' => $promotion['code'],
+            'image_url' => $imageUrl,
+            'is_active' => boolval($promotion['is_active']),
+            'created_at' => $promotion['created_at']
+        ];
+    }, $promotions);
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'promotions' => $formattedPromotions,
+        'total_promotions' => count($formattedPromotions)
+    ]);
+}
+
+// Get merchant reviews with pagination
+function getMerchantReviews($conn, $merchantId, $baseUrl) {
+    $checkStmt = $conn->prepare(
+        "SELECT id, name FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $page = max(1, intval($_GET['page'] ?? 1));
+    $limit = min(50, max(1, intval($_GET['limit'] ?? 10)));
+    $offset = ($page - 1) * $limit;
+    $sortBy = $_GET['sort_by'] ?? 'created_at';
+    $sortOrder = strtoupper($_GET['sort_order'] ?? 'DESC');
+
+    $allowedSortColumns = ['created_at', 'rating', 'helpful_count'];
+    $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
+    $sortOrder = $sortOrder === 'ASC' ? 'ASC' : 'DESC';
+
+    $countSql = "SELECT COUNT(*) as total 
+                 FROM merchant_reviews mr
+                 WHERE mr.merchant_id = :merchant_id";
+    $countStmt = $conn->prepare($countSql);
+    $countStmt->execute([':merchant_id' => $merchantId]);
+    $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+
+    $sql = "SELECT 
+                mr.id,
+                mr.user_id,
+                u.full_name as user_name,
+                u.avatar as user_avatar,
+                mr.rating,
+                mr.comment,
+                mr.helpful_count,
+                mr.created_at
+            FROM merchant_reviews mr
+            LEFT JOIN users u ON mr.user_id = u.id
+            WHERE mr.merchant_id = :merchant_id
+            ORDER BY mr.$sortBy $sortOrder
+            LIMIT :limit OFFSET :offset";
+
+    $stmt = $conn->prepare($sql);
+    $stmt->bindValue(':merchant_id', $merchantId, PDO::PARAM_INT);
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    
+    $reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $formattedReviews = array_map('formatReviewData', $reviews);
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'reviews' => $formattedReviews,
+        'pagination' => [
+            'current_page' => $page,
+            'per_page' => $limit,
+            'total_items' => $totalCount,
+            'total_pages' => ceil($totalCount / $limit)
+        ],
+        'sorting' => [
+            'sort_by' => $sortBy,
+            'sort_order' => $sortOrder
+        ]
+    ]);
+}
+
+// Get merchant item types
+function getMerchantItemTypes($conn, $merchantId, $baseUrl) {
+    $checkStmt = $conn->prepare(
+        "SELECT id, name, item_types FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $itemTypes = [];
+    if (!empty($merchant['item_types'])) {
+        try {
+            $itemTypes = json_decode($merchant['item_types'], true);
+            if (!is_array($itemTypes)) {
+                $itemTypes = [];
+            }
+        } catch (Exception $e) {
+            $itemTypes = [];
+        }
+    }
+
+    // Also get item types from menu items
+    $menuItemTypesStmt = $conn->prepare(
+        "SELECT DISTINCT item_type 
+         FROM menu_items 
+         WHERE merchant_id = :merchant_id
+         AND is_active = 1
+         AND item_type IS NOT NULL
+         AND item_type != ''"
+    );
+    
+    $menuItemTypesStmt->execute([':merchant_id' => $merchantId]);
+    $menuItemTypes = $menuItemTypesStmt->fetchAll(PDO::FETCH_COLUMN);
+
+    // Merge and deduplicate
+    $allItemTypes = array_unique(array_merge($itemTypes, $menuItemTypes));
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'item_types' => array_values($allItemTypes),
+        'total_item_types' => count($allItemTypes)
+    ]);
+}
+
+// Get merchant payment methods
+function getMerchantPaymentMethods($conn, $merchantId, $baseUrl) {
+    $checkStmt = $conn->prepare(
+        "SELECT id, name, payment_methods FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $paymentMethods = [];
+    if (!empty($merchant['payment_methods'])) {
+        try {
+            $paymentMethods = json_decode($merchant['payment_methods'], true);
+            if (!is_array($paymentMethods)) {
+                $paymentMethods = [];
+            }
+        } catch (Exception $e) {
+            $paymentMethods = [];
+        }
+    }
+
+    // Default payment methods if none specified
+    if (empty($paymentMethods)) {
+        $paymentMethods = ['cash', 'card', 'mobile_money'];
+    }
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'payment_methods' => $paymentMethods,
+        'total_payment_methods' => count($paymentMethods)
+    ]);
+}
+
+/*********************************
+ * POST ACTION FUNCTIONS - NEW
+ *********************************/
+
+function checkMerchantAvailability($conn, $data) {
+    $merchantId = $data['merchant_id'] ?? null;
+    $dateTime = $data['date_time'] ?? null;
+
+    if (!$merchantId || !$dateTime) {
+        ResponseHandler::error('Merchant ID and date time are required', 400);
+    }
+
+    try {
+        $requestDateTime = new DateTime($dateTime);
+    } catch (Exception $e) {
+        ResponseHandler::error('Invalid date time format', 400);
+    }
+
+    $checkStmt = $conn->prepare(
+        "SELECT id, name, operating_hours FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    $operatingHours = [];
+    if (!empty($merchant['operating_hours'])) {
+        try {
+            $operatingHours = json_decode($merchant['operating_hours'], true);
+            if (!is_array($operatingHours)) {
+                $operatingHours = [];
+            }
+        } catch (Exception $e) {
+            $operatingHours = [];
+        }
+    }
+
+    $requestDay = strtolower($requestDateTime->format('l'));
+    $requestTime = $requestDateTime->format('H:i');
+
+    $isAvailable = false;
+    if (empty($operatingHours)) {
+        $isAvailable = true; // Always available if no hours specified
+    } else {
+        foreach ($operatingHours as $day => $hours) {
+            if (strtolower($day) === $requestDay) {
+                if (empty($hours) || $hours === 'closed') {
+                    $isAvailable = false;
+                    break;
+                }
+
+                $timeSlots = is_array($hours) ? $hours : explode('-', $hours);
+                foreach ($timeSlots as $slot) {
+                    if (is_array($slot)) {
+                        $openTime = $slot['open'] ?? '';
+                        $closeTime = $slot['close'] ?? '';
+                        
+                        if ($openTime && $closeTime && $requestTime >= $openTime && $requestTime <= $closeTime) {
+                            $isAvailable = true;
+                            break 2;
+                        }
+                    } else {
+                        list($openTime, $closeTime) = explode('-', $slot);
+                        if ($requestTime >= $openTime && $requestTime <= $closeTime) {
+                            $isAvailable = true;
+                            break 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'requested_datetime' => $dateTime,
+        'is_available' => $isAvailable,
+        'message' => $isAvailable ? 'Merchant is available at requested time' : 'Merchant is not available at requested time'
+    ]);
+}
+
+function checkDeliveryAvailability($conn, $data) {
+    $merchantId = $data['merchant_id'] ?? null;
+    $addressId = $data['address_id'] ?? null;
+    $latitude = $data['latitude'] ?? null;
+    $longitude = $data['longitude'] ?? null;
+
+    if (!$merchantId || (!$addressId && (!$latitude || !$longitude))) {
+        ResponseHandler::error('Merchant ID and location information are required', 400);
+    }
+
+    $checkStmt = $conn->prepare(
+        "SELECT id, name, delivery_radius, latitude, longitude FROM merchants 
+         WHERE id = :id AND is_active = 1"
+    );
+    $checkStmt->execute([':id' => $merchantId]);
+    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$merchant) {
+        ResponseHandler::error('Merchant not found or inactive', 404);
+    }
+
+    // If address ID provided, get coordinates from address
+    if ($addressId && !empty($_SESSION['user_id'])) {
+        $addressStmt = $conn->prepare(
+            "SELECT latitude, longitude FROM user_addresses 
+             WHERE id = :address_id AND user_id = :user_id"
+        );
+        $addressStmt->execute([
+            ':address_id' => $addressId,
+            ':user_id' => $_SESSION['user_id']
+        ]);
+        $address = $addressStmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($address) {
+            $latitude = $address['latitude'];
+            $longitude = $address['longitude'];
+        }
+    }
+
+    if (!$latitude || !$longitude) {
+        ResponseHandler::error('Could not determine location coordinates', 400);
+    }
+
+    // Calculate distance between merchant and customer
+    $distance = calculateDistance(
+        floatval($merchant['latitude']),
+        floatval($merchant['longitude']),
+        floatval($latitude),
+        floatval($longitude)
+    );
+
+    $deliveryRadius = floatval($merchant['delivery_radius'] ?? 5); // Default 5km
+    $isWithinRadius = $distance <= $deliveryRadius;
+
+    ResponseHandler::success([
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'delivery_radius' => $deliveryRadius,
+        'customer_distance' => round($distance, 2),
+        'is_within_radius' => $isWithinRadius,
+        'can_deliver' => $isWithinRadius,
+        'message' => $isWithinRadius 
+            ? 'Delivery is available to your location' 
+            : 'Delivery is not available to your location (outside delivery radius)'
+    ]);
+}
+
+function getMultipleMerchants($conn, $data, $baseUrl) {
+    $merchantIds = $data['merchant_ids'] ?? [];
+    
+    if (empty($merchantIds) || !is_array($merchantIds)) {
+        ResponseHandler::error('Merchant IDs array is required', 400);
+    }
+
+    if (count($merchantIds) > 20) {
+        ResponseHandler::error('Maximum 20 merchants per request', 400);
+    }
+
+    // Convert to integers and filter invalid values
+    $validMerchantIds = [];
+    foreach ($merchantIds as $id) {
+        $intId = intval($id);
+        if ($intId > 0) {
+            $validMerchantIds[] = $intId;
+        }
+    }
+
+    if (empty($validMerchantIds)) {
+        ResponseHandler::error('No valid merchant IDs provided', 400);
+    }
+
+    $placeholders = implode(',', array_fill(0, count($validMerchantIds), '?'));
+    
+    $sql = "SELECT 
+                m.id,
+                m.name,
+                m.category,
+                m.business_type,
+                m.item_types,
+                m.rating,
+                m.review_count,
+                CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
+                m.image_url,
+                m.is_open,
+                m.is_promoted,
+                m.delivery_fee,
+                m.min_order_amount,
+                m.delivery_radius,
+                m.created_at,
+                m.updated_at
+            FROM merchants m
+            WHERE m.id IN ($placeholders)
+            AND m.is_active = 1
+            ORDER BY FIELD(m.id, " . implode(',', $validMerchantIds) . ")";
+
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($validMerchantIds);
+    $merchants = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $formattedMerchants = array_map(function($m) use ($baseUrl) {
+        return formatMerchantListData($m, $baseUrl);
+    }, $merchants);
+
+    // Create a map for quick lookup
+    $merchantMap = [];
+    foreach ($formattedMerchants as $merchant) {
+        $merchantMap[$merchant['id']] = $merchant;
+    }
+
+    // Return in requested order
+    $orderedMerchants = [];
+    foreach ($validMerchantIds as $id) {
+        if (isset($merchantMap[$id])) {
+            $orderedMerchants[] = $merchantMap[$id];
+        }
+    }
+
+    ResponseHandler::success([
+        'merchants' => $orderedMerchants,
+        'total_returned' => count($orderedMerchants),
+        'total_requested' => count($validMerchantIds)
+    ]);
+}
+
+/*********************************
+ * HELPER FUNCTIONS
+ *********************************/
+
+function getBusinessTypeCounts($conn) {
+    $counts = [];
+    
+    $stmt = $conn->prepare(
+        "SELECT 
+            business_type,
+            COUNT(*) as count
+        FROM merchants 
+        WHERE business_type IS NOT NULL
+        AND is_active = 1
+        GROUP BY business_type"
+    );
+    $stmt->execute();
+    
+    $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($results as $row) {
+        $counts[$row['business_type']] = intval($row['count']);
+    }
+    
+    return $counts;
+}
+
+function calculateDistance($lat1, $lon1, $lat2, $lon2) {
+    $earthRadius = 6371; // km
+
+    $lat1 = deg2rad($lat1);
+    $lon1 = deg2rad($lon1);
+    $lat2 = deg2rad($lat2);
+    $lon2 = deg2rad($lon2);
+
+    $latDelta = $lat2 - $lat1;
+    $lonDelta = $lon2 - $lon1;
+
+    $angle = 2 * asin(sqrt(pow(sin($latDelta / 2), 2) +
+        cos($lat1) * cos($lat2) * pow(sin($lonDelta / 2), 2)));
+    
+    return $angle * $earthRadius;
+}
+
+function formatQuickOrderForMerchant($order, $baseUrl) {
+    $imageUrl = '';
+    if (!empty($order['image_url'])) {
+        if (strpos($order['image_url'], 'http') === 0) {
+            $imageUrl = $order['image_url'];
+        } else {
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick-orders/' . $order['image_url'];
+        }
+    }
+    
+    return [
+        'id' => $order['id'] ?? null,
+        'title' => $order['title'] ?? '',
+        'description' => $order['description'] ?? '',
+        'category' => $order['category'] ?? '',
+        'item_type' => $order['item_type'] ?? 'food',
+        'image_url' => $imageUrl,
+        'price' => floatval($order['price'] ?? 0),
+        'formatted_price' => 'MK ' . number_format(floatval($order['price'] ?? 0), 2),
+        'rating' => floatval($order['rating'] ?? 0)
+    ];
+}
+
 function formatQuickOrderForMerchantList($order, $baseUrl) {
     $imageUrl = '';
     if (!empty($order['image_url'])) {
@@ -812,131 +1652,8 @@ function formatQuickOrderForMerchantList($order, $baseUrl) {
 }
 
 /*********************************
- * GET MERCHANT CATEGORIES
+ * EXISTING POST ACTION FUNCTIONS
  *********************************/
-function getMerchantCategories($conn, $merchantId, $baseUrl) {
-    $checkStmt = $conn->prepare(
-        "SELECT id, name FROM merchants 
-         WHERE id = :id AND is_active = 1"
-    );
-    $checkStmt->execute([':id' => $merchantId]);
-    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$merchant) {
-        ResponseHandler::error('Merchant not found or inactive', 404);
-    }
-
-    $categoriesStmt = $conn->prepare(
-        "SELECT 
-            category as name,
-            COUNT(*) as item_count,
-            GROUP_CONCAT(DISTINCT item_type) as item_types
-        FROM menu_items 
-        WHERE merchant_id = :merchant_id
-        AND is_active = 1
-        AND is_available = 1
-        AND category IS NOT NULL
-        AND category != ''
-        GROUP BY category
-        ORDER BY category ASC"
-    );
-    
-    $categoriesStmt->execute([':merchant_id' => $merchantId]);
-    $uniqueCategories = $categoriesStmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    $displayOrder = 1;
-    $categories = [];
-    foreach ($uniqueCategories as $cat) {
-        $itemTypes = !empty($cat['item_types']) ? explode(',', $cat['item_types']) : [];
-        $categories[] = [
-            'id' => 0,
-            'name' => $cat['name'],
-            'description' => '',
-            'display_order' => $displayOrder++,
-            'image_url' => null,
-            'is_active' => true,
-            'item_count' => intval($cat['item_count']),
-            'item_types' => $itemTypes
-        ];
-    }
-
-    $quickOrderCategoriesStmt = $conn->prepare(
-        "SELECT 
-            qo.category as name,
-            COUNT(*) as item_count,
-            GROUP_CONCAT(DISTINCT qo.item_type) as item_types
-        FROM quick_orders qo
-        INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-        WHERE qom.merchant_id = :merchant_id
-        AND qom.is_active = 1
-        GROUP BY qo.category
-        ORDER BY qo.category ASC"
-    );
-    
-    $quickOrderCategoriesStmt->execute([':merchant_id' => $merchantId]);
-    $quickOrderCategories = $quickOrderCategoriesStmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    foreach ($quickOrderCategories as $cat) {
-        $itemTypes = !empty($cat['item_types']) ? explode(',', $cat['item_types']) : [];
-        $categories[] = [
-            'id' => -1,
-            'name' => $cat['name'] . ' (Quick Order)',
-            'description' => 'Pre-configured quick orders',
-            'display_order' => 999,
-            'image_url' => null,
-            'is_active' => true,
-            'item_count' => intval($cat['item_count']),
-            'item_types' => $itemTypes,
-            'is_quick_order' => true
-        ];
-    }
-
-    $formattedCategories = array_map(function($cat) use ($baseUrl) {
-        return formatCategoryData($cat, $baseUrl);
-    }, $categories);
-
-    ResponseHandler::success([
-        'merchant_id' => $merchantId,
-        'merchant_name' => $merchant['name'],
-        'categories' => $formattedCategories,
-        'total_categories' => count($formattedCategories)
-    ]);
-}
-
-/*********************************
- * POST REQUESTS
- *********************************/
-function handlePostRequest() {
-    $conn = initDatabase();
-    $baseUrl = getBaseUrl();
-
-    $input = json_decode(file_get_contents('php://input'), true);
-    if (!$input) {
-        $input = $_POST;
-    }
-    
-    $action = $input['action'] ?? '';
-
-    switch ($action) {
-        case 'create_review':
-            createMerchantReview($conn, $input);
-            break;
-        case 'toggle_favorite':
-            toggleMerchantFavorite($conn, $input);
-            break;
-        case 'get_favorites':
-            getFavoriteMerchants($conn, $input, $baseUrl);
-            break;
-        case 'report_merchant':
-            reportMerchant($conn, $input);
-            break;
-        case 'search_menu':
-            searchMenuItems($conn, $input, $baseUrl);
-            break;
-        default:
-            ResponseHandler::error('Invalid action', 400);
-    }
-}
 
 function createMerchantReview($conn, $data) {
     if (empty($_SESSION['user_id'])) {
@@ -1298,6 +2015,7 @@ function updateMerchantRating($conn, $merchantId) {
 /*********************************
  * FORMATTING FUNCTIONS
  *********************************/
+
 function formatMerchantListData($m, $baseUrl) {
     $imageUrl = '';
     if (!empty($m['image_url'])) {
