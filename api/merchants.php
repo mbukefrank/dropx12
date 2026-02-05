@@ -1341,6 +1341,24 @@ function formatReviewData($review) {
 }
 
 function formatMenuItemData($item, $baseUrl) {
+    // Make sure all required keys exist
+    $item = array_merge([
+        'stock_quantity' => null,
+        'is_available' => true,
+        'is_popular' => false,
+        'image_url' => '',
+        'description' => '',
+        'category' => 'Uncategorized',
+        'item_type' => 'food',
+        'unit_type' => 'piece',
+        'unit_value' => 1,
+        'preparation_time' => 15,
+        'options' => null,
+        'ingredients' => null,
+        'allergens' => null,
+        'nutrition_info' => null
+    ], $item);
+    
     $imageUrl = '';
     if (!empty($item['image_url'])) {
         if (strpos($item['image_url'], 'http') === 0) {
@@ -1399,10 +1417,10 @@ function formatMenuItemData($item, $baseUrl) {
     }
 
     $displayPrice = $item['price'];
-    $displayUnit = $item['unit_type'] ?? 'piece';
+    $displayUnit = $item['unit_type'];
     
-    if (($item['unit_type'] ?? 'piece') === 'kg' && ($item['unit_value'] ?? 1) != 1) {
-        $displayPrice = $item['price'] / ($item['unit_value'] ?? 1);
+    if ($item['unit_type'] === 'kg' && $item['unit_value'] != 1) {
+        $displayPrice = $item['price'] / $item['unit_value'];
         $displayUnit = 'g';
         $displayPrice = round($displayPrice * 1000, 2);
     }
@@ -1411,31 +1429,30 @@ function formatMenuItemData($item, $baseUrl) {
         'id' => $item['id'] ?? null,
         'quick_order_item_id' => $item['quick_order_item_id'] ?? null,
         'name' => $item['name'] ?? '',
-        'description' => $item['description'] ?? '',
+        'description' => $item['description'],
         'price' => floatval($item['price'] ?? 0),
         'display_price' => floatval($displayPrice),
         'formatted_price' => 'MK ' . number_format(floatval($displayPrice), 2) . ' / ' . $displayUnit,
         'image_url' => $imageUrl,
-        'category' => $item['category'] ?? '',
-        'item_type' => $item['item_type'] ?? 'food',
+        'category' => $item['category'],
+        'item_type' => $item['item_type'],
         'subcategory' => $item['subcategory'] ?? '',
-        'unit_type' => $item['unit_type'] ?? 'piece',
-        'unit_value' => floatval($item['unit_value'] ?? 1),
-        'is_available' => boolval($item['is_available'] ?? true),
-        'is_popular' => boolval($item['is_popular'] ?? false),
+        'unit_type' => $item['unit_type'],
+        'unit_value' => floatval($item['unit_value']),
+        'is_available' => boolval($item['is_available']),
+        'is_popular' => boolval($item['is_popular']),
         'options' => $options,
         'ingredients' => $ingredients,
         'allergens' => $allergens,
         'nutrition_info' => $nutritionInfo,
-        'preparation_time' => intval($item['preparation_time'] ?? 15),
-        'stock_quantity' => intval($item['stock_quantity'] ?? 0),
-        'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && ($item['is_available'] ?? true),
+        'preparation_time' => intval($item['preparation_time']),
+        'stock_quantity' => $item['stock_quantity'] !== null ? intval($item['stock_quantity']) : null,
+        'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && $item['is_available'],
         'source' => $item['source'] ?? 'menu',
         'created_at' => $item['created_at'] ?? '',
         'updated_at' => $item['updated_at'] ?? ''
     ];
 }
-
 function formatCategoryData($category, $baseUrl) {
     $imageUrl = '';
     if (!empty($category['image_url'])) {
