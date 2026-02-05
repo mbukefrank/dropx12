@@ -481,11 +481,13 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
 }
 
 /*********************************
- * GET MERCHANT MENU - FIXED RESPONSE STRUCTURE
+ * GET MERCHANT MENU - SIMPLIFIED & FIXED
  *********************************/
 function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = true) {
-    error_log("DEBUG - Getting menu for merchant ID: " . $merchantId);
+    error_log("=== MENU DEBUG START ===");
+    error_log("Getting menu for merchant ID: " . $merchantId);
     
+    // 1. Verify merchant exists
     $checkStmt = $conn->prepare(
         "SELECT id, name, business_type FROM merchants 
          WHERE id = :id AND is_active = 1"
@@ -494,233 +496,136 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$merchant) {
+        error_log("Merchant not found or inactive");
         ResponseHandler::error('Merchant not found or inactive', 404);
     }
-
-    $quickOrderItems = [];
-    if ($includeQuickOrders) {
-        $quickOrderStmt = $conn->prepare(
-            "SELECT 
-                qoi.id as quick_order_item_id,
-                qoi.name,
-                qoi.description,
-                qoi.price,
-                qoi.image_url,
-                qoi.unit_type,
-                qoi.unit_value,
-                qoi.is_available,
-                qo.category,
-                qo.item_type,
-                'quick_order' as source
-            FROM quick_order_items qoi
-            JOIN quick_orders qo ON qoi.quick_order_id = qo.id
-            JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-            WHERE qom.merchant_id = :merchant_id
-            AND qom.is_active = 1
-            AND qoi.is_available = 1
-            ORDER BY qo.category, qoi.name"
-        );
-        $quickOrderStmt->execute([':merchant_id' => $merchantId]);
-        $quickOrderItems = $quickOrderStmt->fetchAll(PDO::FETCH_ASSOC);
-        error_log("DEBUG - Found " . count($quickOrderItems) . " quick order items");
-    }
-
-    // Get categories from menu items - FIXED: Handle NULL/empty categories
-    $categoriesStmt = $conn->prepare(
-        "SELECT DISTINCT 
-            COALESCE(NULLIF(category, ''), 'Uncategorized') as name,
-            COUNT(*) as item_count
-        FROM menu_items 
-        WHERE merchant_id = :merchant_id
-        AND is_active = 1
-        AND is_available = 1
-        GROUP BY COALESCE(NULLIF(category, ''), 'Uncategorized')
-        ORDER BY 
-            CASE WHEN COALESCE(NULLIF(category, ''), 'Uncategorized') = 'Uncategorized' THEN 1 ELSE 0 END,
-            name ASC"
-    );
     
-    $categoriesStmt->execute([':merchant_id' => $merchantId]);
-    $uniqueCategories = $categoriesStmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    error_log("DEBUG - Found " . count($uniqueCategories) . " categories from menu items");
-    
-    $displayOrder = 1;
-    $categories = [];
-    foreach ($uniqueCategories as $cat) {
-        $isUncategorized = ($cat['name'] === 'Uncategorized');
-        $categories[] = [
-            'id' => 0,
-            'name' => $cat['name'],
-            'description' => '',
-            'image_url' => null,
-            'display_order' => $isUncategorized ? 9999 : $displayOrder++,
-            'item_count' => intval($cat['item_count']),
-            'is_quick_order' => false
-        ];
-    }
+    error_log("Merchant found: " . $merchant['name']);
 
-    // Add quick order categories
-    if (!empty($quickOrderItems)) {
-        $quickOrderCategories = [];
-        foreach ($quickOrderItems as $item) {
-            $catName = !empty($item['category']) ? $item['category'] . ' (Quick Order)' : 'Quick Orders';
-            if (!isset($quickOrderCategories[$catName])) {
-                $quickOrderCategories[$catName] = 0;
-            }
-            $quickOrderCategories[$catName]++;
-        }
-        
-        foreach ($quickOrderCategories as $catName => $count) {
-            $categories[] = [
-                'id' => -1,
-                'name' => $catName,
-                'description' => 'Pre-configured quick orders',
-                'image_url' => null,
-                'display_order' => 999,
-                'item_count' => $count,
-                'is_quick_order' => true
-            ];
-        }
-    }
-
-    // Get menu items - FIXED: Handle NULL categories
+    // 2. Get ALL menu items for this merchant (simplified query)
     $menuStmt = $conn->prepare(
         "SELECT 
-            mi.id,
-            mi.name,
-            mi.description,
-            mi.price,
-            mi.image_url,
-            COALESCE(NULLIF(mi.category, ''), 'Uncategorized') as category,
-            mi.item_type,
-            mi.subcategory,
-            mi.unit_type,
-            mi.unit_value,
-            mi.is_available,
-            mi.is_popular,
-            mi.display_order,
-            mi.options,
-            mi.ingredients,
-            mi.allergens,
-            mi.nutrition_info,
-            mi.preparation_time,
-            mi.stock_quantity,
-            mi.created_at,
-            mi.updated_at,
-            'menu' as source
-        FROM menu_items mi
-        WHERE mi.merchant_id = :merchant_id
-        AND mi.is_active = 1
-        AND mi.is_available = 1
-        ORDER BY 
-            CASE WHEN COALESCE(NULLIF(mi.category, ''), 'Uncategorized') = 'Uncategorized' THEN 1 ELSE 0 END,
-            mi.category ASC, 
-            mi.display_order ASC, 
-            mi.name ASC"
+            id,
+            name,
+            description,
+            price,
+            image_url,
+            COALESCE(NULLIF(category, ''), 'Uncategorized') as category,
+            item_type,
+            is_available,
+            is_popular,
+            preparation_time
+        FROM menu_items 
+        WHERE merchant_id = :merchant_id
+        AND is_available = 1
+        AND is_active = 1
+        ORDER BY category, name ASC"
     );
     
     $menuStmt->execute([':merchant_id' => $merchantId]);
     $menuItems = $menuStmt->fetchAll(PDO::FETCH_ASSOC);
     
-    error_log("DEBUG - Found " . count($menuItems) . " menu items");
+    error_log("Found " . count($menuItems) . " menu items");
     
     // Debug: Show first few items
     if (!empty($menuItems)) {
-        error_log("DEBUG - First menu item: " . json_encode($menuItems[0]));
-    }
-
-    $allItems = array_merge($menuItems, $quickOrderItems);
-    error_log("DEBUG - Total items: " . count($allItems));
-
-    // If no categories found but we have items, create a default category
-    if (empty($categories) && !empty($allItems)) {
-        $categories[] = [
-            'id' => 0,
-            'name' => 'All Items',
-            'description' => 'All available items',
-            'image_url' => null,
-            'display_order' => 1,
-            'item_count' => count($allItems),
-            'is_quick_order' => false
-        ];
-    }
-
-    // Organize items by category
-    $itemsByCategory = [];
-    
-    // Initialize categories
-    foreach ($categories as $category) {
-        $categoryName = $category['name'];
-        $itemsByCategory[$categoryName] = [
-            'category_info' => formatCategoryData($category, $baseUrl),
-            'items' => []
-        ];
-    }
-
-    // Distribute items to categories
-    foreach ($allItems as $item) {
-        $categoryName = $item['category'] ?? 'Uncategorized';
-        
-        // Handle quick order items
-        if ($item['source'] === 'quick_order' && !empty($item['category'])) {
-            $categoryName = $item['category'] . ' (Quick Order)';
-        } elseif ($item['source'] === 'quick_order') {
-            $categoryName = 'Quick Orders';
+        for ($i = 0; $i < min(3, count($menuItems)); $i++) {
+            error_log("Item $i: " . $menuItems[$i]['name'] . " | Category: " . $menuItems[$i]['category']);
         }
+    } else {
+        error_log("NO MENU ITEMS FOUND! Check database for merchant_id = " . $merchantId);
         
-        // Create category if it doesn't exist
-        if (!isset($itemsByCategory[$categoryName])) {
-            $itemsByCategory[$categoryName] = [
-                'category_info' => [
-                    'id' => $item['source'] === 'quick_order' ? -1 : 0,
-                    'name' => $categoryName,
-                    'description' => $item['source'] === 'quick_order' ? 'Pre-configured quick orders' : '',
-                    'image_url' => null,
-                    'display_order' => $item['source'] === 'quick_order' ? 999 : 9999,
-                    'item_count' => 0,
-                    'is_quick_order' => $item['source'] === 'quick_order',
-                    'item_types' => []
-                ],
+        // Check what's actually in the database
+        $debugStmt = $conn->prepare(
+            "SELECT COUNT(*) as count FROM menu_items WHERE merchant_id = :merchant_id"
+        );
+        $debugStmt->execute([':merchant_id' => $merchantId]);
+        $debugResult = $debugStmt->fetch(PDO::FETCH_ASSOC);
+        error_log("Total menu items in DB: " . $debugResult['count']);
+        
+        // Check availability
+        $debugStmt2 = $conn->prepare(
+            "SELECT COUNT(*) as count FROM menu_items 
+             WHERE merchant_id = :merchant_id AND is_available = 1"
+        );
+        $debugStmt2->execute([':merchant_id' => $merchantId]);
+        $debugResult2 = $debugStmt2->fetch(PDO::FETCH_ASSOC);
+        error_log("Available menu items: " . $debugResult2['count']);
+    }
+
+    // 3. Group items by category (SIMPLIFIED)
+    $categories = [];
+    $totalItems = 0;
+    
+    foreach ($menuItems as $item) {
+        $categoryName = $item['category'] ?: 'Uncategorized';
+        
+        if (!isset($categories[$categoryName])) {
+            $categories[$categoryName] = [
+                'category_name' => $categoryName,
                 'items' => []
             ];
         }
         
-        $itemsByCategory[$categoryName]['items'][] = formatMenuItemData($item, $baseUrl);
+        // Format item
+        $formattedItem = [
+            'id' => $item['id'],
+            'name' => $item['name'],
+            'description' => $item['description'] ?? '',
+            'price' => floatval($item['price']),
+            'image_url' => formatMenuItemImage($item['image_url'], $baseUrl),
+            'category' => $item['category'],
+            'item_type' => $item['item_type'] ?? 'food',
+            'is_available' => boolval($item['is_available']),
+            'is_popular' => boolval($item['is_popular']),
+            'preparation_time' => intval($item['preparation_time'] ?? 15)
+        ];
+        
+        $categories[$categoryName]['items'][] = $formattedItem;
+        $totalItems++;
     }
-
-    // Clean up empty categories and update item counts
-    foreach ($itemsByCategory as $categoryName => $data) {
-        if (empty($data['items'])) {
-            unset($itemsByCategory[$categoryName]);
-        } else {
-            $itemsByCategory[$categoryName]['category_info']['item_count'] = count($data['items']);
-        }
-    }
-
-    // Sort categories by display order
-    usort($itemsByCategory, function($a, $b) {
-        return $a['category_info']['display_order'] <=> $b['category_info']['display_order'];
-    });
-
-    $organizedMenu = array_values($itemsByCategory);
-
-    error_log("DEBUG - Organized menu has " . count($organizedMenu) . " categories");
-
-    // Return the menu data with the correct structure
+    
+    // 4. Convert to indexed array
+    $menuList = array_values($categories);
+    
+    error_log("Organized into " . count($menuList) . " categories");
+    error_log("Total items: " . $totalItems);
+    
+    // 5. Return the response in EXACT format Flutter expects
+    $responseData = [
+        'merchant_id' => $merchantId,
+        'merchant_name' => $merchant['name'],
+        'business_type' => $merchant['business_type'],
+        'menu' => $menuList,  // This is what Flutter reads
+        'total_items' => $totalItems,
+        'total_categories' => count($menuList),
+        'includes_quick_orders' => false  // Temporarily disable quick orders for debugging
+    ];
+    
+    error_log("=== FINAL RESPONSE DATA ===");
+    error_log("Categories count: " . count($menuList));
+    error_log("Response structure ready");
+    error_log("=== MENU DEBUG END ===");
+    
+    // Return SUCCESS response with data
     ResponseHandler::success([
         'success' => true,
         'message' => 'Menu retrieved successfully',
-        'data' => [
-            'merchant_id' => $merchantId,
-            'merchant_name' => $merchant['name'],
-            'business_type' => $merchant['business_type'],
-            'menu' => $organizedMenu,
-            'total_items' => count($allItems),
-            'total_categories' => count($organizedMenu),
-            'includes_quick_orders' => !empty($quickOrderItems)
-        ]
+        'data' => $responseData
     ]);
+}
+
+// Helper function for menu item images
+function formatMenuItemImage($imagePath, $baseUrl) {
+    if (empty($imagePath)) {
+        return rtrim($baseUrl, '/') . '/uploads/default_food.jpg';
+    }
+    
+    if (strpos($imagePath, 'http') === 0) {
+        return $imagePath;
+    }
+    
+    return rtrim($baseUrl, '/') . '/uploads/menu_items/' . ltrim($imagePath, '/');
 }
 
 /*********************************
