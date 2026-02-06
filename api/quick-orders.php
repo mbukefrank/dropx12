@@ -1220,7 +1220,7 @@ function formatQuickOrderListData($q, $baseUrl) {
         if (strpos($q['image_url'], 'http') === 0) {
             $imageUrl = $q['image_url'];
         } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick-orders/' . $q['image_url'];
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu-items/' . $q['image_url'];
         }
     }
     
