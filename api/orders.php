@@ -142,7 +142,7 @@ function getOrdersList($conn, $userId) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // Get orders with items
+    // Get orders with items - UPDATED: Changed oi.price to oi.unit_price
     $sql = "SELECT DISTINCT
                 o.id,
                 o.order_number,
@@ -163,7 +163,7 @@ function getOrdersList($conn, $userId) {
                 ot.estimated_delivery,
                 ot.status as tracking_status,
                 GROUP_CONCAT(
-                    CONCAT(oi.item_name, '||', oi.quantity, '||', oi.price)
+                    CONCAT(oi.item_name, '||', oi.quantity, '||', oi.unit_price)
                     ORDER BY oi.id SEPARATOR ';;'
                 ) as items_data
             FROM orders o
@@ -265,13 +265,13 @@ function getOrderDetails($conn, $orderId, $userId) {
         ResponseHandler::error('Order not found', 404);
     }
 
-    // Get order items
+    // Get order items - UPDATED: Changed price to unit_price and total to total_price
     $itemsSql = "SELECT 
                     id,
                     item_name as name,
                     quantity,
-                    price,
-                    total,
+                    unit_price as price,
+                    total_price as total,
                     created_at
                 FROM order_items
                 WHERE order_id = :order_id
@@ -397,10 +397,12 @@ function createOrder($conn, $data, $userId) {
     // Calculate totals
     $subtotal = 0;
     foreach ($items as $item) {
-        if (empty($item['name']) || empty($item['price']) || empty($item['quantity'])) {
+        // UPDATED: Check for unit_price instead of price
+        $itemPrice = $item['unit_price'] ?? $item['price'] ?? 0;
+        if (empty($item['name']) || empty($itemPrice) || empty($item['quantity'])) {
             ResponseHandler::error('Invalid item data', 400);
         }
-        $subtotal += $item['price'] * $item['quantity'];
+        $subtotal += $itemPrice * $item['quantity'];
     }
 
     $deliveryFee = $merchant['delivery_fee'];
@@ -439,22 +441,24 @@ function createOrder($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items
+        // Create order items - UPDATED: Changed price to unit_price and total to total_price
         $itemSql = "INSERT INTO order_items (
-            order_id, item_name, quantity, price, total, created_at
+            order_id, item_name, quantity, unit_price, total_price, created_at
         ) VALUES (
-            :order_id, :item_name, :quantity, :price, :total, NOW()
+            :order_id, :item_name, :quantity, :unit_price, :total_price, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
         foreach ($items as $item) {
-            $itemTotal = $item['price'] * $item['quantity'];
+            // UPDATED: Get unit_price from item data
+            $unitPrice = $item['unit_price'] ?? $item['price'] ?? 0;
+            $itemTotal = $unitPrice * $item['quantity'];
             $itemStmt->execute([
                 ':order_id' => $orderId,
                 ':item_name' => $item['name'],
                 ':quantity' => $item['quantity'],
-                ':price' => $item['price'],
-                ':total' => $itemTotal
+                ':unit_price' => $unitPrice,
+                ':total_price' => $itemTotal
             ]);
         }
 
@@ -715,11 +719,11 @@ function reorder($conn, $data, $userId) {
         ResponseHandler::error('Order ID is required', 400);
     }
 
-    // Get original order details
+    // Get original order details - UPDATED: Changed oi.price to oi.unit_price
     $orderSql = "SELECT 
                     o.*,
                     GROUP_CONCAT(
-                        CONCAT(oi.item_name, '||', oi.quantity, '||', oi.price)
+                        CONCAT(oi.item_name, '||', oi.quantity, '||', oi.unit_price)
                         ORDER BY oi.id SEPARATOR ';;'
                     ) as items_data
                 FROM orders o
@@ -764,7 +768,7 @@ function reorder($conn, $data, $userId) {
                 $items[] = [
                     'name' => $parts[0],
                     'quantity' => (int)$parts[1],
-                    'price' => (float)$parts[2]
+                    'price' => (float)$parts[2]  // This will be unit_price from database
                 ];
             }
         }
@@ -1040,7 +1044,7 @@ function formatOrderData($order, $user) {
                 $items[] = [
                     'name' => $parts[0],
                     'quantity' => (int)$parts[1],
-                    'price' => (float)$parts[2]
+                    'price' => (float)$parts[2]  // This is unit_price from database
                 ];
                 $itemCount += (int)$parts[1];
             }
@@ -1135,8 +1139,8 @@ function formatOrderItemData($item) {
         'id' => $item['id'],
         'name' => $item['name'],
         'quantity' => (int)$item['quantity'],
-        'price' => (float)$item['price'],
-        'total' => (float)$item['total'],
+        'price' => (float)$item['price'],      // This is unit_price from database
+        'total' => (float)$item['total'],      // This is total_price from database
         'created_at' => $item['created_at']
     ];
 }
