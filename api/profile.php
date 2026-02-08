@@ -145,7 +145,7 @@ function handleGetProfile($conn, $baseUrl) { // Accept baseUrl parameter
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
                 DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at,
-                date_of_birth, location
+                location
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -384,7 +384,7 @@ function registerUser($conn, $data, $baseUrl) { // Accept baseUrl
         "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
                 wallet_balance, member_level, member_points, total_orders,
                 rating, verified, member_since, created_at, updated_at,
-                date_of_birth, location
+                location
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $userId]);
@@ -413,7 +413,6 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
     $address = trim($data['address'] ?? '');
     $city = trim($data['city'] ?? '');
     $gender = $data['gender'] ?? null;
-    $dateOfBirth = $data['date_of_birth'] ?? null;
     $location = $data['location'] ?? null;
 
     // Validation
@@ -455,7 +454,6 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
             address = :address,
             city = :city,
             gender = :gender,
-            date_of_birth = :date_of_birth,
             location = :location,
             updated_at = NOW()
          WHERE id = :id"
@@ -468,7 +466,6 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
         ':address' => $address,
         ':city' => $city,
         ':gender' => $gender,
-        ':date_of_birth' => $dateOfBirth,
         ':location' => $location,
         ':id' => $_SESSION['user_id']
     ]);
@@ -480,7 +477,7 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
                 DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at,
-                date_of_birth, location
+                location
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -730,7 +727,6 @@ function formatUserData($u, $baseUrl) { // Accept baseUrl parameter
         'member_since' => $u['member_since'] ?? formatDateForFlutter($u['created_at']),
         'created_at' => $u['created_at'] ?? '',
         'updated_at' => $u['updated_at'] ?? '',
-        'date_of_birth' => $u['date_of_birth'] ?? '',
         'location' => $u['location'] ?? ''
     ];
 }
