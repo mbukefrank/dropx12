@@ -32,7 +32,7 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
- * BASE URL CONFIGURATION - ADD THIS
+ * BASE URL CONFIGURATION
  *********************************/
 $baseUrl = "https://dropx-production-6373.up.railway.app";
 
@@ -90,7 +90,7 @@ function generateAccountNumber($conn) {
 }
 
 /*********************************
- * HELPER FUNCTION FOR BASE URL - ADD THIS
+ * HELPER FUNCTION FOR BASE URL
  *********************************/
 function getBaseUrl() {
     global $baseUrl;
@@ -120,7 +120,7 @@ try {
 function handleGetRequest() {
     $db = new Database();
     $conn = $db->getConnection();
-    $baseUrl = getBaseUrl(); // Get the base URL
+    $baseUrl = getBaseUrl();
 
     // Check which endpoint is requested
     $requestUri = $_SERVER['REQUEST_URI'];
@@ -130,11 +130,11 @@ function handleGetRequest() {
     if (end($pathSegments) === 'stats') {
         handleGetUserStats($conn);
     } else {
-        handleGetProfile($conn, $baseUrl); // Pass baseUrl
+        handleGetProfile($conn, $baseUrl);
     }
 }
 
-function handleGetProfile($conn, $baseUrl) { // Accept baseUrl parameter
+function handleGetProfile($conn, $baseUrl) {
     if (empty($_SESSION['user_id']) || empty($_SESSION['logged_in'])) {
         ResponseHandler::error('Unauthorized', 401);
     }
@@ -144,8 +144,7 @@ function handleGetProfile($conn, $baseUrl) { // Accept baseUrl parameter
                 wallet_balance, member_level, member_points, total_orders,
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
-                DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at,
-                location
+                DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -156,7 +155,7 @@ function handleGetProfile($conn, $baseUrl) { // Accept baseUrl parameter
     }
 
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl) // Pass baseUrl
+        'user' => formatUserData($user, $baseUrl)
     ]);
 }
 
@@ -197,7 +196,7 @@ function handleGetUserStats($conn) {
 function handlePostRequest() {
     $db = new Database();
     $conn = $db->getConnection();
-    $baseUrl = getBaseUrl(); // Get the base URL
+    $baseUrl = getBaseUrl();
 
     // Check which endpoint is requested
     $requestUri = $_SERVER['REQUEST_URI'];
@@ -206,7 +205,7 @@ function handlePostRequest() {
     $endpoint = end($pathSegments);
 
     if ($endpoint === 'upload-avatar') {
-        uploadAvatar($conn, $baseUrl); // Pass baseUrl
+        uploadAvatar($conn, $baseUrl);
     } elseif ($endpoint === 'remove-avatar') {
         removeAvatar($conn);
     } else {
@@ -219,13 +218,13 @@ function handlePostRequest() {
 
         switch ($action) {
             case 'login':
-                loginUser($conn, $input, $baseUrl); // Pass baseUrl
+                loginUser($conn, $input, $baseUrl);
                 break;
             case 'register':
-                registerUser($conn, $input, $baseUrl); // Pass baseUrl
+                registerUser($conn, $input, $baseUrl);
                 break;
             case 'update_profile':
-                updateProfile($conn, $input, $baseUrl); // Pass baseUrl
+                updateProfile($conn, $input, $baseUrl);
                 break;
             case 'change_password':
                 changePassword($conn, $input);
@@ -245,7 +244,7 @@ function handlePostRequest() {
 /*********************************
  * LOGIN
  *********************************/
-function loginUser($conn, $data, $baseUrl) { // Accept baseUrl
+function loginUser($conn, $data, $baseUrl) {
     $identifier = trim($data['identifier'] ?? '');
     $password = $data['password'] ?? '';
     $rememberMe = $data['remember_me'] ?? false;
@@ -297,14 +296,14 @@ function loginUser($conn, $data, $baseUrl) { // Accept baseUrl
     unset($user['password']);
 
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl) // Pass baseUrl
+        'user' => formatUserData($user, $baseUrl)
     ], 'Login successful');
 }
 
 /*********************************
  * REGISTER WITH 5-DIGIT ACCOUNT NUMBER
  *********************************/
-function registerUser($conn, $data, $baseUrl) { // Accept baseUrl
+function registerUser($conn, $data, $baseUrl) {
     $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
@@ -383,8 +382,7 @@ function registerUser($conn, $data, $baseUrl) { // Accept baseUrl
     $stmt = $conn->prepare(
         "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
                 wallet_balance, member_level, member_points, total_orders,
-                rating, verified, member_since, created_at, updated_at,
-                location
+                rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $userId]);
@@ -395,14 +393,14 @@ function registerUser($conn, $data, $baseUrl) { // Accept baseUrl
     $_SESSION['logged_in'] = true;
 
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl) // Pass baseUrl
+        'user' => formatUserData($user, $baseUrl)
     ], 'Registration successful. Your account number is ' . $accountNumber, 201);
 }
 
 /*********************************
- * UPDATE PROFILE
+ * UPDATE PROFILE - FIXED: Removed location
  *********************************/
-function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
+function updateProfile($conn, $data, $baseUrl) {
     if (empty($_SESSION['user_id'])) {
         ResponseHandler::error('Unauthorized', 401);
     }
@@ -413,7 +411,6 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
     $address = trim($data['address'] ?? '');
     $city = trim($data['city'] ?? '');
     $gender = $data['gender'] ?? null;
-    $location = $data['location'] ?? null;
 
     // Validation
     if (!$fullName) {
@@ -454,7 +451,6 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
             address = :address,
             city = :city,
             gender = :gender,
-            location = :location,
             updated_at = NOW()
          WHERE id = :id"
     );
@@ -466,7 +462,6 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
         ':address' => $address,
         ':city' => $city,
         ':gender' => $gender,
-        ':location' => $location,
         ':id' => $_SESSION['user_id']
     ]);
 
@@ -476,15 +471,14 @@ function updateProfile($conn, $data, $baseUrl) { // Accept baseUrl
                 wallet_balance, member_level, member_points, total_orders,
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
-                DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at,
-                location
+                DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl) // Pass baseUrl
+        'user' => formatUserData($user, $baseUrl)
     ], 'Profile updated successfully');
 }
 
@@ -588,7 +582,7 @@ function forgotPassword($conn, $data) {
 /*********************************
  * AVATAR UPLOAD
  *********************************/
-function uploadAvatar($conn, $baseUrl) { // Accept baseUrl
+function uploadAvatar($conn, $baseUrl) {
     if (empty($_SESSION['user_id'])) {
         ResponseHandler::error('Unauthorized', 401);
     }
@@ -696,7 +690,7 @@ function cleanPhoneNumber($phone) {
 /*********************************
  * FORMAT USER DATA FOR FLUTTER
  *********************************/
-function formatUserData($u, $baseUrl) { // Accept baseUrl parameter
+function formatUserData($u, $baseUrl) {
     // Format avatar URL with full path
     $avatarUrl = null;
     if (!empty($u['avatar'])) {
@@ -717,17 +711,19 @@ function formatUserData($u, $baseUrl) { // Accept baseUrl parameter
         'address' => $u['address'] ?? '',
         'city' => $u['city'] ?? '',
         'gender' => $u['gender'] ?? '',
-        'avatar' => $avatarUrl, // Use formatted URL
+        'avatar' => $avatarUrl,
+        'profile_image' => $avatarUrl, // Add for compatibility
         'wallet_balance' => (float) ($u['wallet_balance'] ?? 0.00),
         'member_level' => $u['member_level'] ?? 'basic',
         'member_points' => (int) ($u['member_points'] ?? 0),
         'total_orders' => (int) ($u['total_orders'] ?? 0),
         'rating' => (float) ($u['rating'] ?? 0.00),
         'verified' => (bool) ($u['verified'] ?? false),
+        'is_verified' => (bool) ($u['verified'] ?? false), // Add for compatibility
         'member_since' => $u['member_since'] ?? formatDateForFlutter($u['created_at']),
         'created_at' => $u['created_at'] ?? '',
         'updated_at' => $u['updated_at'] ?? '',
-        'location' => $u['location'] ?? ''
+        'location' => $u['city'] ?? '' // Use city as location for compatibility
     ];
 }
 
@@ -735,7 +731,6 @@ function formatUserData($u, $baseUrl) { // Accept baseUrl parameter
  * GENERATE TEMP ACCOUNT NUMBER
  *********************************/
 function generateTempAccountNumber($userId) {
-    // Generate temporary 5-digit number from user ID
     return str_pad(10000 + $userId, 5, '0', STR_PAD_LEFT);
 }
 
