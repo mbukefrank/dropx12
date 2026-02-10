@@ -1,10 +1,10 @@
 <?php
 class Database {
-    private $host     = 'maglev.proxy.rlwy.net';  // Railway MySQL public host
-    private $port     = '19672';                   // Railway MySQL public port
+    private $host     = 'shuttle.proxy.rlwy.net';  // Railway MySQL public host
+    private $port     = '37800';                   // Railway MySQL public port
     private $db_name  = 'railway';                 // Railway database name
     private $username = 'root';                    // Railway username
-    private $password = 'qCECcweIbWamgnLlPifYxRuedYvtHETT'; // Railway password
+    private $password = 'YoYStIhdmOWAmfUtsJtLKHXxthLtUvuf'; // Railway password
     public $conn;
 
     public function getConnection() {
