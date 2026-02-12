@@ -42,7 +42,7 @@ function checkAuthentication() {
 /*********************************
  * BASE URL CONFIGURATION
  *********************************/
-$baseUrl = "https://dropx-production-6373.up.railway.app";
+$baseUrl ="https://dropx12-production.up.railway.app";
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';

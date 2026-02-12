@@ -2,7 +2,7 @@
 /*********************************
  * BASE URL CONFIGURATION
  *********************************/
-$baseUrl = "https://dropx-production-6373.up.railway.app";
+$baseUrl = "https://dropx12-production.up.railway.app";
 
 /*********************************
  * CORS Configuration
