@@ -444,7 +444,7 @@ function handlePostRequest($userId) {
 }
 
 /*********************************
- * GET TRACKABLE ORDERS - NEW FUNCTION
+ * GET TRACKABLE ORDERS - FIXED SQL SYNTAX
  *********************************/
 function getTrackableOrders($conn, $data, $userId) {
     $limit = $data['limit'] ?? 50;
@@ -458,6 +458,8 @@ function getTrackableOrders($conn, $data, $userId) {
     
     // Trackable statuses (orders that can be tracked)
     $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    
+    // Create placeholders for the IN clause
     $placeholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
     
     $sql = "SELECT 
@@ -477,6 +479,7 @@ function getTrackableOrders($conn, $data, $userId) {
             ORDER BY o.$sortBy $sortOrder
             LIMIT ?";
     
+    // Prepare parameters
     $params = array_merge([$userId], $trackableStatuses, [$limit]);
     
     $stmt = $conn->prepare($sql);
@@ -510,9 +513,8 @@ function getTrackableOrders($conn, $data, $userId) {
         'orders' => $formattedOrders
     ]);
 }
-
 /*********************************
- * GET LATEST ACTIVE ORDER - NEW FUNCTION
+ * GET LATEST ACTIVE ORDER - FIXED SQL SYNTAX
  *********************************/
 function getLatestActiveOrder($conn, $userId) {
     $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
