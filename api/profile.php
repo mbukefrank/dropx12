@@ -98,6 +98,39 @@ function getBaseUrl() {
 }
 
 /*********************************
+ * GET USER WALLET BALANCE
+ *********************************/
+function getUserWalletBalance($conn, $userId) {
+    $stmt = $conn->prepare(
+        "SELECT balance, currency, is_active 
+         FROM dropx_wallets 
+         WHERE user_id = :user_id AND is_active = 1
+         LIMIT 1"
+    );
+    $stmt->execute([':user_id' => $userId]);
+    $wallet = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    return $wallet ? (float) $wallet['balance'] : 0.00;
+}
+
+/*********************************
+ * CREATE INITIAL WALLET FOR USER
+ *********************************/
+function createUserWallet($conn, $userId) {
+    // Check if wallet already exists
+    $check = $conn->prepare("SELECT id FROM dropx_wallets WHERE user_id = :user_id");
+    $check->execute([':user_id' => $userId]);
+    
+    if ($check->rowCount() === 0) {
+        $stmt = $conn->prepare(
+            "INSERT INTO dropx_wallets (user_id, balance, currency, is_active, created_at, updated_at)
+             VALUES (:user_id, 0.00, 'MWK', 1, NOW(), NOW())"
+        );
+        $stmt->execute([':user_id' => $userId]);
+    }
+}
+
+/*********************************
  * ROUTER
  *********************************/
 try {
@@ -139,9 +172,10 @@ function handleGetProfile($conn, $baseUrl) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
+    // Get user profile without wallet_balance from users table
     $stmt = $conn->prepare(
         "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
-                wallet_balance, member_level, member_points, total_orders,
+                member_level, member_points, total_orders,
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
                 DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at
@@ -154,8 +188,11 @@ function handleGetProfile($conn, $baseUrl) {
         ResponseHandler::error('User not found', 404);
     }
 
+    // Get wallet balance from dropx_wallets table
+    $walletBalance = getUserWalletBalance($conn, $_SESSION['user_id']);
+
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl)
+        'user' => formatUserData($user, $baseUrl, $walletBalance)
     ]);
 }
 
@@ -164,12 +201,11 @@ function handleGetUserStats($conn) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    // Get user stats
+    // Get user stats (excluding wallet_balance from users table)
     $stmt = $conn->prepare(
         "SELECT 
             member_points,
             total_orders,
-            wallet_balance,
             (SELECT COUNT(*) FROM orders WHERE user_id = :user_id) as total_order_count,
             (SELECT COALESCE(SUM(total_amount), 0) FROM orders WHERE user_id = :user_id) as total_spent,
             (SELECT COALESCE(AVG(total_amount), 0) FROM orders WHERE user_id = :user_id) as avg_order_value,
@@ -179,13 +215,17 @@ function handleGetUserStats($conn) {
     $stmt->execute([':user_id' => $_SESSION['user_id']]);
     $stats = $stmt->fetch(PDO::FETCH_ASSOC);
 
+    // Get wallet balance from dropx_wallets table
+    $walletBalance = getUserWalletBalance($conn, $_SESSION['user_id']);
+
     ResponseHandler::success([
         'stats' => [
             'member_points' => (int) ($stats['member_points'] ?? 0),
             'total_orders' => (int) ($stats['total_order_count'] ?? 0),
             'total_spent' => (float) ($stats['total_spent'] ?? 0),
             'avg_order_value' => (float) ($stats['avg_order_value'] ?? 0),
-            'last_order_date' => $stats['last_order_date'] ? formatDateForFlutter($stats['last_order_date']) : null
+            'last_order_date' => $stats['last_order_date'] ? formatDateForFlutter($stats['last_order_date']) : null,
+            'wallet_balance' => $walletBalance
         ]
     ]);
 }
@@ -292,11 +332,14 @@ function loginUser($conn, $data, $baseUrl) {
         "UPDATE users SET last_login = NOW() WHERE id = :id"
     )->execute([':id' => $user['id']]);
 
+    // Get wallet balance
+    $walletBalance = getUserWalletBalance($conn, $user['id']);
+
     // Remove password from response
     unset($user['password']);
 
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl)
+        'user' => formatUserData($user, $baseUrl, $walletBalance)
     ], 'Login successful');
 }
 
@@ -356,13 +399,13 @@ function registerUser($conn, $data, $baseUrl) {
     // Generate 5-digit account number
     $accountNumber = generateAccountNumber($conn);
 
-    // Create user
+    // Create user (without wallet_balance field)
     $stmt = $conn->prepare(
         "INSERT INTO users (full_name, email, phone, password, address, city, gender, 
-                           wallet_balance, member_level, member_points, total_orders, 
+                           member_level, member_points, total_orders, 
                            rating, verified, member_since, account_number, created_at, updated_at)
          VALUES (:full_name, :email, :phone, :password, :address, :city, :gender,
-                 0.00, 'basic', 0, 0, 0.00, 0, :member_since, :account_number, NOW(), NOW())"
+                 'basic', 0, 0, 0.00, 0, :member_since, :account_number, NOW(), NOW())"
     );
     
     $stmt->execute([
@@ -379,26 +422,33 @@ function registerUser($conn, $data, $baseUrl) {
 
     // Get the new user
     $userId = $conn->lastInsertId();
+    
+    // Create wallet for the user
+    createUserWallet($conn, $userId);
+    
     $stmt = $conn->prepare(
         "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
-                wallet_balance, member_level, member_points, total_orders,
+                member_level, member_points, total_orders,
                 rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $userId]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
+    // Get wallet balance (should be 0.00)
+    $walletBalance = getUserWalletBalance($conn, $userId);
+
     // Set session
     $_SESSION['user_id'] = $userId;
     $_SESSION['logged_in'] = true;
 
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl)
+        'user' => formatUserData($user, $baseUrl, $walletBalance)
     ], 'Registration successful. Your account number is ' . $accountNumber, 201);
 }
 
 /*********************************
- * UPDATE PROFILE - FIXED: Removed location
+ * UPDATE PROFILE
  *********************************/
 function updateProfile($conn, $data, $baseUrl) {
     if (empty($_SESSION['user_id'])) {
@@ -468,7 +518,7 @@ function updateProfile($conn, $data, $baseUrl) {
     // Get updated user
     $stmt = $conn->prepare(
         "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
-                wallet_balance, member_level, member_points, total_orders,
+                member_level, member_points, total_orders,
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
                 DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at
@@ -477,8 +527,11 @@ function updateProfile($conn, $data, $baseUrl) {
     $stmt->execute([':id' => $_SESSION['user_id']]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
+    // Get wallet balance
+    $walletBalance = getUserWalletBalance($conn, $_SESSION['user_id']);
+
     ResponseHandler::success([
-        'user' => formatUserData($user, $baseUrl)
+        'user' => formatUserData($user, $baseUrl, $walletBalance)
     ], 'Profile updated successfully');
 }
 
@@ -690,7 +743,7 @@ function cleanPhoneNumber($phone) {
 /*********************************
  * FORMAT USER DATA FOR FLUTTER
  *********************************/
-function formatUserData($u, $baseUrl) {
+function formatUserData($u, $baseUrl, $walletBalance = null) {
     // Format avatar URL with full path
     $avatarUrl = null;
     if (!empty($u['avatar'])) {
@@ -713,7 +766,7 @@ function formatUserData($u, $baseUrl) {
         'gender' => $u['gender'] ?? '',
         'avatar' => $avatarUrl,
         'profile_image' => $avatarUrl, // Add for compatibility
-        'wallet_balance' => (float) ($u['wallet_balance'] ?? 0.00),
+        'wallet_balance' => $walletBalance !== null ? (float) $walletBalance : 0.00,
         'member_level' => $u['member_level'] ?? 'basic',
         'member_points' => (int) ($u['member_points'] ?? 0),
         'total_orders' => (int) ($u['total_orders'] ?? 0),
