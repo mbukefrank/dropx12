@@ -211,7 +211,7 @@ function handlePostRequest() {
 }
 
 /*********************************
- * GET ORDER TRACKING - FIXED FOR YOUR SCHEMA
+ * GET ORDER TRACKING - COMPLETELY FIXED WITH MENU_ITEMS JOIN
  *********************************/
 function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
     // Check if order identifier is order_number or order_id
@@ -293,7 +293,8 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
         ResponseHandler::error('Order not found', 404);
     }
 
-    // Get order items - FIXED for your order_items table
+    // Get order items - FIXED: Join with menu_items using item_name
+    // Since order_items doesn't have menu_item_id, we join by item_name
     $itemsStmt = $conn->prepare(
         "SELECT 
             oi.id,
@@ -301,15 +302,25 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
             oi.quantity,
             oi.unit_price as price,
             oi.total_price as total,
-            oi.created_at
+            oi.created_at,
+            mi.image_url as item_image,
+            mi.description as item_description,
+            mi.category,
+            mi.item_type,
+            mi.unit_type,
+            mi.unit_value
         FROM order_items oi
+        LEFT JOIN menu_items mi ON oi.item_name = mi.name AND mi.merchant_id = :merchant_id
         WHERE oi.order_id = :order_id
         ORDER BY oi.id"
     );
-    $itemsStmt->execute([':order_id' => $order['id']]);
+    $itemsStmt->execute([
+        ':order_id' => $order['id'],
+        ':merchant_id' => $order['merchant_id']
+    ]);
     $orderItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Get order tracking info - FIXED for your order_tracking table
+    // Get order tracking info
     $trackingStmt = $conn->prepare(
         "SELECT 
             id,
@@ -347,7 +358,7 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
     // Estimate delivery time
     $estimatedDelivery = estimateDeliveryTime($order, $trackingInfo);
 
-    // Build delivery status timeline (simplified without history table)
+    // Build delivery status timeline
     $deliveryStatus = buildDeliveryStatusTimeline($order, $trackingInfo);
 
     // Build driver info
@@ -376,7 +387,6 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
         'actions' => $actions
     ]);
 }
-
 /*********************************
  * GET TRACKABLE ORDERS
  *********************************/
