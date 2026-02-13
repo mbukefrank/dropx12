@@ -172,7 +172,7 @@ function getOrdersList($conn, $userId) {
             LEFT JOIN order_tracking ot ON o.id = ot.order_id
             LEFT JOIN order_items oi ON o.id = oi.order_id
             $whereClause
-            GROUP BY o.id
+            GROUP BY o.id, ot.estimated_delivery
             ORDER BY o.$sortBy $sortOrder
             LIMIT :limit OFFSET :offset";
 
