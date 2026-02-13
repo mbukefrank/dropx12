@@ -89,7 +89,7 @@ function handleGetRequest($userId) {
     }
 }
 /*********************************
- * GET ORDERS LIST - COMPLETELY FIXED
+ * GET ORDERS LIST - MATCHING FLUTTER EXPECTATIONS
  *********************************/
 function getOrdersList($conn, $userId) {
     // Get query parameters
@@ -141,7 +141,7 @@ function getOrdersList($conn, $userId) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // ============= COMPLETELY REWRITTEN QUERY - NO GROUP BY ISSUES =============
+    // FIXED: Simplified query to match Flutter expectations
     $sql = "SELECT 
                 o.id,
                 o.order_number,
@@ -150,22 +150,29 @@ function getOrdersList($conn, $userId) {
                 o.delivery_fee,
                 o.total_amount,
                 o.payment_method,
+                o.payment_status,
                 o.delivery_address,
                 o.special_instructions,
                 o.created_at,
                 o.updated_at,
                 o.merchant_id,
-                m.name as restaurant_name,
+                m.name as merchant_name,
                 m.image_url as merchant_image,
                 d.name as driver_name,
                 d.phone as driver_phone,
                 (
-                    SELECT estimated_delivery 
-                    FROM order_tracking 
-                    WHERE order_id = o.id 
-                    ORDER BY created_at DESC 
-                    LIMIT 1
-                ) as estimated_delivery,
+                    SELECT GROUP_CONCAT(
+                        CONCAT(
+                            oi.id, '||', 
+                            oi.item_name, '||', 
+                            oi.quantity, '||', 
+                            oi.unit_price
+                        )
+                        ORDER BY oi.id SEPARATOR ';;'
+                    )
+                    FROM order_items oi 
+                    WHERE oi.order_id = o.id
+                ) as items_data,
                 (
                     SELECT status 
                     FROM order_tracking 
@@ -174,13 +181,12 @@ function getOrdersList($conn, $userId) {
                     LIMIT 1
                 ) as tracking_status,
                 (
-                    SELECT GROUP_CONCAT(
-                        CONCAT(item_name, '||', quantity, '||', unit_price)
-                        ORDER BY id SEPARATOR ';;'
-                    )
-                    FROM order_items 
-                    WHERE order_id = o.id
-                ) as items_data
+                    SELECT estimated_delivery 
+                    FROM order_tracking 
+                    WHERE order_id = o.id 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                ) as estimated_delivery_time
             FROM orders o
             LEFT JOIN merchants m ON o.merchant_id = m.id
             LEFT JOIN drivers d ON o.driver_id = d.id
@@ -201,18 +207,77 @@ function getOrdersList($conn, $userId) {
     
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Get user info for customer name
+    // Get user info for customer details
     $userStmt = $conn->prepare(
-        "SELECT full_name, phone FROM users WHERE id = :user_id"
+        "SELECT full_name, phone, email FROM users WHERE id = :user_id"
     );
     $userStmt->execute([':user_id' => $userId]);
     $user = $userStmt->fetch(PDO::FETCH_ASSOC);
 
-    // Format orders data
-    $formattedOrders = array_map(function($order) use ($user) {
-        return formatOrderData($order, $user);
-    }, $orders);
+    // Format orders data to match Flutter expectations
+    $formattedOrders = [];
+    foreach ($orders as $order) {
+        // Parse items data
+        $items = [];
+        $itemCount = 0;
+        
+        if (!empty($order['items_data'])) {
+            $itemStrings = explode(';;', $order['items_data']);
+            foreach ($itemStrings as $itemString) {
+                $parts = explode('||', $itemString);
+                if (count($parts) === 4) {
+                    $items[] = [
+                        'id' => $parts[0],
+                        'name' => $parts[1],
+                        'quantity' => (int)$parts[2],
+                        'price' => (float)$parts[3],
+                        'total' => (float)$parts[3] * (int)$parts[2]
+                    ];
+                    $itemCount += (int)$parts[2];
+                }
+            }
+        }
 
+        // Format merchant image URL
+        $merchantImage = '';
+        if (!empty($order['merchant_image'])) {
+            if (strpos($order['merchant_image'], 'http') === 0) {
+                $merchantImage = $order['merchant_image'];
+            } else {
+                global $baseUrl;
+                $merchantImage = rtrim($baseUrl ?? '', '/') . '/uploads/merchants/' . ltrim($order['merchant_image'], '/');
+            }
+        }
+
+        // Build order object matching Flutter's expectations
+        $formattedOrders[] = [
+            'id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'status' => $order['status'],
+            'order_type' => 'Food Delivery', // Default or get from merchant
+            'customer_name' => $user['full_name'] ?? 'Customer',
+            'customer_phone' => $user['phone'] ?? '',
+            'delivery_address' => $order['delivery_address'],
+            'total_amount' => (float)$order['total_amount'],
+            'delivery_fee' => (float)$order['delivery_fee'],
+            'subtotal' => (float)$order['subtotal'],
+            'items' => $items,
+            'item_count' => $itemCount,
+            'created_at' => $order['created_at'],
+            'estimated_delivery_time' => $order['estimated_delivery_time'],
+            'payment_method' => $order['payment_method'] ?? 'cash',
+            'payment_status' => $order['payment_status'] ?? 'pending',
+            'merchant_name' => $order['merchant_name'] ?? 'DropX Store',
+            'merchant_id' => $order['merchant_id'],
+            'merchant_image' => $merchantImage,
+            'driver_name' => $order['driver_name'] ?? '',
+            'driver_phone' => $order['driver_phone'] ?? '',
+            'special_instructions' => $order['special_instructions'] ?? '',
+            'updated_at' => $order['updated_at']
+        ];
+    }
+
+    // Return in the format Flutter expects
     ResponseHandler::success([
         'orders' => $formattedOrders,
         'pagination' => [
