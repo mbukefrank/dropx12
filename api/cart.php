@@ -1281,7 +1281,7 @@ function formatCartItemData($item, $baseUrl) {
         if (strpos($item['item_image'], 'http') === 0) {
             $itemImage = $item['item_image'];
         } else {
-            $itemImage = rtrim($baseUrl, '/') . '/uploads/' . $item['item_image'];
+            $itemImage = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['item_image'];
         }
     }
     
