@@ -4,7 +4,6 @@
  * Malawi Kwacha (MWK)
  * 4-Character Alphanumeric External Codes
  * Partners: TNM Mpamba, Airtel Money, Banks
- * NO CUSTOMER VERIFICATION - JUST CODE + AMOUNT
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -125,12 +124,11 @@ function generatePaymentCode($conn) {
 
 /*********************************
  * CHECK DROPX WALLET BALANCE
- * Using user_wallets table
  *********************************/
 function checkDropXWalletBalance($conn, $userId) {
     $stmt = $conn->prepare(
-        "SELECT balance, is_active 
-         FROM user_wallets 
+        "SELECT balance, currency, is_active 
+         FROM dropx_wallets 
          WHERE user_id = :user_id 
          AND is_active = 1
          LIMIT 1"
@@ -142,6 +140,7 @@ function checkDropXWalletBalance($conn, $userId) {
         return [
             'exists' => false,
             'balance' => 0,
+            'currency' => 'MWK',
             'is_active' => false
         ];
     }
@@ -149,13 +148,13 @@ function checkDropXWalletBalance($conn, $userId) {
     return [
         'exists' => true,
         'balance' => floatval($wallet['balance']),
+        'currency' => $wallet['currency'] ?? 'MWK',
         'is_active' => boolval($wallet['is_active'])
     ];
 }
 
 /*********************************
  * AUTHENTICATION CHECK (FOR APP USERS)
- * Using balances table (users)
  *********************************/
 function authenticateUser($conn) {
     if (!empty($_SESSION['user_id'])) {
@@ -168,7 +167,7 @@ function authenticateUser($conn) {
     if (strpos($authHeader, 'Bearer ') === 0) {
         $token = substr($authHeader, 7);
         $stmt = $conn->prepare(
-            "SELECT id FROM balances WHERE api_token = :token AND api_token_expiry > NOW()"
+            "SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()"
         );
         $stmt->execute([':token' => $token]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -299,7 +298,6 @@ function calculateCartTotals($conn, $cartId, $userId) {
 
 /*********************************
  * GET USER'S DEFAULT ADDRESS
- * Using addresses table
  *********************************/
 function getUserDefaultAddress($conn, $userId) {
     $stmt = $conn->prepare(
@@ -366,7 +364,6 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
 
 /*********************************
  * PROCESS DROPX WALLET PAYMENT
- * Using user_wallets and wallet_transactions tables
  *********************************/
 function processWalletPayment($conn, $userId, $cartId, $amount) {
     try {
@@ -374,7 +371,7 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
         
         // Check wallet balance
         $walletStmt = $conn->prepare(
-            "SELECT id, balance FROM user_wallets 
+            "SELECT id, balance FROM dropx_wallets 
              WHERE user_id = :user_id AND is_active = 1
              FOR UPDATE"
         );
@@ -387,9 +384,8 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
         
         // Deduct from wallet
         $updateStmt = $conn->prepare(
-            "UPDATE user_wallets 
-             SET balance = balance - :amount,
-                 updated_at = NOW()
+            "UPDATE dropx_wallets 
+             SET balance = balance - :amount
              WHERE id = :wallet_id"
         );
         $updateStmt->execute([
@@ -397,19 +393,18 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
             ':wallet_id' => $wallet['id']
         ]);
         
-        // Record transaction in wallet_transactions
+        // Record transaction
         $txnStmt = $conn->prepare(
             "INSERT INTO wallet_transactions 
-                (user_id, amount, transaction_type, reference_id, balance_before, balance_after, status, description)
+                (user_id, amount, type, reference_type, reference_id, status, description)
              VALUES 
-                (:user_id, :amount, 'payment', :cart_id, :balance_before, :balance_after, 'completed', 'Payment for order')"
+                (:user_id, :amount, 'debit', 'order', :cart_id, 'completed', 
+                 'Payment for order #' || :cart_id)"
         );
         $txnStmt->execute([
             ':user_id' => $userId,
             ':amount' => $amount,
-            ':cart_id' => $cartId,
-            ':balance_before' => $wallet['balance'],
-            ':balance_after' => $wallet['balance'] - $amount
+            ':cart_id' => $cartId
         ]);
         
         // Update cart status
@@ -451,6 +446,38 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
 }
 
 /*********************************
+ * GET WALLET BALANCE DIRECTLY
+ * NEW DEDICATED ENDPOINT
+ *********************************/
+function getWalletBalanceDirect($conn, $userId) {
+    $wallet = checkDropXWalletBalance($conn, $userId);
+    
+    // Get active cart to calculate sufficiency
+    $cart = getActiveCart($conn, $userId);
+    $sufficient = false;
+    $shortfall = 0;
+    
+    if ($cart) {
+        $totals = calculateCartTotals($conn, $cart['id'], $userId);
+        $totalAmount = $totals['total_amount'];
+        $balance = $wallet['balance'];
+        $sufficient = $balance >= $totalAmount;
+        $shortfall = $sufficient ? 0 : $totalAmount - $balance;
+    }
+    
+    return [
+        'exists' => $wallet['exists'],
+        'balance' => $wallet['balance'],
+        'balance_formatted' => 'MK' . number_format($wallet['balance'], 2),
+        'is_active' => $wallet['is_active'],
+        'currency' => $wallet['currency'],
+        'sufficient' => $sufficient,
+        'shortfall' => round($shortfall, 2),
+        'shortfall_formatted' => 'MK' . number_format($shortfall, 2)
+    ];
+}
+
+/*********************************
  * MAIN ROUTER
  *********************************/
 try {
@@ -462,6 +489,12 @@ try {
         $input = $_POST;
     }
     
+    // Debug logging
+    error_log("=== CHECKOUT REQUEST ===");
+    error_log("Method: " . $method);
+    error_log("Path: " . $path);
+    error_log("Input: " . print_r($input, true));
+    
     $db = new Database();
     $conn = $db->getConnection();
     
@@ -470,10 +503,99 @@ try {
     }
     
     /*********************************
+     * ROUTE: GET /wallet/balance
+     * NEW DEDICATED WALLET BALANCE ENDPOINT
+     *********************************/
+    if ($method === 'GET' && strpos($path, '/wallet/balance') !== false) {
+        error_log("=== WALLET BALANCE REQUEST ===");
+        
+        $userId = authenticateUser($conn);
+        if (!$userId) {
+            ResponseHandler::error('Authentication required', 401);
+        }
+        
+        $walletData = getWalletBalanceDirect($conn, $userId);
+        
+        ResponseHandler::success([
+            'success' => true,
+            'data' => $walletData
+        ]);
+    }
+    
+    /*********************************
+     * ROUTE: GET /generate-payment-code
+     * NEW DEDICATED CODE GENERATION ENDPOINT
+     *********************************/
+    elseif ($method === 'GET' && strpos($path, '/generate-payment-code') !== false) {
+        error_log("=== GENERATE CODE REQUEST ===");
+        
+        $userId = authenticateUser($conn);
+        if (!$userId) {
+            ResponseHandler::error('Authentication required', 401);
+        }
+        
+        // Get active cart
+        $cart = getActiveCart($conn, $userId);
+        if (!$cart) {
+            ResponseHandler::error('No active cart found', 404);
+        }
+        
+        // Validate cart has items
+        if (!validateCart($conn, $cart['id'])) {
+            ResponseHandler::error('Cart is empty', 400);
+        }
+        
+        // Calculate totals
+        $totals = calculateCartTotals($conn, $cart['id'], $userId);
+        $amount = $totals['total_amount'];
+        
+        // Check wallet balance
+        $wallet = checkDropXWalletBalance($conn, $userId);
+        
+        // Generate code
+        $externalPayment = createExternalPayment(
+            $conn, 
+            $userId, 
+            $cart['id'], 
+            $amount, 
+            $wallet['balance']
+        );
+        
+        ResponseHandler::success([
+            'success' => true,
+            'message' => 'Payment code generated',
+            'data' => [
+                'payment_code' => $externalPayment['payment_code'],
+                'formatted_code' => $externalPayment['formatted_code'],
+                'amount' => $amount,
+                'amount_formatted' => 'MK' . number_format($amount, 2),
+                'expires_at' => $externalPayment['expires_at'],
+                'expiry_minutes' => 30,
+                'accepted_partners' => [
+                    'TNM Mpamba',
+                    'Airtel Money',
+                    'NBS Bank',
+                    'FDH Bank',
+                    'Standard Bank'
+                ],
+                'instructions' => [
+                    '🔑 Your code: ' . $externalPayment['payment_code'],
+                    '💰 Amount: MK' . number_format($amount, 2),
+                    '⏱️  Expires: ' . date('h:i A', strtotime($externalPayment['expires_at'])),
+                    '📍 Show this code at any TNM Mpamba, Airtel Money, or Bank branch',
+                    '✅ Pay cash, we add funds to your wallet instantly'
+                ]
+            ]
+        ]);
+    }
+    
+    /*********************************
      * ROUTE: GET /checkout
      * Load checkout screen for app users
      *********************************/
-    if ($method === 'GET' && strpos($path, '/checkout') !== false) {
+    elseif ($method === 'GET' && strpos($path, '/checkout') !== false) {
+        error_log("=== CHECKOUT DATA REQUEST ===");
+        
         $userId = authenticateUser($conn);
         if (!$userId) {
             ResponseHandler::error('Authentication required', 401);
@@ -544,6 +666,7 @@ try {
                     'exists' => $wallet['exists'],
                     'balance' => $wallet['balance'],
                     'balance_formatted' => 'MK' . number_format($wallet['balance'], 2),
+                    'is_active' => $wallet['is_active'],
                     'sufficient' => $wallet['balance'] >= $totals['total_amount'],
                     'shortfall' => $wallet['balance'] >= $totals['total_amount'] ? 0 : 
                                   round($totals['total_amount'] - $wallet['balance'], 2),
@@ -576,6 +699,9 @@ try {
      * Actions: initiate, process_payment, generate_code
      *********************************/
     elseif ($method === 'POST' && strpos($path, '/checkout') !== false) {
+        error_log("=== POST CHECKOUT REQUEST ===");
+        error_log("Action: " . ($input['action'] ?? 'none'));
+        
         $userId = authenticateUser($conn);
         if (!$userId) {
             ResponseHandler::error('Authentication required', 401);
@@ -689,7 +815,6 @@ try {
             /*********************************
              * ACTION: generate_code
              * Generate 4-character code for external payment
-             * NO CUSTOMER VERIFICATION - JUST CODE + AMOUNT
              *********************************/
             case 'generate_code':
                 $cartId = $input['cart_id'] ?? null;
@@ -880,9 +1005,8 @@ try {
             
             // Add funds to wallet
             $walletStmt = $conn->prepare(
-                "UPDATE user_wallets 
-                 SET balance = balance + :amount,
-                     updated_at = NOW()
+                "UPDATE dropx_wallets 
+                 SET balance = balance + :amount
                  WHERE user_id = :user_id"
             );
             $walletStmt->execute([
@@ -890,30 +1014,22 @@ try {
                 ':user_id' => $payment['user_id']
             ]);
             
-            // Get current balance for transaction record
-            $balanceStmt = $conn->prepare(
-                "SELECT balance FROM user_wallets WHERE user_id = :user_id"
-            );
-            $balanceStmt->execute([':user_id' => $payment['user_id']]);
-            $currentBalance = $balanceStmt->fetch(PDO::FETCH_ASSOC)['balance'];
-            
-            // Record wallet credit in wallet_transactions
+            // Record wallet credit
             $txnStmt = $conn->prepare(
                 "INSERT INTO wallet_transactions 
-                    (user_id, amount, transaction_type, reference_id, partner, partner_reference, 
-                     balance_before, balance_after, status, description)
+                    (user_id, amount, type, reference_type, reference_id, 
+                     partner, partner_reference, status, description)
                  VALUES 
-                    (:user_id, :amount, 'deposit', :payment_id, :partner, :reference,
-                     :balance_before, :balance_after, 'completed', 'Wallet top-up via ' || :partner)"
+                    (:user_id, :amount, 'credit', 'external_payment', :payment_id,
+                     :partner, :reference, 'completed', 
+                     'Wallet top-up via ' || :partner)"
             );
             $txnStmt->execute([
                 ':user_id' => $payment['user_id'],
                 ':amount' => $payment['amount'],
                 ':payment_id' => $payment['id'],
                 ':partner' => $partner,
-                ':reference' => $partnerReference,
-                ':balance_before' => $currentBalance - $payment['amount'],
-                ':balance_after' => $currentBalance
+                ':reference' => $partnerReference
             ]);
             
             $conn->commit();
@@ -982,6 +1098,7 @@ try {
     }
     
 } catch (Exception $e) {
+    error_log("Checkout error: " . $e->getMessage());
     ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
 }
 ?>
