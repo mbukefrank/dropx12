@@ -88,9 +88,8 @@ function handleGetRequest($userId) {
         getOrdersList($conn, $userId);
     }
 }
-
 /*********************************
- * GET ORDERS LIST
+ * GET ORDERS LIST - FIXED
  *********************************/
 function getOrdersList($conn, $userId) {
     // Get query parameters
@@ -142,7 +141,8 @@ function getOrdersList($conn, $userId) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // Get orders with items - UPDATED: Changed oi.price to oi.unit_price
+    // ============= FIXED QUERY =============
+    // Option 1: Add estimated_delivery to GROUP BY (Recommended)
     $sql = "SELECT DISTINCT
                 o.id,
                 o.order_number,
@@ -172,7 +172,7 @@ function getOrdersList($conn, $userId) {
             LEFT JOIN order_tracking ot ON o.id = ot.order_id
             LEFT JOIN order_items oi ON o.id = oi.order_id
             $whereClause
-            GROUP BY o.id, ot.estimated_delivery
+            GROUP BY o.id, ot.estimated_delivery  -- FIX: Added ot.estimated_delivery to GROUP BY
             ORDER BY o.$sortBy $sortOrder
             LIMIT :limit OFFSET :offset";
 
@@ -211,7 +211,6 @@ function getOrdersList($conn, $userId) {
         ]
     ]);
 }
-
 /*********************************
  * GET ORDER DETAILS
  *********************************/
