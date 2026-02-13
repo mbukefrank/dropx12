@@ -81,6 +81,247 @@ define('EXTERNAL_PARTNERS', [
 ]);
 
 /*********************************
+ * DEDICATED WALLET BALANCE ENDPOINT
+ * GET /wallet/balance
+ *********************************/
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && strpos($_SERVER['REQUEST_URI'], '/wallet/balance') !== false) {
+    header("Content-Type: application/json");
+    
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    
+    // Authenticate user
+    $userId = null;
+    if (!empty($_SESSION['user_id'])) {
+        $userId = $_SESSION['user_id'];
+    } else {
+        $headers = getallheaders();
+        $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+        if (strpos($authHeader, 'Bearer ') === 0) {
+            $token = substr($authHeader, 7);
+            $db = new Database();
+            $conn = $db->getConnection();
+            $stmt = $conn->prepare("SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()");
+            $stmt->execute([':token' => $token]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($user) {
+                $userId = $user['id'];
+                $_SESSION['user_id'] = $userId;
+            }
+        }
+    }
+    
+    if (!$userId) {
+        echo json_encode([
+            'success' => true,
+            'data' => [
+                'exists' => false,
+                'balance' => 0.0,
+                'balance_formatted' => 'MK0.00',
+                'is_active' => false
+            ]
+        ]);
+        exit();
+    }
+    
+    try {
+        $db = new Database();
+        $conn = $db->getConnection();
+        
+        // Get wallet balance
+        $stmt = $conn->prepare("SELECT balance, currency, is_active FROM dropx_wallets WHERE user_id = ? LIMIT 1");
+        $stmt->execute([$userId]);
+        $wallet = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($wallet) {
+            echo json_encode([
+                'success' => true,
+                'data' => [
+                    'exists' => true,
+                    'balance' => floatval($wallet['balance']),
+                    'balance_formatted' => 'MK' . number_format($wallet['balance'], 2),
+                    'is_active' => boolval($wallet['is_active']),
+                    'currency' => $wallet['currency'] ?? 'MWK'
+                ]
+            ]);
+        } else {
+            echo json_encode([
+                'success' => true,
+                'data' => [
+                    'exists' => false,
+                    'balance' => 0.0,
+                    'balance_formatted' => 'MK0.00',
+                    'is_active' => false,
+                    'currency' => 'MWK'
+                ]
+            ]);
+        }
+    } catch (Exception $e) {
+        echo json_encode([
+            'success' => false,
+            'message' => $e->getMessage(),
+            'data' => [
+                'exists' => false,
+                'balance' => 0.0,
+                'balance_formatted' => 'MK0.00',
+                'is_active' => false
+            ]
+        ]);
+    }
+    exit();
+}
+
+/*********************************
+ * DEDICATED CODE GENERATION ENDPOINT
+ * GET /generate-payment-code
+ *********************************/
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && strpos($_SERVER['REQUEST_URI'], '/generate-payment-code') !== false) {
+    header("Content-Type: application/json");
+    
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    
+    // Authenticate user
+    $userId = null;
+    if (!empty($_SESSION['user_id'])) {
+        $userId = $_SESSION['user_id'];
+    } else {
+        $headers = getallheaders();
+        $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+        if (strpos($authHeader, 'Bearer ') === 0) {
+            $token = substr($authHeader, 7);
+            $db = new Database();
+            $conn = $db->getConnection();
+            $stmt = $conn->prepare("SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()");
+            $stmt->execute([':token' => $token]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($user) {
+                $userId = $user['id'];
+                $_SESSION['user_id'] = $userId;
+            }
+        }
+    }
+    
+    if (!$userId) {
+        echo json_encode(['success' => false, 'message' => 'Authentication required']);
+        exit();
+    }
+    
+    try {
+        $db = new Database();
+        $conn = $db->getConnection();
+        
+        // Get active cart
+        $stmt = $conn->prepare("SELECT id FROM carts WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1");
+        $stmt->execute([$userId]);
+        $cart = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$cart) {
+            echo json_encode(['success' => false, 'message' => 'No active cart found']);
+            exit();
+        }
+        
+        // Calculate totals
+        $totalsStmt = $conn->prepare(
+            "SELECT SUM(mi.price * ci.quantity) as subtotal 
+             FROM cart_items ci 
+             JOIN menu_items mi ON ci.menu_item_id = mi.id 
+             WHERE ci.cart_id = ? AND ci.is_active = 1"
+        );
+        $totalsStmt->execute([$cart['id']]);
+        $result = $totalsStmt->fetch(PDO::FETCH_ASSOC);
+        $subtotal = floatval($result['subtotal'] ?? 0);
+        
+        // Get applied discount
+        $discountStmt = $conn->prepare("SELECT applied_discount FROM carts WHERE id = ?");
+        $discountStmt->execute([$cart['id']]);
+        $cartData = $discountStmt->fetch(PDO::FETCH_ASSOC);
+        $discount = floatval($cartData['applied_discount'] ?? 0);
+        
+        $adjustedSubtotal = max(0, $subtotal - $discount);
+        
+        // Calculate fees
+        $deliveryFee = 1500.00;
+        $serviceFee = max(500.00, $adjustedSubtotal * 0.02);
+        $taxRate = 0.165;
+        $taxableAmount = $adjustedSubtotal + $deliveryFee + $serviceFee;
+        $taxAmount = $taxableAmount * $taxRate;
+        $totalAmount = $taxableAmount + $taxAmount;
+        
+        // Get wallet balance for reference
+        $walletStmt = $conn->prepare("SELECT balance FROM dropx_wallets WHERE user_id = ?");
+        $walletStmt->execute([$userId]);
+        $wallet = $walletStmt->fetch(PDO::FETCH_ASSOC);
+        $walletBalance = $wallet ? floatval($wallet['balance']) : 0;
+        
+        // Generate 4-character code
+        $letters = 'ABCDEFGHJKLMNPQRTUVWXY';
+        $numbers = '346789';
+        $maxAttempts = 100;
+        $attempts = 0;
+        
+        do {
+            $code = $letters[random_int(0, strlen($letters) - 1)] .
+                    $numbers[random_int(0, strlen($numbers) - 1)] .
+                    $letters[random_int(0, strlen($letters) - 1)] .
+                    $numbers[random_int(0, strlen($numbers) - 1)];
+            
+            $checkStmt = $conn->prepare(
+                "SELECT id FROM external_payments 
+                 WHERE payment_code = ? 
+                 AND status IN ('pending', 'processing')
+                 AND expires_at > NOW()"
+            );
+            $checkStmt->execute([$code]);
+            $attempts++;
+        } while ($checkStmt->fetch() && $attempts < $maxAttempts);
+        
+        $expiresAt = date('Y-m-d H:i:s', strtotime('+30 minutes'));
+        
+        // Save to database
+        $insertStmt = $conn->prepare(
+            "INSERT INTO external_payments 
+                (payment_code, user_id, cart_id, amount, wallet_balance_at_request, status, created_at, expires_at) 
+             VALUES 
+                (?, ?, ?, ?, ?, 'pending', NOW(), ?)"
+        );
+        $insertStmt->execute([$code, $userId, $cart['id'], $totalAmount, $walletBalance, $expiresAt]);
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Payment code generated',
+            'data' => [
+                'payment_code' => $code,
+                'formatted_code' => implode(' ', str_split($code)),
+                'amount' => $totalAmount,
+                'amount_formatted' => 'MK' . number_format($totalAmount, 2),
+                'expires_at' => $expiresAt,
+                'expiry_minutes' => 30,
+                'accepted_partners' => [
+                    'TNM Mpamba',
+                    'Airtel Money',
+                    'NBS Bank',
+                    'FDH Bank',
+                    'Standard Bank'
+                ],
+                'instructions' => [
+                    '🔑 Your code: ' . $code,
+                    '💰 Amount: MK' . number_format($totalAmount, 2),
+                    '⏱️  Expires in 30 minutes',
+                    '📍 Show this code at any TNM Mpamba, Airtel Money, or Bank branch',
+                    '✅ Pay cash, we add funds to your wallet instantly'
+                ]
+            ]
+        ]);
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    }
+    exit();
+}
+
+/*********************************
  * GENERATE 4-CHARACTER ALPHANUMERIC CODE
  * NO AMBIGUOUS CHARACTERS (NO 0,1,2,5,I,O,S,Z)
  * FORMAT: LETTER-NUMBER-LETTER-NUMBER (A3B7)
@@ -447,7 +688,6 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
 
 /*********************************
  * GET WALLET BALANCE DIRECTLY
- * NEW DEDICATED ENDPOINT
  *********************************/
 function getWalletBalanceDirect($conn, $userId) {
     $wallet = checkDropXWalletBalance($conn, $userId);
@@ -503,97 +743,10 @@ try {
     }
     
     /*********************************
-     * ROUTE: GET /wallet/balance
-     * NEW DEDICATED WALLET BALANCE ENDPOINT
-     *********************************/
-    if ($method === 'GET' && strpos($path, '/wallet/balance') !== false) {
-        error_log("=== WALLET BALANCE REQUEST ===");
-        
-        $userId = authenticateUser($conn);
-        if (!$userId) {
-            ResponseHandler::error('Authentication required', 401);
-        }
-        
-        $walletData = getWalletBalanceDirect($conn, $userId);
-        
-        ResponseHandler::success([
-            'success' => true,
-            'data' => $walletData
-        ]);
-    }
-    
-    /*********************************
-     * ROUTE: GET /generate-payment-code
-     * NEW DEDICATED CODE GENERATION ENDPOINT
-     *********************************/
-    elseif ($method === 'GET' && strpos($path, '/generate-payment-code') !== false) {
-        error_log("=== GENERATE CODE REQUEST ===");
-        
-        $userId = authenticateUser($conn);
-        if (!$userId) {
-            ResponseHandler::error('Authentication required', 401);
-        }
-        
-        // Get active cart
-        $cart = getActiveCart($conn, $userId);
-        if (!$cart) {
-            ResponseHandler::error('No active cart found', 404);
-        }
-        
-        // Validate cart has items
-        if (!validateCart($conn, $cart['id'])) {
-            ResponseHandler::error('Cart is empty', 400);
-        }
-        
-        // Calculate totals
-        $totals = calculateCartTotals($conn, $cart['id'], $userId);
-        $amount = $totals['total_amount'];
-        
-        // Check wallet balance
-        $wallet = checkDropXWalletBalance($conn, $userId);
-        
-        // Generate code
-        $externalPayment = createExternalPayment(
-            $conn, 
-            $userId, 
-            $cart['id'], 
-            $amount, 
-            $wallet['balance']
-        );
-        
-        ResponseHandler::success([
-            'success' => true,
-            'message' => 'Payment code generated',
-            'data' => [
-                'payment_code' => $externalPayment['payment_code'],
-                'formatted_code' => $externalPayment['formatted_code'],
-                'amount' => $amount,
-                'amount_formatted' => 'MK' . number_format($amount, 2),
-                'expires_at' => $externalPayment['expires_at'],
-                'expiry_minutes' => 30,
-                'accepted_partners' => [
-                    'TNM Mpamba',
-                    'Airtel Money',
-                    'NBS Bank',
-                    'FDH Bank',
-                    'Standard Bank'
-                ],
-                'instructions' => [
-                    '🔑 Your code: ' . $externalPayment['payment_code'],
-                    '💰 Amount: MK' . number_format($amount, 2),
-                    '⏱️  Expires: ' . date('h:i A', strtotime($externalPayment['expires_at'])),
-                    '📍 Show this code at any TNM Mpamba, Airtel Money, or Bank branch',
-                    '✅ Pay cash, we add funds to your wallet instantly'
-                ]
-            ]
-        ]);
-    }
-    
-    /*********************************
      * ROUTE: GET /checkout
      * Load checkout screen for app users
      *********************************/
-    elseif ($method === 'GET' && strpos($path, '/checkout') !== false) {
+    if ($method === 'GET' && strpos($path, '/checkout') !== false) {
         error_log("=== CHECKOUT DATA REQUEST ===");
         
         $userId = authenticateUser($conn);
