@@ -101,7 +101,7 @@ try {
 }
 
 /*********************************
- * HANDLE POST REQUESTS - MATCHES FLUTTER ACTIONS
+ * POST REQUESTS HANDLER
  *********************************/
 function handlePostRequest() {
     global $baseUrl;
@@ -118,10 +118,9 @@ function handlePostRequest() {
     
     $action = $input['action'] ?? '';
     
-    // Check authentication for all endpoints (except maybe public tracking)
+    // Check authentication for all endpoints
     $userId = checkAuthentication();
     if ($userId === false && $action !== 'track_order') {
-        // track_order might be public if using order number
         ResponseHandler::error('Authentication required. Please login.', 401);
     }
 
@@ -136,7 +135,7 @@ function handlePostRequest() {
             break;
             
         case 'get_trackable':
-            $limit = $input['limit'] ?? 20;
+            $limit = $input['limit'] ?? 50;
             $sortBy = $input['sort_by'] ?? 'created_at';
             $sortOrder = $input['sort_order'] ?? 'DESC';
             getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder);
@@ -448,11 +447,11 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
  *********************************/
 function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
     // Validate sort parameters
-    $allowedSortColumns = ['created_at', 'order_number', 'status'];
+    $allowedSortColumns = ['created_at', 'order_number', 'total_amount', 'status'];
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
     $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
     
-    // Trackable statuses
+    // Trackable statuses (orders that can be tracked)
     $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
     $placeholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
     
@@ -479,7 +478,7 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
     $stmt->execute($params);
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Format orders
+    // Format orders for response
     $formattedOrders = [];
     foreach ($orders as $order) {
         $merchantImage = '';
@@ -497,7 +496,8 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
             'total_amount' => floatval($order['total_amount']),
             'payment_method' => $order['payment_method'],
             'merchant_name' => $order['merchant_name'],
-            'merchant_image' => $merchantImage
+            'merchant_image' => $merchantImage,
+            'restaurant_name' => $order['merchant_name'] // For compatibility with Order.fromApiResponse
         ];
     }
     
@@ -720,38 +720,48 @@ function rateDelivery($conn, $userId, $orderId, $rating, $punctualityRating, $pr
         ResponseHandler::error('You have already rated this delivery', 409);
     }
 
-    // Create rating
-    $stmt = $conn->prepare(
-        "INSERT INTO driver_ratings 
-            (driver_id, user_id, order_id, rating, punctuality_rating, 
-             professionalism_rating, comment, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())"
-    );
-    
-    $stmt->execute([
-        $order['driver_id'],
-        $userId,
-        $orderId,
-        $rating,
-        $punctualityRating,
-        $professionalismRating,
-        $comment
-    ]);
+    // Start transaction
+    $conn->beginTransaction();
 
-    // Update driver's average rating
-    $updateDriverStmt = $conn->prepare(
-        "UPDATE drivers 
-         SET rating = (
-             SELECT AVG(rating) 
-             FROM driver_ratings 
-             WHERE driver_id = ?
-         ),
-         updated_at = NOW()
-         WHERE id = ?"
-    );
-    $updateDriverStmt->execute([$order['driver_id'], $order['driver_id']]);
+    try {
+        // Create rating
+        $stmt = $conn->prepare(
+            "INSERT INTO driver_ratings 
+                (driver_id, user_id, order_id, rating, punctuality_rating, 
+                 professionalism_rating, comment, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())"
+        );
+        
+        $stmt->execute([
+            $order['driver_id'],
+            $userId,
+            $orderId,
+            $rating,
+            $punctualityRating,
+            $professionalismRating,
+            $comment
+        ]);
 
-    ResponseHandler::success([], 'Thank you for your feedback!');
+        // Update driver's average rating
+        $updateDriverStmt = $conn->prepare(
+            "UPDATE drivers 
+             SET rating = (
+                 SELECT AVG(rating) 
+                 FROM driver_ratings 
+                 WHERE driver_id = ?
+             ),
+             updated_at = NOW()
+             WHERE id = ?"
+        );
+        $updateDriverStmt->execute([$order['driver_id'], $order['driver_id']]);
+
+        $conn->commit();
+
+        ResponseHandler::success([], 'Thank you for your feedback!');
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to submit rating: ' . $e->getMessage(), 500);
+    }
 }
 
 /*********************************
@@ -975,24 +985,23 @@ function getLatestActiveOrder($conn, $userId) {
     $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
     $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
     
-    $stmt = $conn->prepare(
-        "SELECT 
-            o.id,
-            o.order_number,
-            o.status,
-            o.created_at,
-            o.updated_at,
-            o.total_amount,
-            m.name as merchant_name
-        FROM orders o
-        LEFT JOIN merchants m ON o.merchant_id = m.id
-        WHERE o.user_id = ? 
-        AND o.status IN ($placeholders)
-        ORDER BY o.created_at DESC
-        LIMIT 1"
-    );
+    $sql = "SELECT 
+                o.id,
+                o.order_number,
+                o.status,
+                o.created_at,
+                o.updated_at,
+                o.total_amount,
+                m.name as merchant_name
+            FROM orders o
+            LEFT JOIN merchants m ON o.merchant_id = m.id
+            WHERE o.user_id = ? 
+            AND o.status IN ($placeholders)
+            ORDER BY o.created_at DESC
+            LIMIT 1";
     
     $params = array_merge([$userId], $activeStatuses);
+    $stmt = $conn->prepare($sql);
     $stmt->execute($params);
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
     
