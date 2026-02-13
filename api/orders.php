@@ -89,7 +89,7 @@ function handleGetRequest($userId) {
     }
 }
 /*********************************
- * GET ORDERS LIST - FIXED
+ * GET ORDERS LIST - COMPLETELY FIXED
  *********************************/
 function getOrdersList($conn, $userId) {
     // Get query parameters
@@ -141,8 +141,7 @@ function getOrdersList($conn, $userId) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // ============= FIXED QUERY =============
-    // OPTION 1: Include all non-aggregated columns in GROUP BY (Recommended)
+    // ============= COMPLETELY REWRITTEN QUERY - NO GROUP BY ISSUES =============
     $sql = "SELECT 
                 o.id,
                 o.order_number,
@@ -160,19 +159,32 @@ function getOrdersList($conn, $userId) {
                 m.image_url as merchant_image,
                 d.name as driver_name,
                 d.phone as driver_phone,
-                MAX(ot.estimated_delivery) as estimated_delivery,  -- Using MAX() aggregate function
-                MAX(ot.status) as tracking_status,                  -- Using MAX() aggregate function
-                GROUP_CONCAT(
-                    CONCAT(oi.item_name, '||', oi.quantity, '||', oi.unit_price)
-                    ORDER BY oi.id SEPARATOR ';;'
+                (
+                    SELECT estimated_delivery 
+                    FROM order_tracking 
+                    WHERE order_id = o.id 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                ) as estimated_delivery,
+                (
+                    SELECT status 
+                    FROM order_tracking 
+                    WHERE order_id = o.id 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                ) as tracking_status,
+                (
+                    SELECT GROUP_CONCAT(
+                        CONCAT(item_name, '||', quantity, '||', unit_price)
+                        ORDER BY id SEPARATOR ';;'
+                    )
+                    FROM order_items 
+                    WHERE order_id = o.id
                 ) as items_data
             FROM orders o
             LEFT JOIN merchants m ON o.merchant_id = m.id
             LEFT JOIN drivers d ON o.driver_id = d.id
-            LEFT JOIN order_tracking ot ON o.id = ot.order_id
-            LEFT JOIN order_items oi ON o.id = oi.order_id
             $whereClause
-            GROUP BY o.id  -- Only group by order ID, use aggregates for other columns
             ORDER BY o.$sortBy $sortOrder
             LIMIT :limit OFFSET :offset";
 
