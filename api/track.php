@@ -1,6 +1,8 @@
 <?php
 /*********************************
- * CORS Configuration
+ * ORDER TRACKING API - track.php
+ * Handles all tracking-related endpoints for DropX
+ * Matches Flutter app's expected actions exactly
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -59,32 +61,10 @@ function initializeSession() {
 /*********************************
  * AUTHENTICATION CHECK
  *********************************/
-function checkAuthentication($endpoint = null) {
-    // Some endpoints don't require authentication
-    $publicEndpoints = [
-        '/order/', // Public tracking by order number
-    ];
-    
-    // Check if this is a public endpoint
-    $isPublic = false;
-    if ($endpoint) {
-        foreach ($publicEndpoints as $publicPath) {
-            if (strpos($endpoint, $publicPath) === 0) {
-                $isPublic = true;
-                break;
-            }
-        }
-    }
-    
-    if ($isPublic) {
-        // Public endpoint - no authentication required
-        return null;
-    }
-    
-    // Private endpoint - require authentication
+function checkAuthentication() {
     initializeSession();
     
-    // Check if user is logged in (same as auth.php)
+    // Check if user is logged in
     if (empty($_SESSION['user_id']) || empty($_SESSION['logged_in'])) {
         return false;
     }
@@ -95,195 +75,228 @@ function checkAuthentication($endpoint = null) {
 /*********************************
  * BASE URL CONFIGURATION
  *********************************/
-// Update this with your actual backend URL
 $baseUrl = "https://dropx12-production.up.railway.app";
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
- * ROUTER
+ * MAIN ROUTER - HANDLES ALL POST REQUESTS FROM FLUTTER
  *********************************/
 try {
     $method = $_SERVER['REQUEST_METHOD'];
-    $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
     
-    // Remove the base path if needed (adjust based on your setup)
-    $path = str_replace('/api/track', '', $path);
-    $path = str_replace('/track.php', '', $path); // Also remove if accessed directly
-
-    if ($method === 'GET') {
-        handleGetRequest($path);
-    } elseif ($method === 'POST') {
-        handlePostRequest($path);
+    // Log the request for debugging
+    error_log("Track API Request - Method: $method");
+    
+    // Flutter app makes POST requests to /api/track with action parameter
+    if ($method === 'POST') {
+        handlePostRequest();
     } else {
         ResponseHandler::error('Method not allowed', 405);
     }
 } catch (Exception $e) {
+    error_log("Track API Error: " . $e->getMessage());
     ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
 }
 
 /*********************************
- * GET REQUESTS
+ * HANDLE POST REQUESTS - MATCHES FLUTTER ACTIONS
  *********************************/
-function handleGetRequest($path) {
+function handlePostRequest() {
     global $baseUrl;
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Route based on path pattern
-    if (preg_match('/^\/order\/([A-Za-z0-9_-]+)$/', $path, $matches)) {
-        $orderIdentifier = $matches[1];
-        getOrderTracking($conn, $orderIdentifier, $baseUrl);
-    } elseif ($path === '/driver-location' || strpos($path, '?action=driver-location') !== false) {
-        // Check authentication for private endpoint
-        $userId = checkAuthentication('/driver-location');
-        if ($userId === false) {
-            ResponseHandler::error('Authentication required. Please login.', 401);
-        }
-        getDriverLocation($conn, $userId);
-    } elseif ($path === '/realtime-updates' || strpos($path, '?action=realtime-updates') !== false) {
-        // Check authentication for private endpoint
-        $userId = checkAuthentication('/realtime-updates');
-        if ($userId === false) {
-            ResponseHandler::error('Authentication required. Please login.', 401);
-        }
-        getRealTimeUpdates($conn, $userId);
-    } elseif ($path === '/' || $path === '') {
-        // Root endpoint - just return success
-        ResponseHandler::success(['service' => 'DropX Tracking API', 'status' => 'active']);
-    } else {
-        ResponseHandler::error('Invalid endpoint', 404);
+    $input = json_decode(file_get_contents('php://input'), true);
+    if (!$input) {
+        $input = $_POST;
+    }
+    
+    // Log the input for debugging
+    error_log("Track POST Input: " . json_encode($input));
+    
+    $action = $input['action'] ?? '';
+    
+    // Check authentication for all endpoints (except maybe public tracking)
+    $userId = checkAuthentication();
+    if ($userId === false && $action !== 'track_order') {
+        // track_order might be public if using order number
+        ResponseHandler::error('Authentication required. Please login.', 401);
+    }
+
+    // Route based on action from Flutter
+    switch ($action) {
+        case 'track_order':
+            $orderIdentifier = $input['order_identifier'] ?? '';
+            if (!$orderIdentifier) {
+                ResponseHandler::error('Order identifier is required', 400);
+            }
+            getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId);
+            break;
+            
+        case 'get_trackable':
+            $limit = $input['limit'] ?? 20;
+            $sortBy = $input['sort_by'] ?? 'created_at';
+            $sortOrder = $input['sort_order'] ?? 'DESC';
+            getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder);
+            break;
+            
+        case 'driver_location':
+            $orderId = $input['order_id'] ?? '';
+            if (!$orderId) {
+                ResponseHandler::error('Order ID is required', 400);
+            }
+            getDriverLocation($conn, $userId, $orderId);
+            break;
+            
+        case 'realtime_updates':
+            $orderId = $input['order_id'] ?? '';
+            $lastUpdate = $input['last_update'] ?? null;
+            if (!$orderId) {
+                ResponseHandler::error('Order ID is required', 400);
+            }
+            getRealTimeUpdates($conn, $userId, $orderId, $lastUpdate);
+            break;
+            
+        case 'rate_delivery':
+            $orderId = $input['order_id'] ?? '';
+            $rating = floatval($input['rating'] ?? 0);
+            $punctualityRating = intval($input['punctuality_rating'] ?? 0);
+            $professionalismRating = intval($input['professionalism_rating'] ?? 0);
+            $comment = $input['comment'] ?? '';
+            
+            if (!$orderId) {
+                ResponseHandler::error('Order ID is required', 400);
+            }
+            if ($rating < 1 || $rating > 5) {
+                ResponseHandler::error('Rating must be between 1 and 5', 400);
+            }
+            rateDelivery($conn, $userId, $orderId, $rating, $punctualityRating, $professionalismRating, $comment);
+            break;
+            
+        case 'call_driver':
+            $orderId = $input['order_id'] ?? '';
+            if (!$orderId) {
+                ResponseHandler::error('Order ID is required', 400);
+            }
+            getDriverContact($conn, $userId, $orderId);
+            break;
+            
+        case 'share_tracking':
+            $orderId = $input['order_id'] ?? '';
+            if (!$orderId) {
+                ResponseHandler::error('Order ID is required', 400);
+            }
+            shareTracking($conn, $userId, $orderId);
+            break;
+            
+        case 'cancel_order':
+            $orderId = $input['order_id'] ?? '';
+            $reason = $input['reason'] ?? '';
+            if (!$orderId) {
+                ResponseHandler::error('Order ID is required', 400);
+            }
+            cancelOrderFromTracking($conn, $userId, $orderId, $reason);
+            break;
+            
+        case 'contact_support':
+            $orderId = $input['order_id'] ?? '';
+            $issue = $input['issue'] ?? '';
+            $details = $input['details'] ?? '';
+            if (!$issue) {
+                ResponseHandler::error('Issue description is required', 400);
+            }
+            contactOrderSupport($conn, $userId, $orderId, $issue, $details);
+            break;
+            
+        case 'latest_active':
+            getLatestActiveOrder($conn, $userId);
+            break;
+            
+        default:
+            ResponseHandler::error('Invalid action: ' . $action, 400);
     }
 }
 
 /*********************************
- * GET ORDER TRACKING DETAILS
+ * GET ORDER TRACKING - track_order
  *********************************/
-function getOrderTracking($conn, $orderIdentifier, $baseUrl) {
-    // Public endpoint - anyone can track with order number
-    
+function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
     // Check if order identifier is order_number or order_id
-    $isOrderNumber = preg_match('/^[A-Za-z0-9_-]+$/', $orderIdentifier);
+    $isOrderNumber = !is_numeric($orderIdentifier) && preg_match('/^[A-Za-z0-9_-]+$/', $orderIdentifier);
+    
+    $sql = "SELECT 
+                o.id,
+                o.order_number,
+                o.user_id,
+                o.merchant_id,
+                o.driver_id,
+                o.subtotal,
+                o.delivery_fee,
+                o.total_amount,
+                o.payment_method,
+                o.delivery_address_id,
+                o.special_instructions,
+                o.status,
+                o.scheduled_delivery_time,
+                o.actual_delivery_time,
+                o.created_at,
+                o.updated_at,
+                o.cancellation_reason,
+                m.name as merchant_name,
+                m.address as merchant_address,
+                m.phone as merchant_phone,
+                m.image_url as merchant_image,
+                m.latitude as merchant_latitude,
+                m.longitude as merchant_longitude,
+                d.name as driver_name,
+                d.phone as driver_phone,
+                d.current_latitude,
+                d.current_longitude,
+                d.vehicle_type,
+                d.vehicle_number,
+                d.vehicle_color,
+                d.image_url as driver_image,
+                d.rating as driver_rating,
+                u.full_name as user_name,
+                u.phone as user_phone,
+                a.full_name as address_name,
+                a.phone as address_phone,
+                a.address_line1,
+                a.address_line2,
+                a.city,
+                a.neighborhood,
+                a.area,
+                a.sector,
+                a.latitude as address_latitude,
+                a.longitude as address_longitude,
+                a.landmark
+            FROM orders o
+            LEFT JOIN merchants m ON o.merchant_id = m.id
+            LEFT JOIN drivers d ON o.driver_id = d.id
+            LEFT JOIN users u ON o.user_id = u.id
+            LEFT JOIN addresses a ON o.delivery_address_id = a.id
+            WHERE ";
     
     if ($isOrderNumber) {
-        // Try to find by order_number first
-        $orderStmt = $conn->prepare(
-            "SELECT 
-                o.id,
-                o.order_number,
-                o.user_id,
-                o.merchant_id,
-                o.driver_id,
-                o.subtotal,
-                o.delivery_fee,
-                o.total_amount,
-                o.payment_method,
-                o.delivery_address_id,
-                o.special_instructions,
-                o.status,
-                o.scheduled_delivery_time,
-                o.actual_delivery_time,
-                o.created_at,
-                o.updated_at,
-                o.cancellation_reason,
-                m.name as merchant_name,
-                m.address as merchant_address,
-                m.phone as merchant_phone,
-                m.image_url as merchant_image,
-                m.latitude as merchant_latitude,
-                m.longitude as merchant_longitude,
-                d.name as driver_name,
-                d.phone as driver_phone,
-                d.current_latitude,
-                d.current_longitude,
-                d.vehicle_type,
-                d.vehicle_number,
-                d.vehicle_color,
-                d.image_url as driver_image,
-                d.rating as driver_rating,
-                u.full_name as user_name,
-                u.phone as user_phone,
-                a.full_name as address_name,
-                a.phone as address_phone,
-                a.address_line1,
-                a.address_line2,
-                a.city,
-                a.neighborhood,
-                a.area,
-                a.sector,
-                a.latitude,
-                a.longitude,
-                a.landmark
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            LEFT JOIN drivers d ON o.driver_id = d.id
-            LEFT JOIN users u ON o.user_id = u.id
-            LEFT JOIN addresses a ON o.delivery_address_id = a.id
-            WHERE o.order_number = :order_number
-            LIMIT 1"
-        );
-        $orderStmt->execute([':order_number' => $orderIdentifier]);
+        $sql .= "o.order_number = :identifier";
+        $params = [':identifier' => $orderIdentifier];
     } else {
-        // Try by order ID
-        $orderStmt = $conn->prepare(
-            "SELECT 
-                o.id,
-                o.order_number,
-                o.user_id,
-                o.merchant_id,
-                o.driver_id,
-                o.subtotal,
-                o.delivery_fee,
-                o.total_amount,
-                o.payment_method,
-                o.delivery_address_id,
-                o.special_instructions,
-                o.status,
-                o.scheduled_delivery_time,
-                o.actual_delivery_time,
-                o.created_at,
-                o.updated_at,
-                o.cancellation_reason,
-                m.name as merchant_name,
-                m.address as merchant_address,
-                m.phone as merchant_phone,
-                m.image_url as merchant_image,
-                m.latitude as merchant_latitude,
-                m.longitude as merchant_longitude,
-                d.name as driver_name,
-                d.phone as driver_phone,
-                d.current_latitude,
-                d.current_longitude,
-                d.vehicle_type,
-                d.vehicle_number,
-                d.vehicle_color,
-                d.image_url as driver_image,
-                d.rating as driver_rating,
-                u.full_name as user_name,
-                u.phone as user_phone,
-                a.full_name as address_name,
-                a.phone as address_phone,
-                a.address_line1,
-                a.address_line2,
-                a.city,
-                a.neighborhood,
-                a.area,
-                a.sector,
-                a.latitude,
-                a.longitude,
-                a.landmark
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            LEFT JOIN drivers d ON o.driver_id = d.id
-            LEFT JOIN users u ON o.user_id = u.id
-            LEFT JOIN addresses a ON o.delivery_address_id = a.id
-            WHERE o.id = :order_id
-            LIMIT 1"
-        );
-        $orderStmt->execute([':order_id' => intval($orderIdentifier)]);
+        $sql .= "o.id = :identifier";
+        $params = [':identifier' => intval($orderIdentifier)];
     }
     
+    // If user is authenticated, also check ownership
+    if ($userId) {
+        $sql .= " AND o.user_id = :user_id";
+        $params[':user_id'] = $userId;
+    }
+    
+    $sql .= " LIMIT 1";
+    
+    $orderStmt = $conn->prepare($sql);
+    $orderStmt->execute($params);
     $order = $orderStmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$order) {
@@ -312,10 +325,10 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl) {
         "SELECT 
             oi.id,
             oi.menu_item_id,
-            oi.item_name,
+            oi.item_name as name,
             oi.quantity,
-            oi.price,
-            oi.total,
+            oi.unit_price as price,
+            oi.total_price as total,
             oi.special_instructions,
             oi.customizations,
             mi.image_url as item_image,
@@ -390,25 +403,28 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl) {
     $deliveryAddress = formatDeliveryAddress($order);
 
     // Calculate delivery progress
-    $deliveryProgress = calculateDeliveryProgress($order['status'], $order['created_at']);
+    $deliveryProgress = calculateDeliveryProgress($order['status']);
 
-    // Estimate delivery time from database or calculate
+    // Estimate delivery time
     $estimatedDelivery = estimateDeliveryTime($order, $trackingInfo, $conn);
 
-    // Build delivery status timeline from database
+    // Build delivery status timeline
     $deliveryStatus = buildDeliveryStatusTimeline($statusHistory, $order, $trackingInfo);
 
-    // Build driver info from database
+    // Build driver info
     $driverInfo = null;
     if ($order['driver_id']) {
         $driverInfo = buildDriverInfo($order, $driverRating, $driverImage);
     }
 
-    // Build delivery route from database coordinates
+    // Build delivery route
     $deliveryRoute = buildDeliveryRoute($order, $locationHistory);
 
     // Build merchant info
     $merchantInfo = buildMerchantInfo($order, $merchantImage);
+
+    // Get available actions
+    $actions = getAvailableActions($order['status']);
 
     ResponseHandler::success([
         'order' => formatOrderData($order, $merchantInfo, $deliveryAddress),
@@ -423,34 +439,94 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl) {
             'location_history' => $locationHistory,
             'last_updated' => $trackingInfo['updated_at'] ?? $order['updated_at']
         ],
-        'actions' => getAvailableActions($order['status'])
+        'actions' => $actions
     ]);
 }
 
 /*********************************
- * GET DRIVER LOCATION (REALTIME)
+ * GET TRACKABLE ORDERS - get_trackable
  *********************************/
-function getDriverLocation($conn, $userId) {
-    $orderId = $_GET['order_id'] ?? null;
+function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
+    // Validate sort parameters
+    $allowedSortColumns = ['created_at', 'order_number', 'status'];
+    $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
+    $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
     
-    if (!$orderId) {
-        ResponseHandler::error('Order ID is required', 400);
+    // Trackable statuses
+    $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    $placeholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
+    
+    $sql = "SELECT 
+                o.id,
+                o.order_number,
+                o.status,
+                o.created_at,
+                o.updated_at,
+                o.total_amount,
+                o.payment_method,
+                m.name as merchant_name,
+                m.image_url as merchant_image
+            FROM orders o
+            LEFT JOIN merchants m ON o.merchant_id = m.id
+            WHERE o.user_id = ? 
+            AND o.status IN ($placeholders)
+            ORDER BY o.$sortBy $sortOrder
+            LIMIT ?";
+    
+    $params = array_merge([$userId], $trackableStatuses, [$limit]);
+    
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($params);
+    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Format orders
+    $formattedOrders = [];
+    foreach ($orders as $order) {
+        $merchantImage = '';
+        if (!empty($order['merchant_image'])) {
+            global $baseUrl;
+            $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
+        }
+        
+        $formattedOrders[] = [
+            'id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'status' => $order['status'],
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at'],
+            'total_amount' => floatval($order['total_amount']),
+            'payment_method' => $order['payment_method'],
+            'merchant_name' => $order['merchant_name'],
+            'merchant_image' => $merchantImage
+        ];
     }
-
-    // Verify the order belongs to the authenticated user
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM orders 
-         WHERE id = :order_id AND user_id = :user_id"
-    );
-    $checkStmt->execute([
-        ':order_id' => $orderId,
-        ':user_id' => $userId
-    ]);
     
-    if (!$checkStmt->fetch()) {
+    ResponseHandler::success([
+        'orders' => $formattedOrders
+    ]);
+}
+
+/*********************************
+ * GET DRIVER LOCATION - driver_location
+ *********************************/
+function getDriverLocation($conn, $userId, $orderId) {
+    // Verify the order belongs to the user
+    $checkStmt = $conn->prepare(
+        "SELECT id, driver_id FROM orders 
+         WHERE id = ? AND user_id = ?"
+    );
+    $checkStmt->execute([$orderId, $userId]);
+    $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$order) {
         ResponseHandler::error('Order not found or not authorized', 403);
     }
 
+    if (!$order['driver_id']) {
+        ResponseHandler::error('No driver assigned to this order yet', 404);
+    }
+
+    // Get driver location
     $stmt = $conn->prepare(
         "SELECT 
             d.current_latitude,
@@ -459,19 +535,17 @@ function getDriverLocation($conn, $userId) {
             d.phone,
             d.vehicle_type,
             d.vehicle_number,
+            d.vehicle_color,
+            d.image_url,
+            d.rating,
             o.status,
-            o.updated_at
+            o.updated_at as order_updated_at
         FROM orders o
-        JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = :order_id
-        LIMIT 1"
+        LEFT JOIN drivers d ON o.driver_id = d.id
+        WHERE o.id = ?"
     );
-    $stmt->execute([':order_id' => $orderId]);
+    $stmt->execute([$orderId]);
     $driver = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    if (!$driver) {
-        ResponseHandler::error('Driver not found for this order', 404);
-    }
 
     // Get the latest location from history
     $historyStmt = $conn->prepare(
@@ -481,68 +555,79 @@ function getDriverLocation($conn, $userId) {
             address,
             created_at
         FROM driver_location_history
-        WHERE order_id = :order_id
+        WHERE order_id = ?
         ORDER BY created_at DESC
         LIMIT 1"
     );
-    $historyStmt->execute([':order_id' => $orderId]);
+    $historyStmt->execute([$orderId]);
     $history = $historyStmt->fetch(PDO::FETCH_ASSOC);
 
+    // Format driver image URL
+    $driverImage = '';
+    if (!empty($driver['image_url'])) {
+        global $baseUrl;
+        $driverImage = formatImageUrl($driver['image_url'], $baseUrl, 'drivers');
+    }
+
     ResponseHandler::success([
-        'location' => [
-            'latitude' => $driver['current_latitude'],
-            'longitude' => $driver['current_longitude'],
+        'driver_location' => [
+            'latitude' => floatval($driver['current_latitude'] ?? $history['latitude'] ?? 0),
+            'longitude' => floatval($driver['current_longitude'] ?? $history['longitude'] ?? 0),
             'address' => $history['address'] ?? '',
-            'timestamp' => $driver['updated_at'],
-            'status' => $driver['status'],
-            'vehicle' => $driver['vehicle_type'],
-            'vehicle_number' => $driver['vehicle_number']
-        ]
+            'timestamp' => $history['created_at'] ?? $driver['order_updated_at'] ?? date('Y-m-d H:i:s')
+        ],
+        'driver_info' => [
+            'name' => $driver['name'] ?? 'Driver',
+            'phone' => $driver['phone'] ?? '',
+            'vehicle' => $driver['vehicle_type'] ?? 'Motorcycle',
+            'vehicle_number' => $driver['vehicle_number'] ?? '',
+            'rating' => floatval($driver['rating'] ?? 4.5),
+            'image_url' => $driverImage
+        ],
+        'order_status' => $driver['status']
     ]);
 }
 
 /*********************************
- * GET REAL-TIME UPDATES
+ * GET REAL-TIME UPDATES - realtime_updates
  *********************************/
-function getRealTimeUpdates($conn, $userId) {
-    $orderId = $_GET['order_id'] ?? null;
-    $lastUpdate = $_GET['last_update'] ?? null;
-    
-    if (!$orderId) {
-        ResponseHandler::error('Order ID is required', 400);
-    }
-
-    // Verify the order belongs to the authenticated user
+function getRealTimeUpdates($conn, $userId, $orderId, $lastUpdate = null) {
+    // Verify the order belongs to the user
     $checkStmt = $conn->prepare(
         "SELECT id FROM orders 
-         WHERE id = :order_id AND user_id = :user_id"
+         WHERE id = ? AND user_id = ?"
     );
-    $checkStmt->execute([
-        ':order_id' => $orderId,
-        ':user_id' => $userId
-    ]);
+    $checkStmt->execute([$orderId, $userId]);
     
     if (!$checkStmt->fetch()) {
         ResponseHandler::error('Order not found or not authorized', 403);
+    }
+
+    // Parse last update timestamp
+    $lastUpdateTime = null;
+    if ($lastUpdate) {
+        try {
+            $lastUpdateTime = date('Y-m-d H:i:s', strtotime($lastUpdate));
+        } catch (Exception $e) {
+            $lastUpdateTime = null;
+        }
     }
 
     // Check for new status updates
     $statusStmt = $conn->prepare(
         "SELECT 
             new_status,
-            created_at,
+            old_status,
+            created_at as timestamp,
             changed_by,
-            notes
+            notes as description
         FROM order_status_history
-        WHERE order_id = :order_id
-        AND (:last_update IS NULL OR created_at > :last_update)
-        ORDER BY created_at DESC"
+        WHERE order_id = ?
+        AND (? IS NULL OR created_at > ?)
+        ORDER BY created_at ASC"
     );
     
-    $statusStmt->execute([
-        ':order_id' => $orderId,
-        ':last_update' => $lastUpdate
-    ]);
+    $statusStmt->execute([$orderId, $lastUpdateTime, $lastUpdateTime]);
     $newStatuses = $statusStmt->fetchAll(PDO::FETCH_ASSOC);
 
     // Check for tracking updates
@@ -553,16 +638,13 @@ function getRealTimeUpdates($conn, $userId) {
             estimated_delivery,
             updated_at
         FROM order_tracking
-        WHERE order_id = :order_id
-        AND (:last_update IS NULL OR updated_at > :last_update)
+        WHERE order_id = ?
+        AND (? IS NULL OR updated_at > ?)
         ORDER BY updated_at DESC
         LIMIT 1"
     );
     
-    $trackingStmt->execute([
-        ':order_id' => $orderId,
-        ':last_update' => $lastUpdate
-    ]);
+    $trackingStmt->execute([$orderId, $lastUpdateTime, $lastUpdateTime]);
     $trackingUpdate = $trackingStmt->fetch(PDO::FETCH_ASSOC);
 
     // Get current driver location
@@ -570,12 +652,12 @@ function getRealTimeUpdates($conn, $userId) {
         "SELECT 
             d.current_latitude,
             d.current_longitude,
-            o.updated_at
+            d.updated_at as timestamp
         FROM orders o
         LEFT JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = :order_id"
+        WHERE o.id = ?"
     );
-    $driverStmt->execute([':order_id' => $orderId]);
+    $driverStmt->execute([$orderId]);
     $driverLocation = $driverStmt->fetch(PDO::FETCH_ASSOC);
 
     // Get new location history entries
@@ -584,21 +666,19 @@ function getRealTimeUpdates($conn, $userId) {
             latitude,
             longitude,
             address,
-            created_at
+            created_at as timestamp
         FROM driver_location_history
-        WHERE order_id = :order_id
-        AND (:last_update IS NULL OR created_at > :last_update)
+        WHERE order_id = ?
+        AND (? IS NULL OR created_at > ?)
         ORDER BY created_at DESC
         LIMIT 5"
     );
     
-    $locationStmt->execute([
-        ':order_id' => $orderId,
-        ':last_update' => $lastUpdate
-    ]);
+    $locationStmt->execute([$orderId, $lastUpdateTime, $lastUpdateTime]);
     $newLocations = $locationStmt->fetchAll(PDO::FETCH_ASSOC);
 
     ResponseHandler::success([
+        'success' => true,
         'has_updates' => !empty($newStatuses) || !empty($trackingUpdate) || !empty($newLocations),
         'status_updates' => $newStatuses,
         'tracking_update' => $trackingUpdate,
@@ -609,89 +689,15 @@ function getRealTimeUpdates($conn, $userId) {
 }
 
 /*********************************
- * POST REQUESTS
+ * RATE DELIVERY - rate_delivery
  *********************************/
-function handlePostRequest($path) {
-    global $baseUrl;
-    $db = new Database();
-    $conn = $db->getConnection();
-
-    $input = json_decode(file_get_contents('php://input'), true);
-    if (!$input) {
-        $input = $_POST;
-    }
-    
-    // Check authentication for all POST endpoints (they're all private)
-    $userId = checkAuthentication($path);
-    if ($userId === false) {
-        ResponseHandler::error('Authentication required. Please login.', 401);
-    }
-    
-    // Clean the path for routing
-    $cleanPath = strtok($path, '?');
-    
-    switch ($cleanPath) {
-        case '/rate-delivery':
-        case '/rate':
-            rateDelivery($conn, $input, $userId);
-            break;
-        case '/call-driver':
-        case '/call':
-            callDriver($conn, $input, $userId);
-            break;
-        case '/share-tracking':
-        case '/share':
-            shareTracking($conn, $input, $userId);
-            break;
-        case '/cancel-order':
-        case '/cancel':
-            cancelOrder($conn, $input, $userId);
-            break;
-        case '/contact-support':
-        case '/support':
-            contactSupport($conn, $input, $userId);
-            break;
-        case '/update-preferences':
-        case '/preferences':
-            updateTrackingPreferences($conn, $input, $userId);
-            break;
-        case '/':
-        case '':
-            // Handle POST to root - maybe create a tracking event
-            ResponseHandler::error('Specify an action', 400);
-            break;
-        default:
-            ResponseHandler::error('Invalid endpoint', 404);
-    }
-}
-
-/*********************************
- * RATE DELIVERY
- *********************************/
-function rateDelivery($conn, $data, $userId) {
-    $orderId = $data['order_id'] ?? null;
-    $rating = floatval($data['rating'] ?? 0);
-    $punctualityRating = intval($data['punctuality_rating'] ?? 0);
-    $professionalismRating = intval($data['professionalism_rating'] ?? 0);
-    $comment = trim($data['comment'] ?? '');
-
-    if (!$orderId) {
-        ResponseHandler::error('Order ID is required', 400);
-    }
-
-    if ($rating < 1 || $rating > 5) {
-        ResponseHandler::error('Rating must be between 1 and 5', 400);
-    }
-
+function rateDelivery($conn, $userId, $orderId, $rating, $punctualityRating, $professionalismRating, $comment) {
     // Verify order belongs to user
     $checkStmt = $conn->prepare(
         "SELECT id, driver_id FROM orders 
-         WHERE id = :order_id AND user_id = :user_id"
+         WHERE id = ? AND user_id = ?"
     );
-    $checkStmt->execute([
-        ':order_id' => $orderId,
-        ':user_id' => $userId
-    ]);
+    $checkStmt->execute([$orderId, $userId]);
     
     $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
     
@@ -706,9 +712,9 @@ function rateDelivery($conn, $data, $userId) {
     // Check if already rated
     $existingStmt = $conn->prepare(
         "SELECT id FROM driver_ratings 
-         WHERE order_id = :order_id"
+         WHERE order_id = ?"
     );
-    $existingStmt->execute([':order_id' => $orderId]);
+    $existingStmt->execute([$orderId]);
     
     if ($existingStmt->fetch()) {
         ResponseHandler::error('You have already rated this delivery', 409);
@@ -719,18 +725,17 @@ function rateDelivery($conn, $data, $userId) {
         "INSERT INTO driver_ratings 
             (driver_id, user_id, order_id, rating, punctuality_rating, 
              professionalism_rating, comment, created_at)
-         VALUES (:driver_id, :user_id, :order_id, :rating, :punctuality_rating,
-                :professionalism_rating, :comment, NOW())"
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())"
     );
     
     $stmt->execute([
-        ':driver_id' => $order['driver_id'],
-        ':user_id' => $userId,
-        ':order_id' => $orderId,
-        ':rating' => $rating,
-        ':punctuality_rating' => $punctualityRating,
-        ':professionalism_rating' => $professionalismRating,
-        ':comment' => $comment
+        $order['driver_id'],
+        $userId,
+        $orderId,
+        $rating,
+        $punctualityRating,
+        $professionalismRating,
+        $comment
     ]);
 
     // Update driver's average rating
@@ -739,35 +744,26 @@ function rateDelivery($conn, $data, $userId) {
          SET rating = (
              SELECT AVG(rating) 
              FROM driver_ratings 
-             WHERE driver_id = :driver_id
+             WHERE driver_id = ?
          ),
          updated_at = NOW()
-         WHERE id = :driver_id"
+         WHERE id = ?"
     );
-    $updateDriverStmt->execute([':driver_id' => $order['driver_id']]);
+    $updateDriverStmt->execute([$order['driver_id'], $order['driver_id']]);
 
     ResponseHandler::success([], 'Thank you for your feedback!');
 }
 
 /*********************************
- * CALL DRIVER
+ * GET DRIVER CONTACT - call_driver
  *********************************/
-function callDriver($conn, $data, $userId) {
-    $orderId = $data['order_id'] ?? null;
-    
-    if (!$orderId) {
-        ResponseHandler::error('Order ID is required', 400);
-    }
-
+function getDriverContact($conn, $userId, $orderId) {
     // Verify order belongs to user
     $checkStmt = $conn->prepare(
         "SELECT id FROM orders 
-         WHERE id = :order_id AND user_id = :user_id"
+         WHERE id = ? AND user_id = ?"
     );
-    $checkStmt->execute([
-        ':order_id' => $orderId,
-        ':user_id' => $userId
-    ]);
+    $checkStmt->execute([$orderId, $userId]);
     
     if (!$checkStmt->fetch()) {
         ResponseHandler::error('Order not found or not authorized', 403);
@@ -781,27 +777,27 @@ function callDriver($conn, $data, $userId) {
             o.order_number
         FROM orders o
         JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = :order_id"
+        WHERE o.id = ?"
     );
-    $stmt->execute([':order_id' => $orderId]);
+    $stmt->execute([$orderId]);
     $result = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$result) {
         ResponseHandler::error('Driver not available', 404);
     }
 
-    // Log the call attempt in database
+    // Log the call attempt
     $logStmt = $conn->prepare(
         "INSERT INTO user_activities 
             (user_id, activity_type, description, ip_address, metadata, created_at)
-         VALUES (:user_id, 'call_driver', 'Attempted to call driver for order', 
-                :ip_address, :metadata, NOW())"
+         VALUES (?, 'call_driver', 'Attempted to call driver for order', 
+                ?, ?, NOW())"
     );
     
     $logStmt->execute([
-        ':user_id' => $userId,
-        ':ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
-        ':metadata' => json_encode([
+        $userId,
+        $_SERVER['REMOTE_ADDR'] ?? '',
+        json_encode([
             'order_id' => $orderId,
             'driver_phone' => $result['phone'],
             'driver_name' => $result['name']
@@ -813,30 +809,20 @@ function callDriver($conn, $data, $userId) {
             'name' => $result['name'],
             'phone' => $result['phone'],
             'callable' => true
-        ],
-        'message' => 'Ready to call ' . $result['name']
+        ]
     ]);
 }
 
 /*********************************
- * SHARE TRACKING
+ * SHARE TRACKING - share_tracking
  *********************************/
-function shareTracking($conn, $data, $userId) {
-    $orderId = $data['order_id'] ?? null;
-    
-    if (!$orderId) {
-        ResponseHandler::error('Order ID is required', 400);
-    }
-
+function shareTracking($conn, $userId, $orderId) {
     // Verify order belongs to user
     $checkStmt = $conn->prepare(
         "SELECT id FROM orders 
-         WHERE id = :order_id AND user_id = :user_id"
+         WHERE id = ? AND user_id = ?"
     );
-    $checkStmt->execute([
-        ':order_id' => $orderId,
-        ':user_id' => $userId
-    ]);
+    $checkStmt->execute([$orderId, $userId]);
     
     if (!$checkStmt->fetch()) {
         ResponseHandler::error('Order not found or not authorized', 403);
@@ -847,21 +833,20 @@ function shareTracking($conn, $data, $userId) {
         "SELECT 
             o.order_number,
             o.status,
-            m.name as merchant_name,
-            o.created_at
+            m.name as merchant_name
         FROM orders o
         JOIN merchants m ON o.merchant_id = m.id
-        WHERE o.id = :order_id"
+        WHERE o.id = ?"
     );
-    $stmt->execute([':order_id' => $orderId]);
+    $stmt->execute([$orderId]);
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$order) {
         ResponseHandler::error('Order not found', 404);
     }
 
-    // Generate tracking URL (use your actual domain)
-    $trackingUrl = "https://dropxbackend-production.up.railway.app/api/track/order/" . $order['order_number'];
+    // Generate tracking URL
+    $trackingUrl = "https://dropx12-production.up.railway.app/api/track/order/" . $order['order_number'];
     
     // Generate sharing message
     $message = "Track my order from " . $order['merchant_name'] . ":\n" .
@@ -878,25 +863,15 @@ function shareTracking($conn, $data, $userId) {
 }
 
 /*********************************
- * CANCEL ORDER
+ * CANCEL ORDER FROM TRACKING - cancel_order
  *********************************/
-function cancelOrder($conn, $data, $userId) {
-    $orderId = $data['order_id'] ?? null;
-    $reason = trim($data['reason'] ?? '');
-    
-    if (!$orderId) {
-        ResponseHandler::error('Order ID is required', 400);
-    }
-
+function cancelOrderFromTracking($conn, $userId, $orderId, $reason) {
     // Verify order belongs to user and can be cancelled
     $checkStmt = $conn->prepare(
         "SELECT id, status FROM orders 
-         WHERE id = :order_id AND user_id = :user_id"
+         WHERE id = ? AND user_id = ?"
     );
-    $checkStmt->execute([
-        ':order_id' => $orderId,
-        ':user_id' => $userId
-    ]);
+    $checkStmt->execute([$orderId, $userId]);
     
     $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
     
@@ -918,40 +893,31 @@ function cancelOrder($conn, $data, $userId) {
         $updateStmt = $conn->prepare(
             "UPDATE orders 
              SET status = 'cancelled', 
-                 cancellation_reason = :reason,
+                 cancellation_reason = ?,
                  updated_at = NOW()
-             WHERE id = :order_id"
+             WHERE id = ?"
         );
-        $updateStmt->execute([
-            ':order_id' => $orderId,
-            ':reason' => $reason
-        ]);
+        $updateStmt->execute([$reason, $orderId]);
 
         // Add to status history
         $historyStmt = $conn->prepare(
             "INSERT INTO order_status_history 
                 (order_id, old_status, new_status, changed_by, 
                  changed_by_id, reason, created_at)
-             VALUES (:order_id, :old_status, 'cancelled', 'user',
-                    :user_id, :reason, NOW())"
+             VALUES (?, ?, 'cancelled', 'user', ?, ?, NOW())"
         );
-        $historyStmt->execute([
-            ':order_id' => $orderId,
-            ':old_status' => $order['status'],
-            ':user_id' => $userId,
-            ':reason' => $reason
-        ]);
+        $historyStmt->execute([$orderId, $order['status'], $userId, $reason]);
 
         // Update tracking
         $trackingStmt = $conn->prepare(
             "INSERT INTO order_tracking 
                 (order_id, status, created_at, updated_at)
-             VALUES (:order_id, 'cancelled', NOW(), NOW())
+             VALUES (?, 'cancelled', NOW(), NOW())
              ON DUPLICATE KEY UPDATE 
                 status = 'cancelled',
                 updated_at = NOW()"
         );
-        $trackingStmt->execute([':order_id' => $orderId]);
+        $trackingStmt->execute([$orderId]);
 
         $conn->commit();
 
@@ -964,45 +930,32 @@ function cancelOrder($conn, $data, $userId) {
 }
 
 /*********************************
- * CONTACT SUPPORT
+ * CONTACT ORDER SUPPORT - contact_support
  *********************************/
-function contactSupport($conn, $data, $userId) {
-    $orderId = $data['order_id'] ?? null;
-    $issue = trim($data['issue'] ?? '');
-    $details = trim($data['details'] ?? '');
-    
-    if (!$issue) {
-        ResponseHandler::error('Please describe the issue', 400);
-    }
-
+function contactOrderSupport($conn, $userId, $orderId, $issue, $details) {
     // Get order details for context
     $orderInfo = null;
     if ($orderId) {
-        // Verify order belongs to user
         $checkStmt = $conn->prepare(
             "SELECT id, order_number, status FROM orders 
-             WHERE id = :order_id AND user_id = :user_id"
+             WHERE id = ? AND user_id = ?"
         );
-        $checkStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
+        $checkStmt->execute([$orderId, $userId]);
         $orderInfo = $checkStmt->fetch(PDO::FETCH_ASSOC);
     }
 
-    // Log support request to database
+    // Log support request
     $logStmt = $conn->prepare(
         "INSERT INTO user_activities 
             (user_id, activity_type, description, ip_address, metadata, created_at)
-         VALUES (:user_id, 'contact_support', :description, 
-                :ip_address, :metadata, NOW())"
+         VALUES (?, 'contact_support', ?, ?, ?, NOW())"
     );
     
     $logStmt->execute([
-        ':user_id' => $userId,
-        ':description' => $issue,
-        ':ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
-        ':metadata' => json_encode([
+        $userId,
+        $issue,
+        $_SERVER['REMOTE_ADDR'] ?? '',
+        json_encode([
             'order_id' => $orderId,
             'order_info' => $orderInfo,
             'details' => $details
@@ -1016,76 +969,53 @@ function contactSupport($conn, $data, $userId) {
 }
 
 /*********************************
- * UPDATE TRACKING PREFERENCES
+ * GET LATEST ACTIVE ORDER - latest_active
  *********************************/
-function updateTrackingPreferences($conn, $data, $userId) {
-    $pushNotifications = $data['push_notifications'] ?? null;
-    $emailNotifications = $data['email_notifications'] ?? null;
-    $smsNotifications = $data['sms_notifications'] ?? null;
-    $orderUpdates = $data['order_updates'] ?? null;
-
-    // Check if settings exist in database
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM notification_settings WHERE user_id = :user_id"
-    );
-    $checkStmt->execute([':user_id' => $userId]);
+function getLatestActiveOrder($conn, $userId) {
+    $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
     
-    if ($checkStmt->fetch()) {
-        // Update existing
-        $updateFields = [];
-        $params = [':user_id' => $userId];
-        
-        if ($pushNotifications !== null) {
-            $updateFields[] = 'push_notifications = :push';
-            $params[':push'] = $pushNotifications ? 1 : 0;
-        }
-        
-        if ($emailNotifications !== null) {
-            $updateFields[] = 'email_notifications = :email';
-            $params[':email'] = $emailNotifications ? 1 : 0;
-        }
-        
-        if ($smsNotifications !== null) {
-            $updateFields[] = 'sms_notifications = :sms';
-            $params[':sms'] = $smsNotifications ? 1 : 0;
-        }
-        
-        if ($orderUpdates !== null) {
-            $updateFields[] = 'order_updates = :order_updates';
-            $params[':order_updates'] = $orderUpdates ? 1 : 0;
-        }
-        
-        if (!empty($updateFields)) {
-            $sql = "UPDATE notification_settings SET " . 
-                   implode(', ', $updateFields) . 
-                   ", updated_at = NOW() WHERE user_id = :user_id";
-            
-            $updateStmt = $conn->prepare($sql);
-            $updateStmt->execute($params);
-        }
-    } else {
-        // Create new in database
-        $insertStmt = $conn->prepare(
-            "INSERT INTO notification_settings 
-                (user_id, push_notifications, email_notifications, 
-                 sms_notifications, order_updates, created_at)
-             VALUES (:user_id, :push, :email, :sms, :order_updates, NOW())"
-        );
-        
-        $insertStmt->execute([
-            ':user_id' => $userId,
-            ':push' => $pushNotifications !== null ? ($pushNotifications ? 1 : 0) : 1,
-            ':email' => $emailNotifications !== null ? ($emailNotifications ? 1 : 0) : 1,
-            ':sms' => $smsNotifications !== null ? ($smsNotifications ? 1 : 0) : 0,
-            ':order_updates' => $orderUpdates !== null ? ($orderUpdates ? 1 : 0) : 1
-        ]);
+    $stmt = $conn->prepare(
+        "SELECT 
+            o.id,
+            o.order_number,
+            o.status,
+            o.created_at,
+            o.updated_at,
+            o.total_amount,
+            m.name as merchant_name
+        FROM orders o
+        LEFT JOIN merchants m ON o.merchant_id = m.id
+        WHERE o.user_id = ? 
+        AND o.status IN ($placeholders)
+        ORDER BY o.created_at DESC
+        LIMIT 1"
+    );
+    
+    $params = array_merge([$userId], $activeStatuses);
+    $stmt->execute($params);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$order) {
+        ResponseHandler::success(['order' => null, 'message' => 'No active orders']);
+        return;
     }
-
-    ResponseHandler::success([], 'Tracking preferences updated');
+    
+    ResponseHandler::success([
+        'order' => [
+            'id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'status' => $order['status'],
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at'],
+            'total_amount' => floatval($order['total_amount']),
+            'merchant_name' => $order['merchant_name']
+        ]
+    ]);
 }
 
 /*********************************
- * HELPER FUNCTIONS - ALL DATA FROM DATABASE
+ * HELPER FUNCTIONS
  *********************************/
 
 function formatImageUrl($imagePath, $baseUrl, $type = '') {
@@ -1098,7 +1028,7 @@ function formatImageUrl($imagePath, $baseUrl, $type = '') {
         return $imagePath;
     }
     
-    // Otherwise, build the full URL from database path
+    // Otherwise, build the full URL
     $folder = '';
     switch ($type) {
         case 'merchants':
@@ -1155,8 +1085,7 @@ function formatDeliveryAddress($order) {
     return implode(', ', $addressParts);
 }
 
-function calculateDeliveryProgress($status, $createdAt) {
-    // Get progress based on actual status from database
+function calculateDeliveryProgress($status) {
     $statusWeights = [
         'pending' => 0.1,
         'confirmed' => 0.2,
@@ -1179,25 +1108,25 @@ function estimateDeliveryTime($order, $trackingInfo, $conn) {
         return $trackingInfo['estimated_delivery'];
     }
     
-    // Calculate based on order creation time and merchant preparation time
+    // Calculate based on order creation time
     if (!empty($order['created_at'])) {
         $orderTime = strtotime($order['created_at']);
         
-        // Get merchant average preparation time from database
+        // Get merchant average preparation time
         $prepStmt = $conn->prepare(
             "SELECT average_preparation_time FROM merchants 
-             WHERE id = :merchant_id"
+             WHERE id = ?"
         );
-        $prepStmt->execute([':merchant_id' => $order['merchant_id']]);
+        $prepStmt->execute([$order['merchant_id']]);
         $merchant = $prepStmt->fetch(PDO::FETCH_ASSOC);
         
-        $prepTime = $merchant['average_preparation_time'] ?? 30; // Default 30 minutes
-        $deliveryTime = $orderTime + (($prepTime + 15) * 60); // +15 minutes for delivery
+        $prepTime = $merchant['average_preparation_time'] ?? 30;
+        $deliveryTime = $orderTime + (($prepTime + 15) * 60);
         
         return date('Y-m-d H:i:s', $deliveryTime);
     }
     
-    return date('Y-m-d H:i:s', time() + (45 * 60)); // Default 45 minutes
+    return date('Y-m-d H:i:s', time() + (45 * 60));
 }
 
 function buildDeliveryStatusTimeline($statusHistory, $order, $trackingInfo) {
@@ -1213,7 +1142,7 @@ function buildDeliveryStatusTimeline($statusHistory, $order, $trackingInfo) {
         'color' => 'green'
     ];
     
-    // Add status history entries from database
+    // Add status history entries
     foreach ($statusHistory as $history) {
         $timeline[] = [
             'status' => strtolower(str_replace(' ', '_', $history['new_status'])),
@@ -1225,28 +1154,6 @@ function buildDeliveryStatusTimeline($statusHistory, $order, $trackingInfo) {
         ];
     }
     
-    // Add current status if not already in timeline
-    if (!empty($order['status'])) {
-        $hasCurrent = false;
-        foreach ($timeline as $entry) {
-            if ($entry['status'] === strtolower(str_replace(' ', '_', $order['status']))) {
-                $hasCurrent = true;
-                break;
-            }
-        }
-        
-        if (!$hasCurrent) {
-            $timeline[] = [
-                'status' => strtolower(str_replace(' ', '_', $order['status'])),
-                'description' => getStatusDescription($order['status']),
-                'timestamp' => $order['updated_at'],
-                'location' => $trackingInfo['location_updates'] ?? '',
-                'icon' => getStatusIcon($order['status']),
-                'color' => getStatusColor($order['status'])
-            ];
-        }
-    }
-    
     // Sort by timestamp
     usort($timeline, function($a, $b) {
         return strtotime($a['timestamp']) - strtotime($b['timestamp']);
@@ -1256,7 +1163,6 @@ function buildDeliveryStatusTimeline($statusHistory, $order, $trackingInfo) {
 }
 
 function getStatusDescription($status) {
-    // Get descriptions from database or use defaults
     $descriptions = [
         'pending' => 'Order has been placed',
         'confirmed' => 'Restaurant has accepted your order',
@@ -1315,12 +1221,12 @@ function buildDriverInfo($order, $driverRating, $driverImage) {
         'vehicle' => $order['vehicle_type'] ?? 'Motorcycle',
         'vehicle_number' => $order['vehicle_number'] ?? '',
         'vehicle_color' => $order['vehicle_color'] ?? '',
-        'rating' => $order['driver_rating'] ?? 4.5,
-        'punctuality_rating' => $driverRating['punctuality_rating'] ?? 0,
-        'professionalism_rating' => $driverRating['professionalism_rating'] ?? 0,
+        'rating' => floatval($order['driver_rating'] ?? 4.5),
+        'punctuality_rating' => intval($driverRating['punctuality_rating'] ?? 0),
+        'professionalism_rating' => intval($driverRating['professionalism_rating'] ?? 0),
         'image_url' => $driverImage,
-        'latitude' => $order['current_latitude'] ?? 0,
-        'longitude' => $order['current_longitude'] ?? 0,
+        'latitude' => floatval($order['current_latitude'] ?? 0),
+        'longitude' => floatval($order['current_longitude'] ?? 0),
         'is_available' => true
     ];
 }
@@ -1332,25 +1238,25 @@ function buildMerchantInfo($order, $merchantImage) {
         'address' => $order['merchant_address'],
         'phone' => $order['merchant_phone'],
         'image_url' => $merchantImage,
-        'latitude' => $order['merchant_latitude'] ?? 0,
-        'longitude' => $order['merchant_longitude'] ?? 0
+        'latitude' => floatval($order['merchant_latitude'] ?? 0),
+        'longitude' => floatval($order['merchant_longitude'] ?? 0)
     ];
 }
 
 function buildDeliveryRoute($order, $locationHistory) {
     $route = [];
     
-    // Merchant location from database
+    // Merchant location
     if (!empty($order['merchant_latitude']) && !empty($order['merchant_longitude'])) {
         $route[] = [
             'lat' => floatval($order['merchant_latitude']),
             'lng' => floatval($order['merchant_longitude']),
-            'name' => $order['merchant_name'],
+            'name' => $order['merchant_name'] ?? 'Restaurant',
             'type' => 'merchant'
         ];
     }
     
-    // Driver location history from database
+    // Driver location history
     foreach ($locationHistory as $location) {
         if (!empty($location['latitude']) && !empty($location['longitude'])) {
             $route[] = [
@@ -1374,11 +1280,11 @@ function buildDeliveryRoute($order, $locationHistory) {
         ];
     }
     
-    // Delivery address from database
-    if (!empty($order['latitude']) && !empty($order['longitude'])) {
+    // Delivery address
+    if (!empty($order['address_latitude']) && !empty($order['address_longitude'])) {
         $route[] = [
-            'lat' => floatval($order['latitude']),
-            'lng' => floatval($order['longitude']),
+            'lat' => floatval($order['address_latitude']),
+            'lng' => floatval($order['address_longitude']),
             'name' => 'Delivery Address',
             'type' => 'destination'
         ];
