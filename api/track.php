@@ -225,59 +225,58 @@ function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
     // Check if order identifier is order_number or order_id
     $isOrderNumber = !is_numeric($orderIdentifier) && preg_match('/^[A-Za-z0-9_-]+$/', $orderIdentifier);
     
-    $sql = "SELECT 
-                o.id,
-                o.order_number,
-                o.user_id,
-                o.merchant_id,
-                o.driver_id,
-                o.subtotal,
-                o.delivery_fee,
-                o.total_amount,
-                o.payment_method,
-                o.delivery_address_id,
-                o.special_instructions,
-                o.status,
-                o.scheduled_delivery_time,
-                o.actual_delivery_time,
-                o.created_at,
-                o.updated_at,
-                o.cancellation_reason,
-                m.name as merchant_name,
-                m.address as merchant_address,
-                m.phone as merchant_phone,
-                m.image_url as merchant_image,
-                m.latitude as merchant_latitude,
-                m.longitude as merchant_longitude,
-                d.name as driver_name,
-                d.phone as driver_phone,
-                d.current_latitude,
-                d.current_longitude,
-                d.vehicle_type,
-                d.vehicle_number,
-                d.vehicle_color,
-                d.image_url as driver_image,
-                d.rating as driver_rating,
-                u.full_name as user_name,
-                u.phone as user_phone,
-                a.full_name as address_name,
-                a.phone as address_phone,
-                a.address_line1,
-                a.address_line2,
-                a.city,
-                a.neighborhood,
-                a.area,
-                a.sector,
-                a.latitude as address_latitude,
-                a.longitude as address_longitude,
-                a.landmark
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            LEFT JOIN drivers d ON o.driver_id = d.id
-            LEFT JOIN users u ON o.user_id = u.id
-            LEFT JOIN addresses a ON o.delivery_address_id = a.id
-            WHERE ";
-    
+   $sql = "SELECT 
+            o.id,
+            o.order_number,
+            o.user_id,
+            o.merchant_id,
+            o.driver_id,
+            o.subtotal,
+            o.delivery_fee,
+            o.total_amount,
+            o.payment_method,
+            o.delivery_address,  // Changed from delivery_address_id
+            o.special_instructions,
+            o.status,
+            o.scheduled_delivery_time,
+            o.actual_delivery_time,
+            o.created_at,
+            o.updated_at,
+            o.cancellation_reason,
+            m.name as merchant_name,
+            m.address as merchant_address,
+            m.phone as merchant_phone,
+            m.image_url as merchant_image,
+            m.latitude as merchant_latitude,
+            m.longitude as merchant_longitude,
+            d.name as driver_name,
+            d.phone as driver_phone,
+            d.current_latitude,
+            d.current_longitude,
+            d.vehicle_type,
+            d.vehicle_number,
+            d.vehicle_color,
+            d.image_url as driver_image,
+            d.rating as driver_rating,
+            u.full_name as user_name,
+            u.phone as user_phone,
+            a.full_name as address_name,
+            a.phone as address_phone,
+            a.address_line1,
+            a.address_line2,
+            a.city,
+            a.neighborhood,
+            a.area,
+            a.sector,
+            a.latitude as address_latitude,
+            a.longitude as address_longitude,
+            a.landmark
+        FROM orders o
+        LEFT JOIN merchants m ON o.merchant_id = m.id
+        LEFT JOIN drivers d ON o.driver_id = d.id
+        LEFT JOIN users u ON o.user_id = u.id
+        LEFT JOIN addresses a ON o.delivery_address_id = a.id
+        WHERE ";
     if ($isOrderNumber) {
         $sql .= "o.order_number = :identifier";
         $params = [':identifier' => $orderIdentifier];
