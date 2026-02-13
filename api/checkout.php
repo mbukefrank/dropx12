@@ -323,11 +323,48 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
     ];
 }
 /*********************************
- * PROCESS DROPX WALLET PAYMENT - COMPLETELY FIXED
+ * PROCESS DROPX WALLET PAYMENT - COMPLETELY FIXED WITH MERCHANT ID
  *********************************/
 function processWalletPayment($conn, $userId, $cartId, $amount) {
     try {
         $conn->beginTransaction();
+        
+        // FIRST: Get the cart items to find the merchant_id and items
+        $cartItemsStmt = $conn->prepare(
+            "SELECT ci.*, mi.name as item_name, mi.price, mi.merchant_id 
+             FROM cart_items ci
+             JOIN menu_items mi ON ci.menu_item_id = mi.id
+             WHERE ci.cart_id = :cart_id AND ci.is_active = 1"
+        );
+        $cartItemsStmt->execute([':cart_id' => $cartId]);
+        $cartItems = $cartItemsStmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (empty($cartItems)) {
+            throw new Exception('Cart is empty');
+        }
+        
+        // Get the merchant_id from the first item (all items should be from same merchant)
+        $merchantId = $cartItems[0]['merchant_id'];
+        
+        // Get merchant details
+        $merchantStmt = $conn->prepare(
+            "SELECT id, name, delivery_fee FROM merchants WHERE id = :merchant_id"
+        );
+        $merchantStmt->execute([':merchant_id' => $merchantId]);
+        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$merchant) {
+            throw new Exception('Merchant not found');
+        }
+        
+        // Calculate subtotal from cart items
+        $subtotal = 0;
+        foreach ($cartItems as $item) {
+            $subtotal += $item['price'] * $item['quantity'];
+        }
+        
+        // Get delivery fee from merchant or use default
+        $deliveryFee = $merchant['delivery_fee'] ?? 1500.00;
         
         // Check wallet balance
         $walletStmt = $conn->prepare(
@@ -353,55 +390,107 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
             ':wallet_id' => $wallet['id']
         ]);
         
-        // FIXED: Insert into wallet_transactions with correct column names
+        // Record wallet transaction
         $txnStmt = $conn->prepare(
             "INSERT INTO wallet_transactions 
                 (user_id, amount, type, reference_type, reference_id, status, description)
              VALUES 
                 (:user_id, :amount, 'debit', 'order', :reference_id, 'completed', 
-                 CONCAT('Payment for order #', :cart_id))"
+                 CONCAT('Payment for order from ', :merchant_name))"
         );
         $txnStmt->execute([
             ':user_id' => $userId,
             ':amount' => $amount,
-            ':reference_id' => $cartId,  // Using reference_id, not cart_id
-            ':cart_id' => $cartId
+            ':reference_id' => $cartId,
+            ':merchant_name' => $merchant['name']
         ]);
         
-        // Update cart status
-        $cartStmt = $conn->prepare(
-            "UPDATE carts SET status = 'completed' WHERE id = :cart_id"
+        // Get user's default address or use a placeholder
+        $addressStmt = $conn->prepare(
+            "SELECT address_line1, city FROM addresses WHERE user_id = :user_id AND is_default = 1 LIMIT 1"
         );
-        $cartStmt->execute([':cart_id' => $cartId]);
+        $addressStmt->execute([':user_id' => $userId]);
+        $address = $addressStmt->fetch(PDO::FETCH_ASSOC);
         
-        // FIXED: Insert into orders with correct column names from your structure
+        $deliveryAddress = $address 
+            ? $address['address_line1'] . ', ' . $address['city']
+            : 'Default Address';
+        
+        // Generate unique order number
+        $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
+        
+        // Create order with CORRECT merchant_id
         $orderStmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, subtotal, delivery_fee, total_amount, 
                  payment_method, payment_status, delivery_address, status, created_at, updated_at)
              VALUES 
-                (CONCAT('ORD', UNIX_TIMESTAMP()), :user_id, 1, :subtotal, 1500, :total_amount, 
-                 'dropx_wallet', 'paid', 'Default Address', 'confirmed', NOW(), NOW())"
+                (:order_number, :user_id, :merchant_id, :subtotal, :delivery_fee, :total_amount, 
+                 'dropx_wallet', 'paid', :delivery_address, 'confirmed', NOW(), NOW())"
         );
         
-        // Calculate subtotal (amount - delivery_fee - tax)
-        // Since we don't have the breakdown here, we'll approximate
-        $deliveryFee = 1500;
-        $estimatedSubtotal = $amount - $deliveryFee - ($amount * 0.165); // Rough estimate
-        
         $orderStmt->execute([
+            ':order_number' => $orderNumber,
             ':user_id' => $userId,
-            ':subtotal' => round($estimatedSubtotal, 2),
-            ':total_amount' => $amount
+            ':merchant_id' => $merchantId,  // Now using the actual merchant_id from cart
+            ':subtotal' => $subtotal,
+            ':delivery_fee' => $deliveryFee,
+            ':total_amount' => $amount,
+            ':delivery_address' => $deliveryAddress
         ]);
         
         $orderId = $conn->lastInsertId();
+        
+        // Insert order items
+        $itemStmt = $conn->prepare(
+            "INSERT INTO order_items 
+                (order_id, item_name, quantity, unit_price, total_price, created_at)
+             VALUES 
+                (:order_id, :item_name, :quantity, :unit_price, :total_price, NOW())"
+        );
+        
+        foreach ($cartItems as $item) {
+            $itemTotal = $item['price'] * $item['quantity'];
+            $itemStmt->execute([
+                ':order_id' => $orderId,
+                ':item_name' => $item['item_name'],
+                ':quantity' => $item['quantity'],
+                ':unit_price' => $item['price'],
+                ':total_price' => $itemTotal
+            ]);
+        }
+        
+        // Create order tracking
+        $trackingStmt = $conn->prepare(
+            "INSERT INTO order_tracking 
+                (order_id, status, estimated_delivery, created_at)
+             VALUES 
+                (:order_id, 'Order placed', :estimated_delivery, NOW())"
+        );
+        
+        $estimatedDelivery = date('Y-m-d H:i:s', strtotime('+45 minutes'));
+        $trackingStmt->execute([
+            ':order_id' => $orderId,
+            ':estimated_delivery' => $estimatedDelivery
+        ]);
+        
+        // Clear the cart
+        $clearCartStmt = $conn->prepare(
+            "UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id"
+        );
+        $clearCartStmt->execute([':cart_id' => $cartId]);
+        
+        $updateCartStmt = $conn->prepare(
+            "UPDATE carts SET status = 'completed' WHERE id = :cart_id"
+        );
+        $updateCartStmt->execute([':cart_id' => $cartId]);
         
         $conn->commit();
         
         return [
             'success' => true,
             'order_id' => $orderId,
+            'order_number' => $orderNumber,
             'new_balance' => $wallet['balance'] - $amount,
             'new_balance_formatted' => 'MK' . number_format($wallet['balance'] - $amount, 2)
         ];
