@@ -142,8 +142,8 @@ function getOrdersList($conn, $userId) {
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
     // ============= FIXED QUERY =============
-    // Option 1: Add estimated_delivery to GROUP BY (Recommended)
-    $sql = "SELECT DISTINCT
+    // OPTION 1: Include all non-aggregated columns in GROUP BY (Recommended)
+    $sql = "SELECT 
                 o.id,
                 o.order_number,
                 o.status,
@@ -160,8 +160,8 @@ function getOrdersList($conn, $userId) {
                 m.image_url as merchant_image,
                 d.name as driver_name,
                 d.phone as driver_phone,
-                ot.estimated_delivery,
-                ot.status as tracking_status,
+                MAX(ot.estimated_delivery) as estimated_delivery,  -- Using MAX() aggregate function
+                MAX(ot.status) as tracking_status,                  -- Using MAX() aggregate function
                 GROUP_CONCAT(
                     CONCAT(oi.item_name, '||', oi.quantity, '||', oi.unit_price)
                     ORDER BY oi.id SEPARATOR ';;'
@@ -172,7 +172,7 @@ function getOrdersList($conn, $userId) {
             LEFT JOIN order_tracking ot ON o.id = ot.order_id
             LEFT JOIN order_items oi ON o.id = oi.order_id
             $whereClause
-            GROUP BY o.id, ot.estimated_delivery  -- FIX: Added ot.estimated_delivery to GROUP BY
+            GROUP BY o.id  -- Only group by order ID, use aggregates for other columns
             ORDER BY o.$sortBy $sortOrder
             LIMIT :limit OFFSET :offset";
 
@@ -206,7 +206,7 @@ function getOrdersList($conn, $userId) {
         'pagination' => [
             'current_page' => $page,
             'per_page' => $limit,
-            'total_items' => $totalCount,
+            'total_items' => (int)$totalCount,
             'total_pages' => ceil($totalCount / $limit)
         ]
     ]);
