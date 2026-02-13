@@ -142,7 +142,7 @@ function getOrdersList($conn, $userId) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // FIXED: Simplified query to match Flutter expectations
+    // Main query
     $sql = "SELECT 
                 o.id,
                 o.order_number,
@@ -255,7 +255,7 @@ function getOrdersList($conn, $userId) {
             'id' => $order['id'],
             'order_number' => $order['order_number'],
             'status' => $order['status'],
-            'order_type' => 'Food Delivery', // Default or get from merchant
+            'order_type' => 'Food Delivery',
             'customer_name' => $user['full_name'] ?? 'Customer',
             'customer_phone' => $user['phone'] ?? '',
             'delivery_address' => $order['delivery_address'],
@@ -343,7 +343,7 @@ function getOrderDetails($conn, $orderId, $userId) {
         ResponseHandler::error('Order not found', 404);
     }
 
-    // Get order items - UPDATED: Changed price to unit_price and total to total_price
+    // Get order items
     $itemsSql = "SELECT 
                     id,
                     item_name as name,
@@ -444,10 +444,10 @@ function handlePostRequest($userId) {
 }
 
 /*********************************
- * GET TRACKABLE ORDERS - FIXED SQL SYNTAX
+ * GET TRACKABLE ORDERS - COMPLETELY FIXED
  *********************************/
 function getTrackableOrders($conn, $data, $userId) {
-    $limit = $data['limit'] ?? 50;
+    $limit = intval($data['limit'] ?? 50);
     $sortBy = $data['sort_by'] ?? 'created_at';
     $sortOrder = $data['sort_order'] ?? 'DESC';
     
@@ -459,8 +459,12 @@ function getTrackableOrders($conn, $data, $userId) {
     // Trackable statuses (orders that can be tracked)
     $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
     
-    // Create placeholders for the IN clause
-    $placeholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
+    // Create placeholders for the IN clause - use named parameters for clarity
+    $placeholders = [];
+    foreach ($trackableStatuses as $index => $status) {
+        $placeholders[] = ":status_$index";
+    }
+    $placeholdersStr = implode(',', $placeholders);
     
     $sql = "SELECT 
                 o.id,
@@ -474,16 +478,25 @@ function getTrackableOrders($conn, $data, $userId) {
                 m.image_url as merchant_image
             FROM orders o
             LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE o.user_id = ? 
-            AND o.status IN ($placeholders)
+            WHERE o.user_id = :user_id 
+            AND o.status IN ($placeholdersStr)
             ORDER BY o.$sortBy $sortOrder
-            LIMIT ?";
-    
-    // Prepare parameters
-    $params = array_merge([$userId], $trackableStatuses, [$limit]);
+            LIMIT :limit";
     
     $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
+    
+    // Bind user_id
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    
+    // Bind each status
+    foreach ($trackableStatuses as $index => $status) {
+        $stmt->bindValue(":status_$index", $status, PDO::PARAM_STR);
+    }
+    
+    // Bind limit
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    
+    $stmt->execute();
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     // Format orders for response
@@ -513,12 +526,19 @@ function getTrackableOrders($conn, $data, $userId) {
         'orders' => $formattedOrders
     ]);
 }
+
 /*********************************
- * GET LATEST ACTIVE ORDER - FIXED SQL SYNTAX
+ * GET LATEST ACTIVE ORDER - FIXED
  *********************************/
 function getLatestActiveOrder($conn, $userId) {
     $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
-    $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
+    
+    // Create placeholders for the IN clause
+    $placeholders = [];
+    foreach ($activeStatuses as $index => $status) {
+        $placeholders[] = ":status_$index";
+    }
+    $placeholdersStr = implode(',', $placeholders);
     
     $sql = "SELECT 
                 o.id,
@@ -530,14 +550,22 @@ function getLatestActiveOrder($conn, $userId) {
                 m.name as merchant_name
             FROM orders o
             LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE o.user_id = ? 
-            AND o.status IN ($placeholders)
+            WHERE o.user_id = :user_id 
+            AND o.status IN ($placeholdersStr)
             ORDER BY o.created_at DESC
             LIMIT 1";
     
-    $params = array_merge([$userId], $activeStatuses);
     $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
+    
+    // Bind user_id
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    
+    // Bind each status
+    foreach ($activeStatuses as $index => $status) {
+        $stmt->bindValue(":status_$index", $status, PDO::PARAM_STR);
+    }
+    
+    $stmt->execute();
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$order) {
@@ -596,7 +624,6 @@ function createOrder($conn, $data, $userId) {
     // Calculate totals
     $subtotal = 0;
     foreach ($items as $item) {
-        // UPDATED: Check for unit_price instead of price
         $itemPrice = $item['unit_price'] ?? $item['price'] ?? 0;
         if (empty($item['name']) || empty($itemPrice) || empty($item['quantity'])) {
             ResponseHandler::error('Invalid item data', 400);
@@ -640,7 +667,7 @@ function createOrder($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items - UPDATED: Changed price to unit_price and total to total_price
+        // Create order items
         $itemSql = "INSERT INTO order_items (
             order_id, item_name, quantity, unit_price, total_price, created_at
         ) VALUES (
@@ -649,7 +676,6 @@ function createOrder($conn, $data, $userId) {
 
         $itemStmt = $conn->prepare($itemSql);
         foreach ($items as $item) {
-            // UPDATED: Get unit_price from item data
             $unitPrice = $item['unit_price'] ?? $item['price'] ?? 0;
             $itemTotal = $unitPrice * $item['quantity'];
             $itemStmt->execute([
@@ -900,11 +926,6 @@ function createOrderReview($conn, $data, $userId) {
         updateMerchantRating($conn, $merchantId);
     }
 
-    // Update user's rating if review type is driver
-    if ($reviewType === 'driver') {
-        // Update driver rating logic would go here
-    }
-
     ResponseHandler::success([], 'Review submitted successfully');
 }
 
@@ -918,7 +939,7 @@ function reorder($conn, $data, $userId) {
         ResponseHandler::error('Order ID is required', 400);
     }
 
-    // Get original order details - UPDATED: Changed oi.price to oi.unit_price
+    // Get original order details
     $orderSql = "SELECT 
                     o.*,
                     GROUP_CONCAT(
@@ -967,7 +988,7 @@ function reorder($conn, $data, $userId) {
                 $items[] = [
                     'name' => $parts[0],
                     'quantity' => (int)$parts[1],
-                    'price' => (float)$parts[2]  // This will be unit_price from database
+                    'price' => (float)$parts[2]
                 ];
             }
         }
@@ -1243,7 +1264,7 @@ function formatOrderData($order, $user) {
                 $items[] = [
                     'name' => $parts[0],
                     'quantity' => (int)$parts[1],
-                    'price' => (float)$parts[2]  // This is unit_price from database
+                    'price' => (float)$parts[2]
                 ];
                 $itemCount += (int)$parts[1];
             }
@@ -1338,8 +1359,8 @@ function formatOrderItemData($item) {
         'id' => $item['id'],
         'name' => $item['name'],
         'quantity' => (int)$item['quantity'],
-        'price' => (float)$item['price'],      // This is unit_price from database
-        'total' => (float)$item['total'],      // This is total_price from database
+        'price' => (float)$item['price'],
+        'total' => (float)$item['total'],
         'created_at' => $item['created_at']
     ];
 }
@@ -1393,7 +1414,6 @@ function formatImageUrl($imagePath, $baseUrl, $type = '') {
  * GET PAYMENT STATUS
  *********************************/
 function getPaymentStatus($orderStatus) {
-    // This is a simplified version - in reality, this should come from your payment system
     $paidStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived', 'delivered'];
     
     if (in_array($orderStatus, $paidStatuses)) {
