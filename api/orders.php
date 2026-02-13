@@ -88,6 +88,7 @@ function handleGetRequest($userId) {
         getOrdersList($conn, $userId);
     }
 }
+
 /*********************************
  * GET ORDERS LIST - MATCHING FLUTTER EXPECTATIONS
  *********************************/
@@ -288,6 +289,7 @@ function getOrdersList($conn, $userId) {
         ]
     ]);
 }
+
 /*********************************
  * GET ORDER DETAILS
  *********************************/
@@ -401,7 +403,7 @@ function getOrderDetails($conn, $orderId, $userId) {
 }
 
 /*********************************
- * POST REQUESTS
+ * POST REQUESTS - UPDATED WITH GET_TRACKABLE AND LATEST_ACTIVE
  *********************************/
 function handlePostRequest($userId) {
     $db = new Database();
@@ -430,9 +432,128 @@ function handlePostRequest($userId) {
         case 'track_order':
             trackOrder($conn, $input, $userId);
             break;
+        case 'get_trackable':
+            getTrackableOrders($conn, $input, $userId);
+            break;
+        case 'latest_active':
+            getLatestActiveOrder($conn, $userId);
+            break;
         default:
             ResponseHandler::error('Invalid action', 400);
     }
+}
+
+/*********************************
+ * GET TRACKABLE ORDERS - NEW FUNCTION
+ *********************************/
+function getTrackableOrders($conn, $data, $userId) {
+    $limit = $data['limit'] ?? 50;
+    $sortBy = $data['sort_by'] ?? 'created_at';
+    $sortOrder = $data['sort_order'] ?? 'DESC';
+    
+    // Validate sort parameters
+    $allowedSortColumns = ['created_at', 'order_number', 'total_amount', 'status'];
+    $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
+    $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
+    
+    // Trackable statuses (orders that can be tracked)
+    $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    $placeholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
+    
+    $sql = "SELECT 
+                o.id,
+                o.order_number,
+                o.status,
+                o.created_at,
+                o.updated_at,
+                o.total_amount,
+                o.payment_method,
+                m.name as merchant_name,
+                m.image_url as merchant_image
+            FROM orders o
+            LEFT JOIN merchants m ON o.merchant_id = m.id
+            WHERE o.user_id = ? 
+            AND o.status IN ($placeholders)
+            ORDER BY o.$sortBy $sortOrder
+            LIMIT ?";
+    
+    $params = array_merge([$userId], $trackableStatuses, [$limit]);
+    
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($params);
+    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Format orders for response
+    $formattedOrders = [];
+    foreach ($orders as $order) {
+        $merchantImage = '';
+        if (!empty($order['merchant_image'])) {
+            global $baseUrl;
+            $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
+        }
+        
+        $formattedOrders[] = [
+            'id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'status' => $order['status'],
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at'],
+            'total_amount' => floatval($order['total_amount']),
+            'payment_method' => $order['payment_method'],
+            'merchant_name' => $order['merchant_name'],
+            'merchant_image' => $merchantImage,
+            'restaurant_name' => $order['merchant_name'] // For compatibility with Order.fromApiResponse
+        ];
+    }
+    
+    ResponseHandler::success([
+        'orders' => $formattedOrders
+    ]);
+}
+
+/*********************************
+ * GET LATEST ACTIVE ORDER - NEW FUNCTION
+ *********************************/
+function getLatestActiveOrder($conn, $userId) {
+    $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
+    
+    $sql = "SELECT 
+                o.id,
+                o.order_number,
+                o.status,
+                o.created_at,
+                o.updated_at,
+                o.total_amount,
+                m.name as merchant_name
+            FROM orders o
+            LEFT JOIN merchants m ON o.merchant_id = m.id
+            WHERE o.user_id = ? 
+            AND o.status IN ($placeholders)
+            ORDER BY o.created_at DESC
+            LIMIT 1";
+    
+    $params = array_merge([$userId], $activeStatuses);
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($params);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$order) {
+        ResponseHandler::success(['order' => null, 'message' => 'No active orders']);
+        return;
+    }
+    
+    ResponseHandler::success([
+        'order' => [
+            'id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'status' => $order['status'],
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at'],
+            'total_amount' => floatval($order['total_amount']),
+            'merchant_name' => $order['merchant_name']
+        ]
+    ]);
 }
 
 /*********************************
