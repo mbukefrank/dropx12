@@ -125,11 +125,12 @@ function generatePaymentCode($conn) {
 
 /*********************************
  * CHECK DROPX WALLET BALANCE
+ * Using user_wallets table
  *********************************/
 function checkDropXWalletBalance($conn, $userId) {
     $stmt = $conn->prepare(
-        "SELECT balance, currency, is_active 
-         FROM dropx_wallets 
+        "SELECT balance, is_active 
+         FROM user_wallets 
          WHERE user_id = :user_id 
          AND is_active = 1
          LIMIT 1"
@@ -141,7 +142,6 @@ function checkDropXWalletBalance($conn, $userId) {
         return [
             'exists' => false,
             'balance' => 0,
-            'currency' => 'MWK',
             'is_active' => false
         ];
     }
@@ -149,13 +149,13 @@ function checkDropXWalletBalance($conn, $userId) {
     return [
         'exists' => true,
         'balance' => floatval($wallet['balance']),
-        'currency' => $wallet['currency'] ?? 'MWK',
         'is_active' => boolval($wallet['is_active'])
     ];
 }
 
 /*********************************
  * AUTHENTICATION CHECK (FOR APP USERS)
+ * Using balances table (users)
  *********************************/
 function authenticateUser($conn) {
     if (!empty($_SESSION['user_id'])) {
@@ -168,7 +168,7 @@ function authenticateUser($conn) {
     if (strpos($authHeader, 'Bearer ') === 0) {
         $token = substr($authHeader, 7);
         $stmt = $conn->prepare(
-            "SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()"
+            "SELECT id FROM balances WHERE api_token = :token AND api_token_expiry > NOW()"
         );
         $stmt->execute([':token' => $token]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -299,6 +299,7 @@ function calculateCartTotals($conn, $cartId, $userId) {
 
 /*********************************
  * GET USER'S DEFAULT ADDRESS
+ * Using addresses table
  *********************************/
 function getUserDefaultAddress($conn, $userId) {
     $stmt = $conn->prepare(
@@ -365,6 +366,7 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
 
 /*********************************
  * PROCESS DROPX WALLET PAYMENT
+ * Using user_wallets and wallet_transactions tables
  *********************************/
 function processWalletPayment($conn, $userId, $cartId, $amount) {
     try {
@@ -372,7 +374,7 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
         
         // Check wallet balance
         $walletStmt = $conn->prepare(
-            "SELECT id, balance FROM dropx_wallets 
+            "SELECT id, balance FROM user_wallets 
              WHERE user_id = :user_id AND is_active = 1
              FOR UPDATE"
         );
@@ -385,8 +387,9 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
         
         // Deduct from wallet
         $updateStmt = $conn->prepare(
-            "UPDATE dropx_wallets 
-             SET balance = balance - :amount
+            "UPDATE user_wallets 
+             SET balance = balance - :amount,
+                 updated_at = NOW()
              WHERE id = :wallet_id"
         );
         $updateStmt->execute([
@@ -394,18 +397,19 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
             ':wallet_id' => $wallet['id']
         ]);
         
-        // Record transaction
+        // Record transaction in wallet_transactions
         $txnStmt = $conn->prepare(
             "INSERT INTO wallet_transactions 
-                (user_id, amount, type, reference_type, reference_id, status, description)
+                (user_id, amount, transaction_type, reference_id, balance_before, balance_after, status, description)
              VALUES 
-                (:user_id, :amount, 'debit', 'order', :cart_id, 'completed', 
-                 'Payment for order #' || :cart_id)"
+                (:user_id, :amount, 'payment', :cart_id, :balance_before, :balance_after, 'completed', 'Payment for order')"
         );
         $txnStmt->execute([
             ':user_id' => $userId,
             ':amount' => $amount,
-            ':cart_id' => $cartId
+            ':cart_id' => $cartId,
+            ':balance_before' => $wallet['balance'],
+            ':balance_after' => $wallet['balance'] - $amount
         ]);
         
         // Update cart status
@@ -876,8 +880,9 @@ try {
             
             // Add funds to wallet
             $walletStmt = $conn->prepare(
-                "UPDATE dropx_wallets 
-                 SET balance = balance + :amount
+                "UPDATE user_wallets 
+                 SET balance = balance + :amount,
+                     updated_at = NOW()
                  WHERE user_id = :user_id"
             );
             $walletStmt->execute([
@@ -885,22 +890,30 @@ try {
                 ':user_id' => $payment['user_id']
             ]);
             
-            // Record wallet credit
+            // Get current balance for transaction record
+            $balanceStmt = $conn->prepare(
+                "SELECT balance FROM user_wallets WHERE user_id = :user_id"
+            );
+            $balanceStmt->execute([':user_id' => $payment['user_id']]);
+            $currentBalance = $balanceStmt->fetch(PDO::FETCH_ASSOC)['balance'];
+            
+            // Record wallet credit in wallet_transactions
             $txnStmt = $conn->prepare(
                 "INSERT INTO wallet_transactions 
-                    (user_id, amount, type, reference_type, reference_id, 
-                     partner, partner_reference, status, description)
+                    (user_id, amount, transaction_type, reference_id, partner, partner_reference, 
+                     balance_before, balance_after, status, description)
                  VALUES 
-                    (:user_id, :amount, 'credit', 'external_payment', :payment_id,
-                     :partner, :reference, 'completed', 
-                     'Wallet top-up via ' || :partner)"
+                    (:user_id, :amount, 'deposit', :payment_id, :partner, :reference,
+                     :balance_before, :balance_after, 'completed', 'Wallet top-up via ' || :partner)"
             );
             $txnStmt->execute([
                 ':user_id' => $payment['user_id'],
                 ':amount' => $payment['amount'],
                 ':payment_id' => $payment['id'],
                 ':partner' => $partner,
-                ':reference' => $partnerReference
+                ':reference' => $partnerReference,
+                ':balance_before' => $currentBalance - $payment['amount'],
+                ':balance_after' => $currentBalance
             ]);
             
             $conn->commit();

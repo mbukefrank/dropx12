@@ -58,7 +58,7 @@ function handleGetRequest() {
     if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
         $stmt = $conn->prepare(
             "SELECT id, full_name, email, phone, address, city, gender, avatar,
-                    wallet_balance, member_level, member_points, total_orders,
+                    member_level, member_points, total_orders,
                     rating, verified, member_since, created_at, updated_at
              FROM users WHERE id = :id"
         );
@@ -236,10 +236,10 @@ function registerUser($conn, $data) {
     // Create user (no username field, just full_name)
     $stmt = $conn->prepare(
         "INSERT INTO users (full_name, email, phone, password, address, city, gender, 
-                           wallet_balance, member_level, member_points, total_orders, 
+                            member_level, member_points, total_orders, 
                            rating, verified, member_since, created_at, updated_at)
          VALUES (:full_name, :email, :phone, :password, :address, :city, :gender,
-                 0.00, 'basic', 0, 0, 0.00, 0, :member_since, NOW(), NOW())"
+                  'basic', 0, 0, 0.00, 0, :member_since, NOW(), NOW())"
     );
     
     $stmt->execute([
@@ -257,7 +257,7 @@ function registerUser($conn, $data) {
     $userId = $conn->lastInsertId();
     $stmt = $conn->prepare(
         "SELECT id, full_name, email, phone, address, city, gender, avatar,
-                wallet_balance, member_level, member_points, total_orders,
+                 member_level, member_points, total_orders,
                 rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
     );
@@ -344,7 +344,7 @@ function updateProfile($conn, $data) {
     // Get updated user
     $stmt = $conn->prepare(
         "SELECT id, full_name, email, phone, address, city, gender, avatar,
-                wallet_balance, member_level, member_points, total_orders,
+                 member_level, member_points, total_orders,
                 rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
     );
@@ -491,7 +491,7 @@ function formatUserData($u) {
         'city' => $u['city'] ?? '',
         'gender' => $u['gender'] ?? '',
         'avatar' => $u['avatar'] ?? null,
-        'wallet_balance' => (float) ($u['wallet_balance'] ?? 0.00),
+       
         'member_level' => $u['member_level'] ?? 'basic',
         'member_points' => (int) ($u['member_points'] ?? 0),
         'total_orders' => (int) ($u['total_orders'] ?? 0),
