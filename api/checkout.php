@@ -288,9 +288,10 @@ function validateCart($conn, $cartId) {
 }
 
 /*********************************
- * CREATE EXTERNAL PAYMENT CODE
+ * CREATE EXTERNAL PAYMENT CODE - FIXED
  *********************************/
 function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance) {
+    // Generate 4-character code
     $paymentCode = generatePaymentCode($conn);
     $expiresAt = date('Y-m-d H:i:s', strtotime('+30 minutes'));
     
@@ -315,20 +316,20 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
     return [
         'payment_id' => $conn->lastInsertId(),
         'payment_code' => $paymentCode,
-        'formatted_code' => implode(' ', str_split($paymentCode)),
+        'formatted_code' => implode(' ', str_split($paymentCode)), // "A 3 B 7"
         'expires_at' => $expiresAt,
         'amount' => $amount,
         'formatted_amount' => 'MK' . number_format($amount, 2)
     ];
 }
-
 /*********************************
- * PROCESS DROPX WALLET PAYMENT
+ * PROCESS DROPX WALLET PAYMENT - FIXED
  *********************************/
 function processWalletPayment($conn, $userId, $cartId, $amount) {
     try {
         $conn->beginTransaction();
         
+        // Check wallet balance
         $walletStmt = $conn->prepare(
             "SELECT id, balance FROM dropx_wallets 
              WHERE user_id = :user_id AND is_active = 1
@@ -341,6 +342,7 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
             throw new Exception('Insufficient balance');
         }
         
+        // Deduct from wallet
         $updateStmt = $conn->prepare(
             "UPDATE dropx_wallets 
              SET balance = balance - :amount
@@ -351,12 +353,13 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
             ':wallet_id' => $wallet['id']
         ]);
         
+        // FIXED: Use CONCAT instead of || for string concatenation in MySQL
         $txnStmt = $conn->prepare(
             "INSERT INTO wallet_transactions 
                 (user_id, amount, type, reference_type, reference_id, status, description)
              VALUES 
                 (:user_id, :amount, 'debit', 'order', :cart_id, 'completed', 
-                 'Payment for order #' || :cart_id)"
+                 CONCAT('Payment for order #', :cart_id))"
         );
         $txnStmt->execute([
             ':user_id' => $userId,
@@ -364,11 +367,13 @@ function processWalletPayment($conn, $userId, $cartId, $amount) {
             ':cart_id' => $cartId
         ]);
         
+        // Update cart status
         $cartStmt = $conn->prepare(
             "UPDATE carts SET status = 'completed' WHERE id = :cart_id"
         );
         $cartStmt->execute([':cart_id' => $cartId]);
         
+        // Create order
         $orderStmt = $conn->prepare(
             "INSERT INTO orders 
                 (user_id, cart_id, total_amount, payment_method, payment_status, status)
