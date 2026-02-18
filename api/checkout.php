@@ -3,7 +3,7 @@
  * CHECKOUT SCREEN - DROPX WALLET ONLY
  * Malawi Kwacha (MWK)
  * 4-Character Alphanumeric External Codes
- * WITH FULL MULTI-MERCHANT SUPPORT
+ * WITH FULL MULTI-MERCHANT SUPPORT - FIXED PARAMETER BINDING
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -466,7 +466,7 @@ function createOrderGroup($conn, $userId, $cartId, $totalAmount) {
 }
 
 /*********************************
- * CREATE MERCHANT ORDER
+ * CREATE MERCHANT ORDER (FIXED)
  *********************************/
 function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $merchantTotals, $deliveryAddress, $paymentMethod = 'dropx_wallet') {
     // Generate unique order number
@@ -505,7 +505,7 @@ function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $mercha
 }
 
 /*********************************
- * ADD ORDER ITEMS
+ * ADD ORDER ITEMS (FIXED)
  *********************************/
 function addOrderItems($conn, $orderId, $items) {
     $itemStmt = $conn->prepare(
@@ -548,7 +548,7 @@ function createOrderTracking($conn, $orderId) {
 }
 
 /*********************************
- * PROCESS DROPX WALLET PAYMENT - MULTI-MERCHANT
+ * PROCESS DROPX WALLET PAYMENT - MULTI-MERCHANT (FIXED PARAMETER BINDING)
  *********************************/
 function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTotals, $globalTotals) {
     try {
@@ -580,19 +580,22 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
             ':wallet_id' => $wallet['id']
         ]);
         
-        // Record wallet transaction
+        // FIXED: Record wallet transaction - proper parameter binding
         $txnStmt = $conn->prepare(
             "INSERT INTO wallet_transactions 
                 (user_id, amount, type, reference_type, reference_id, status, description)
              VALUES 
                 (:user_id, :amount, 'debit', 'cart', :reference_id, 'completed', 
-                 'Payment for multi-merchant order from cart #:cart_id')"
+                 :description)"
         );
+        
+        $description = 'Payment for multi-merchant order from cart #' . $cartId;
+        
         $txnStmt->execute([
             ':user_id' => $userId,
             ':amount' => $totalAmount,
             ':reference_id' => $cartId,
-            ':cart_id' => $cartId
+            ':description' => $description
         ]);
         
         // Get user's default address
