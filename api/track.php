@@ -443,11 +443,14 @@ function trackOrderGroup($conn, $orderGroupId, $baseUrl, $userId = null) {
         // Parse location updates
         $locationUpdates = [];
         if (!empty($order['location_updates'])) {
-            $locationUpdates = json_decode($order['location_updates'], true) ?: [];
+            $locationUpdates = json_decode($order['location_updates'], true);
+            if (!is_array($locationUpdates)) {
+                $locationUpdates = [];
+            }
         }
         
         // Get items for this order
-        $orderItems = $itemsByOrder[$order['id']] ?? [];
+        $orderItems = isset($itemsByOrder[$order['id']]) ? $itemsByOrder[$order['id']] : [];
         
         // Format delivery address
         $deliveryAddress = formatDeliveryAddress($order);
@@ -639,7 +642,8 @@ function getGroupDriverLocations($conn, $userId, $orderGroupId) {
 
     $formattedDrivers = [];
     foreach ($drivers as $driver) {
-        $driverImage = formatImageUrl($driver['image_url'], $GLOBALS['baseUrl'], 'drivers');
+        global $baseUrl;
+        $driverImage = formatImageUrl($driver['image_url'], $baseUrl, 'drivers');
         
         $formattedDrivers[] = [
             'order_id' => $driver['order_id'],
@@ -669,7 +673,7 @@ function getGroupDriverLocations($conn, $userId, $orderGroupId) {
 }
 
 /*********************************
- * GET GROUP REAL-TIME UPDATES
+ * GET GROUP REAL-TIME UPDATES - FIXED LINE 719
  *********************************/
 function getGroupRealTimeUpdates($conn, $userId, $orderGroupId, $lastUpdate = null) {
     // Verify group belongs to user
@@ -694,44 +698,52 @@ function getGroupRealTimeUpdates($conn, $userId, $orderGroupId, $lastUpdate = nu
     }
 
     // Get all orders in group with their latest updates
-    $stmt = $conn->prepare(
-        "SELECT 
-            o.id,
-            o.order_number,
-            o.status,
-            o.updated_at as order_updated_at,
-            d.name as driver_name,
-            d.current_latitude,
-            d.current_longitude,
-            d.updated_at as driver_updated_at,
-            ot.status as tracking_status,
-            ot.location_updates,
-            ot.estimated_delivery,
-            ot.updated_at as tracking_updated_at
-        FROM orders o
-        LEFT JOIN drivers d ON o.driver_id = d.id
-        LEFT JOIN order_tracking ot ON o.id = ot.order_id
-        WHERE o.order_group_id = ?
-        AND (? IS NULL OR 
-            o.updated_at > ? OR 
-            d.updated_at > ? OR 
-            ot.updated_at > ?)
-        ORDER BY o.id, ot.updated_at DESC";
+    $sql = "SELECT 
+                o.id,
+                o.order_number,
+                o.status,
+                o.updated_at as order_updated_at,
+                d.name as driver_name,
+                d.current_latitude,
+                d.current_longitude,
+                d.updated_at as driver_updated_at,
+                ot.status as tracking_status,
+                ot.location_updates,
+                ot.estimated_delivery,
+                ot.updated_at as tracking_updated_at
+            FROM orders o
+            LEFT JOIN drivers d ON o.driver_id = d.id
+            LEFT JOIN order_tracking ot ON o.id = ot.order_id
+            WHERE o.order_group_id = ?";
     
-    $stmt->execute([
-        $orderGroupId, 
-        $lastUpdateTime, 
-        $lastUpdateTime,
-        $lastUpdateTime,
-        $lastUpdateTime
-    ]);
+    $params = [$orderGroupId];
     
+    if ($lastUpdateTime) {
+        $sql .= " AND (o.updated_at > ? OR d.updated_at > ? OR ot.updated_at > ?)";
+        $params[] = $lastUpdateTime;
+        $params[] = $lastUpdateTime;
+        $params[] = $lastUpdateTime;
+    }
+    
+    $sql .= " ORDER BY o.id, ot.updated_at DESC";
+    
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($params);
     $updates = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     // Group updates by order
     $orderUpdates = [];
     foreach ($updates as $update) {
         if (!isset($orderUpdates[$update['id']])) {
+            // Parse location updates
+            $locationUpdates = [];
+            if (!empty($update['location_updates'])) {
+                $locationUpdates = json_decode($update['location_updates'], true);
+                if (!is_array($locationUpdates)) {
+                    $locationUpdates = [];
+                }
+            }
+            
             $orderUpdates[$update['id']] = [
                 'order_id' => $update['id'],
                 'order_number' => $update['order_number'],
@@ -744,10 +756,14 @@ function getGroupRealTimeUpdates($conn, $userId, $orderGroupId, $lastUpdate = nu
                 'tracking' => [
                     'status' => $update['tracking_status'],
                     'estimated_delivery' => $update['estimated_delivery'],
-                    'location_updates' => json_decode($update['location_updates'] ?? '[]', true),
+                    'location_updates' => $locationUpdates,
                     'updated_at' => $update['tracking_updated_at']
                 ],
-                'updated_at' => max($update['order_updated_at'], $update['driver_updated_at'], $update['tracking_updated_at'])
+                'updated_at' => max(
+                    $update['order_updated_at'] ?? '', 
+                    $update['driver_updated_at'] ?? '', 
+                    $update['tracking_updated_at'] ?? ''
+                )
             ];
         }
     }
@@ -1000,6 +1016,7 @@ function contactGroupSupport($conn, $userId, $orderGroupId, $issue, $details) {
  *********************************/
 function getLatestActiveOrderGroup($conn, $userId) {
     $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
     
     $sql = "SELECT 
                 og.id,
@@ -1012,11 +1029,10 @@ function getLatestActiveOrderGroup($conn, $userId) {
             FROM order_groups og
             JOIN orders o ON og.id = o.order_group_id
             JOIN merchants m ON o.merchant_id = m.id
-            WHERE og.user_id = :user_id
-            AND o.status IN (" . implode(',', array_fill(0, count($activeStatuses), '?')) . ")
-            GROUP BY og.id
-            ORDER BY og.created_at DESC
-            LIMIT 1";
+            WHERE og.user_id = ?";
+    
+    $sql .= " AND o.status IN (" . implode(',', array_fill(0, count($activeStatuses), '?')) . ")";
+    $sql .= " GROUP BY og.id ORDER BY og.created_at DESC LIMIT 1";
     
     $params = array_merge([$userId], $activeStatuses);
     $stmt = $conn->prepare($sql);
@@ -1042,7 +1058,7 @@ function getLatestActiveOrderGroup($conn, $userId) {
 }
 
 /*********************************
- * GET ORDER TRACKING - ORIGINAL FUNCTION (UPDATED)
+ * GET ORDER TRACKING - ORIGINAL FUNCTION
  *********************************/
 function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
     // Check if order identifier is order_number or order_id
@@ -1280,9 +1296,9 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
     
     $formattedOrders = [];
     foreach ($orders as $order) {
+        global $baseUrl;
         $merchantImage = '';
         if (!empty($order['merchant_image'])) {
-            global $baseUrl;
             $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
         }
         
@@ -1347,9 +1363,9 @@ function getDriverLocation($conn, $userId, $orderId) {
     $driver = $stmt->fetch(PDO::FETCH_ASSOC);
 
     // Format driver image URL
+    global $baseUrl;
     $driverImage = '';
     if (!empty($driver['image_url'])) {
-        global $baseUrl;
         $driverImage = formatImageUrl($driver['image_url'], $baseUrl, 'drivers');
     }
 
@@ -1374,7 +1390,7 @@ function getDriverLocation($conn, $userId, $orderId) {
 }
 
 /*********************************
- * GET REAL-TIME UPDATES
+ * GET REAL-TIME UPDATES - ORIGINAL FUNCTION
  *********************************/
 function getRealTimeUpdates($conn, $userId, $orderId, $lastUpdate = null) {
     // Verify the order belongs to the user
@@ -1399,38 +1415,50 @@ function getRealTimeUpdates($conn, $userId, $orderId, $lastUpdate = null) {
     }
 
     // Check for tracking updates
-    $trackingStmt = $conn->prepare(
-        "SELECT 
+    $trackingSql = "SELECT 
             status,
             location_updates,
             estimated_delivery,
             updated_at
         FROM order_tracking
-        WHERE order_id = ?
-        AND (? IS NULL OR updated_at > ?)
-        ORDER BY updated_at DESC
-        LIMIT 1"
-    );
+        WHERE order_id = ?";
     
-    $trackingStmt->execute([$orderId, $lastUpdateTime, $lastUpdateTime]);
+    $trackingParams = [$orderId];
+    
+    if ($lastUpdateTime) {
+        $trackingSql .= " AND updated_at > ?";
+        $trackingParams[] = $lastUpdateTime;
+    }
+    
+    $trackingSql .= " ORDER BY updated_at DESC LIMIT 1";
+    
+    $trackingStmt = $conn->prepare($trackingSql);
+    $trackingStmt->execute($trackingParams);
     $trackingUpdate = $trackingStmt->fetch(PDO::FETCH_ASSOC);
 
     // Get current driver location
-    $driverStmt = $conn->prepare(
-        "SELECT 
+    $driverSql = "SELECT 
             d.current_latitude,
             d.current_longitude,
             d.updated_at as timestamp
         FROM orders o
         LEFT JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = ?"
-    );
-    $driverStmt->execute([$orderId]);
+        WHERE o.id = ?";
+    
+    $driverParams = [$orderId];
+    
+    if ($lastUpdateTime) {
+        $driverSql .= " AND d.updated_at > ?";
+        $driverParams[] = $lastUpdateTime;
+    }
+    
+    $driverStmt = $conn->prepare($driverSql);
+    $driverStmt->execute($driverParams);
     $driverLocation = $driverStmt->fetch(PDO::FETCH_ASSOC);
 
     ResponseHandler::success([
         'success' => true,
-        'has_updates' => !empty($trackingUpdate),
+        'has_updates' => !empty($trackingUpdate) || !empty($driverLocation),
         'tracking_update' => $trackingUpdate,
         'driver_location' => $driverLocation,
         'server_timestamp' => date('Y-m-d H:i:s')
