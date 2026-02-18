@@ -3,7 +3,7 @@
  * CHECKOUT SCREEN - DROPX WALLET ONLY
  * Malawi Kwacha (MWK)
  * 4-Character Alphanumeric External Codes
- * WITH FULL MULTI-MERCHANT SUPPORT - FIXED PARAMETER BINDING
+ * WITH FULL MULTI-MERCHANT SUPPORT - DEBUG VERSION
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -12,7 +12,7 @@ header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-W
 header("Content-Type: application/json; charset=UTF-8");
 
 error_reporting(E_ALL);
-ini_set('display_errors', 0);
+ini_set('display_errors', 1); // Enable for debugging
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -36,6 +36,18 @@ if (session_status() === PHP_SESSION_NONE) {
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
+
+/*********************************
+ * DEBUG LOGGING FUNCTION
+ *********************************/
+function debug_log($message, $data = null) {
+    $log = date('Y-m-d H:i:s') . " - " . $message;
+    if ($data !== null) {
+        $log .= ": " . print_r($data, true);
+    }
+    error_log($log);
+    file_put_contents(__DIR__ . '/checkout_debug.log', $log . "\n", FILE_APPEND);
+}
 
 /*********************************
  * MALAWI KWACHA CONFIGURATION
@@ -122,6 +134,8 @@ function generatePaymentCode($conn) {
  * CHECK DROPX WALLET BALANCE
  *********************************/
 function checkDropXWalletBalance($conn, $userId) {
+    debug_log("Checking wallet balance for user", $userId);
+    
     $stmt = $conn->prepare(
         "SELECT balance, currency, is_active 
          FROM dropx_wallets 
@@ -133,6 +147,7 @@ function checkDropXWalletBalance($conn, $userId) {
     $wallet = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$wallet) {
+        debug_log("No wallet found for user", $userId);
         return [
             'exists' => false,
             'balance' => 0,
@@ -141,6 +156,7 @@ function checkDropXWalletBalance($conn, $userId) {
         ];
     }
     
+    debug_log("Wallet found", $wallet);
     return [
         'exists' => true,
         'balance' => floatval($wallet['balance']),
@@ -154,6 +170,7 @@ function checkDropXWalletBalance($conn, $userId) {
  *********************************/
 function authenticateUser($conn) {
     if (!empty($_SESSION['user_id'])) {
+        debug_log("User authenticated via session", $_SESSION['user_id']);
         return $_SESSION['user_id'];
     }
     
@@ -162,6 +179,8 @@ function authenticateUser($conn) {
     
     if (strpos($authHeader, 'Bearer ') === 0) {
         $token = substr($authHeader, 7);
+        debug_log("Authenticating with token", substr($token, 0, 10) . "...");
+        
         $stmt = $conn->prepare(
             "SELECT id FROM users WHERE api_token = :token AND api_token_expiry > NOW()"
         );
@@ -170,10 +189,12 @@ function authenticateUser($conn) {
         
         if ($user) {
             $_SESSION['user_id'] = $user['id'];
+            debug_log("User authenticated via token", $user['id']);
             return $user['id'];
         }
     }
     
+    debug_log("Authentication failed");
     return false;
 }
 
@@ -181,6 +202,8 @@ function authenticateUser($conn) {
  * GET USER'S ACTIVE CART
  *********************************/
 function getActiveCart($conn, $userId) {
+    debug_log("Getting active cart for user", $userId);
+    
     $stmt = $conn->prepare(
         "SELECT id, user_id, status, applied_promotion_id, applied_discount 
          FROM carts 
@@ -188,13 +211,18 @@ function getActiveCart($conn, $userId) {
          ORDER BY created_at DESC LIMIT 1"
     );
     $stmt->execute([':user_id' => $userId]);
-    return $stmt->fetch(PDO::FETCH_ASSOC);
+    $cart = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    debug_log("Active cart result", $cart);
+    return $cart;
 }
 
 /*********************************
  * GET CART ITEMS WITH MERCHANT DETAILS
  *********************************/
 function getCartItemsWithMerchants($conn, $cartId) {
+    debug_log("Getting cart items for cart", $cartId);
+    
     $stmt = $conn->prepare(
         "SELECT 
             ci.id,
@@ -215,7 +243,10 @@ function getCartItemsWithMerchants($conn, $cartId) {
          ORDER BY m.id, mi.name"
     );
     $stmt->execute([':cart_id' => $cartId]);
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    debug_log("Cart items found", count($items));
+    return $items;
 }
 
 /*********************************
@@ -267,6 +298,8 @@ function groupItemsByMerchant($items) {
  * CALCULATE CART TOTALS WITH MERCHANT BREAKDOWN
  *********************************/
 function calculateCartTotalsWithMerchants($conn, $cartId, $userId, $merchants, $totalSubtotal) {
+    debug_log("Calculating totals for cart", $cartId);
+    
     // Global calculations
     $discount = 0;
     
@@ -365,6 +398,8 @@ function calculateCartTotalsWithMerchants($conn, $cartId, $userId, $merchants, $
  * GET USER'S DEFAULT ADDRESS
  *********************************/
 function getUserDefaultAddress($conn, $userId) {
+    debug_log("Getting default address for user", $userId);
+    
     $stmt = $conn->prepare(
         "SELECT id, label, address_line1, city, neighborhood, latitude, longitude 
          FROM addresses 
@@ -372,7 +407,10 @@ function getUserDefaultAddress($conn, $userId) {
          LIMIT 1"
     );
     $stmt->execute([':user_id' => $userId]);
-    return $stmt->fetch(PDO::FETCH_ASSOC);
+    $address = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    debug_log("Default address", $address);
+    return $address;
 }
 
 /*********************************
@@ -417,6 +455,8 @@ function validateMerchantMinimums($merchants) {
  * CREATE EXTERNAL PAYMENT CODE
  *********************************/
 function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance) {
+    debug_log("Creating external payment", ['user' => $userId, 'cart' => $cartId, 'amount' => $amount]);
+    
     $paymentCode = generatePaymentCode($conn);
     $expiresAt = date('Y-m-d H:i:s', strtotime('+30 minutes'));
     
@@ -438,6 +478,8 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
         ':expires_at' => $expiresAt
     ]);
     
+    debug_log("External payment created", ['code' => $paymentCode, 'id' => $conn->lastInsertId()]);
+    
     return [
         'payment_id' => $conn->lastInsertId(),
         'payment_code' => $paymentCode,
@@ -452,23 +494,31 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
  * CREATE ORDER GROUP
  *********************************/
 function createOrderGroup($conn, $userId, $cartId, $totalAmount) {
+    debug_log("Creating order group", ['user' => $userId, 'cart' => $cartId, 'amount' => $totalAmount]);
+    
     $stmt = $conn->prepare(
         "INSERT INTO order_groups (user_id, cart_id, total_amount, status, created_at)
          VALUES (:user_id, :cart_id, :total_amount, 'pending', NOW())"
     );
+    
     $stmt->execute([
         ':user_id' => $userId,
         ':cart_id' => $cartId,
         ':total_amount' => $totalAmount
     ]);
     
-    return $conn->lastInsertId();
+    $groupId = $conn->lastInsertId();
+    debug_log("Order group created", $groupId);
+    
+    return $groupId;
 }
 
 /*********************************
  * CREATE MERCHANT ORDER (FIXED)
  *********************************/
 function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $merchantTotals, $deliveryAddress, $paymentMethod = 'dropx_wallet') {
+    debug_log("Creating merchant order", ['merchant' => $merchantId, 'group' => $orderGroupId]);
+    
     // Generate unique order number
     $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT) . '-' . $merchantId;
     
@@ -483,7 +533,7 @@ function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $mercha
              :payment_method, 'paid', :delivery_address, 'confirmed', NOW(), NOW())"
     );
     
-    $stmt->execute([
+    $params = [
         ':order_number' => $orderNumber,
         ':user_id' => $userId,
         ':merchant_id' => $merchantId,
@@ -496,10 +546,16 @@ function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $mercha
         ':total_amount' => $merchantTotals['total'],
         ':payment_method' => $paymentMethod,
         ':delivery_address' => $deliveryAddress
-    ]);
+    ];
+    
+    debug_log("Order params", $params);
+    $stmt->execute($params);
+    
+    $orderId = $conn->lastInsertId();
+    debug_log("Order created", ['id' => $orderId, 'number' => $orderNumber]);
     
     return [
-        'order_id' => $conn->lastInsertId(),
+        'order_id' => $orderId,
         'order_number' => $orderNumber
     ];
 }
@@ -508,6 +564,8 @@ function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $mercha
  * ADD ORDER ITEMS (FIXED)
  *********************************/
 function addOrderItems($conn, $orderId, $items) {
+    debug_log("Adding items to order", ['order' => $orderId, 'item_count' => count($items)]);
+    
     $itemStmt = $conn->prepare(
         "INSERT INTO order_items 
             (order_id, menu_item_id, item_name, quantity, unit_price, total_price, created_at)
@@ -515,16 +573,20 @@ function addOrderItems($conn, $orderId, $items) {
             (:order_id, :menu_item_id, :item_name, :quantity, :unit_price, :total_price, NOW())"
     );
     
-    foreach ($items as $item) {
+    foreach ($items as $index => $item) {
         $itemTotal = $item['price'] * $item['quantity'];
-        $itemStmt->execute([
+        
+        $params = [
             ':order_id' => $orderId,
             ':menu_item_id' => $item['menu_item_id'],
             ':item_name' => $item['name'],
             ':quantity' => $item['quantity'],
             ':unit_price' => $item['price'],
             ':total_price' => $itemTotal
-        ]);
+        ];
+        
+        debug_log("Adding item $index", $params);
+        $itemStmt->execute($params);
     }
 }
 
@@ -532,6 +594,8 @@ function addOrderItems($conn, $orderId, $items) {
  * CREATE ORDER TRACKING
  *********************************/
 function createOrderTracking($conn, $orderId) {
+    debug_log("Creating tracking for order", $orderId);
+    
     $estimatedDelivery = date('Y-m-d H:i:s', strtotime('+45 minutes'));
     
     $stmt = $conn->prepare(
@@ -541,22 +605,34 @@ function createOrderTracking($conn, $orderId) {
             (:order_id, 'Order placed', :estimated_delivery, NOW())"
     );
     
-    $stmt->execute([
+    $params = [
         ':order_id' => $orderId,
         ':estimated_delivery' => $estimatedDelivery
-    ]);
+    ];
+    
+    debug_log("Tracking params", $params);
+    $stmt->execute($params);
 }
 
 /*********************************
- * PROCESS DROPX WALLET PAYMENT - MULTI-MERCHANT (FIXED PARAMETER BINDING)
+ * PROCESS DROPX WALLET PAYMENT - MULTI-MERCHANT (COMPLETELY REWRITTEN FOR DEBUGGING)
  *********************************/
 function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTotals, $globalTotals) {
+    debug_log("=== STARTING PAYMENT PROCESSING ===");
+    debug_log("Params", [
+        'user' => $userId,
+        'cart' => $cartId,
+        'total' => $globalTotals['total_amount'],
+        'merchant_count' => count($merchants)
+    ]);
+    
     try {
         $conn->beginTransaction();
         
         $totalAmount = $globalTotals['total_amount'];
         
-        // Check wallet balance with row lock
+        // STEP 1: Check wallet balance
+        debug_log("STEP 1: Checking wallet balance");
         $walletStmt = $conn->prepare(
             "SELECT id, balance FROM dropx_wallets 
              WHERE user_id = :user_id AND is_active = 1
@@ -565,52 +641,67 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
         $walletStmt->execute([':user_id' => $userId]);
         $wallet = $walletStmt->fetch(PDO::FETCH_ASSOC);
         
-        if (!$wallet || $wallet['balance'] < $totalAmount) {
-            throw new Exception('Insufficient wallet balance');
+        if (!$wallet) {
+            throw new Exception('Wallet not found');
+        }
+        debug_log("Wallet found", $wallet);
+        
+        if ($wallet['balance'] < $totalAmount) {
+            throw new Exception('Insufficient wallet balance: ' . $wallet['balance'] . ' < ' . $totalAmount);
         }
         
-        // Deduct from wallet
+        // STEP 2: Deduct from wallet
+        debug_log("STEP 2: Deducting from wallet");
         $updateStmt = $conn->prepare(
             "UPDATE dropx_wallets 
              SET balance = balance - :amount
              WHERE id = :wallet_id"
         );
-        $updateStmt->execute([
+        $updateParams = [
             ':amount' => $totalAmount,
             ':wallet_id' => $wallet['id']
-        ]);
+        ];
+        debug_log("Update params", $updateParams);
+        $updateStmt->execute($updateParams);
         
-        // FIXED: Record wallet transaction - proper parameter binding
+        // STEP 3: Record wallet transaction
+        debug_log("STEP 3: Recording wallet transaction");
         $txnStmt = $conn->prepare(
             "INSERT INTO wallet_transactions 
                 (user_id, amount, type, reference_type, reference_id, status, description)
              VALUES 
-                (:user_id, :amount, 'debit', 'cart', :reference_id, 'completed', 
-                 :description)"
+                (:user_id, :amount, 'debit', 'cart', :reference_id, 'completed', :description)"
         );
         
         $description = 'Payment for multi-merchant order from cart #' . $cartId;
-        
-        $txnStmt->execute([
+        $txnParams = [
             ':user_id' => $userId,
             ':amount' => $totalAmount,
             ':reference_id' => $cartId,
             ':description' => $description
-        ]);
+        ];
+        debug_log("Transaction params", $txnParams);
+        $txnStmt->execute($txnParams);
         
-        // Get user's default address
+        // STEP 4: Get user's default address
+        debug_log("STEP 4: Getting user address");
         $address = getUserDefaultAddress($conn, $userId);
         $deliveryAddress = $address 
             ? $address['address_line1'] . ', ' . $address['city']
             : 'Default Address';
+        debug_log("Delivery address", $deliveryAddress);
         
-        // Create order group
+        // STEP 5: Create order group
+        debug_log("STEP 5: Creating order group");
         $orderGroupId = createOrderGroup($conn, $userId, $cartId, $totalAmount);
         
-        // Create orders for each merchant
+        // STEP 6: Create orders for each merchant
+        debug_log("STEP 6: Creating merchant orders");
         $createdOrders = [];
         
         foreach ($merchantTotals as $merchantId => $totals) {
+            debug_log("Processing merchant", $merchantId);
+            
             // Get items for this merchant
             $merchantItems = $merchants[$merchantId]['items'];
             
@@ -640,7 +731,8 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
             ];
         }
         
-        // Clear the cart
+        // STEP 7: Clear the cart
+        debug_log("STEP 7: Clearing cart");
         $clearCartStmt = $conn->prepare(
             "UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id"
         );
@@ -651,13 +743,15 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
         );
         $updateCartStmt->execute([':cart_id' => $cartId]);
         
-        // Update order group status
+        // STEP 8: Update order group status
+        debug_log("STEP 8: Updating order group");
         $updateGroupStmt = $conn->prepare(
             "UPDATE order_groups SET status = 'completed' WHERE id = :group_id"
         );
         $updateGroupStmt->execute([':group_id' => $orderGroupId]);
         
         $conn->commit();
+        debug_log("=== PAYMENT COMPLETED SUCCESSFULLY ===");
         
         return [
             'success' => true,
@@ -671,7 +765,10 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
         
     } catch (Exception $e) {
         $conn->rollBack();
+        debug_log("!!! PAYMENT ERROR: " . $e->getMessage());
         error_log("Multi-merchant payment error: " . $e->getMessage());
+        error_log("Stack trace: " . $e->getTraceAsString());
+        
         return [
             'success' => false,
             'error' => $e->getMessage()
@@ -683,8 +780,11 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
  * MAIN ROUTER
  *********************************/
 try {
+    debug_log("=== NEW REQUEST ===");
+    debug_log("Method", $_SERVER['REQUEST_METHOD']);
+    debug_log("Input", file_get_contents('php://input'));
+    
     $method = $_SERVER['REQUEST_METHOD'];
-    $path = $_SERVER['REQUEST_URI'];
     $input = json_decode(file_get_contents('php://input'), true);
     
     if (!$input && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -695,6 +795,7 @@ try {
     $conn = $db->getConnection();
     
     if (!$conn) {
+        debug_log("Database connection failed");
         ResponseHandler::error('Database connection failed', 500);
     }
     
@@ -702,17 +803,22 @@ try {
      * ROUTE: GET /checkout.php
      *********************************/
     if ($method === 'GET') {
+        debug_log("Processing GET request");
+        
         $userId = authenticateUser($conn);
         if (!$userId) {
+            debug_log("Authentication failed for GET");
             ResponseHandler::error('Authentication required', 401);
         }
         
         $cart = getActiveCart($conn, $userId);
         if (!$cart) {
+            debug_log("No active cart found");
             ResponseHandler::error('No active cart found', 404);
         }
         
         if (!validateCart($conn, $cart['id'])) {
+            debug_log("Cart is empty");
             ResponseHandler::error('Cart is empty', 400);
         }
         
@@ -741,7 +847,7 @@ try {
         $wallet = checkDropXWalletBalance($conn, $userId);
         
         // Prepare response
-        ResponseHandler::success([
+        $response = [
             'cart_id' => $cart['id'],
             'merchants' => array_values($merchants),
             'merchant_totals' => array_values($totals['merchant_totals']),
@@ -782,15 +888,21 @@ try {
                     }, EXTERNAL_PARTNERS)
                 ]
             ]
-        ]);
+        ];
+        
+        debug_log("GET response prepared");
+        ResponseHandler::success($response);
     }
     
     /*********************************
      * ROUTE: POST /checkout.php
      *********************************/
     elseif ($method === 'POST') {
+        debug_log("Processing POST request with action: " . ($input['action'] ?? 'none'));
+        
         $userId = authenticateUser($conn);
         if (!$userId) {
+            debug_log("Authentication failed for POST");
             ResponseHandler::error('Authentication required', 401);
         }
         
@@ -798,6 +910,7 @@ try {
         
         switch ($action) {
             case 'initiate':
+                debug_log("Handling initiate action");
                 $cartId = $input['cart_id'] ?? null;
                 
                 if (!$cartId) {
@@ -843,6 +956,8 @@ try {
                     'initiated_at' => date('Y-m-d H:i:s')
                 ];
                 
+                debug_log("Checkout initiated", $_SESSION['checkout_' . $cartId]);
+                
                 ResponseHandler::success([
                     'cart_id' => $cartId,
                     'amount' => $totals['global']['total_amount'],
@@ -852,6 +967,7 @@ try {
                 break;
             
             case 'process_payment':
+                debug_log("Handling process_payment action");
                 $cartId = $input['cart_id'] ?? null;
                 
                 if (!$cartId) {
@@ -864,6 +980,8 @@ try {
                 }
                 
                 $session = $_SESSION['checkout_' . $cartId] ?? null;
+                debug_log("Session data", $session);
+                
                 if (!$session || $session['user_id'] != $userId) {
                     ResponseHandler::error('Please initiate checkout first', 400);
                 }
@@ -895,6 +1013,7 @@ try {
                 break;
             
             case 'generate_code':
+                debug_log("Handling generate_code action");
                 $cartId = $input['cart_id'] ?? null;
                 
                 if (!$cartId) {
@@ -962,15 +1081,19 @@ try {
                 break;
             
             default:
+                debug_log("Invalid action: " . $action);
                 ResponseHandler::error('Invalid action', 400);
         }
     }
     
     else {
+        debug_log("Method not allowed: " . $method);
         ResponseHandler::error('Method not allowed', 405);
     }
     
 } catch (Exception $e) {
+    debug_log("SERVER ERROR: " . $e->getMessage());
+    debug_log("Stack trace: " . $e->getTraceAsString());
     ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
 }
 ?>
