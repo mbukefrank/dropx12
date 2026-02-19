@@ -1,14 +1,4 @@
 <?php
-/**
- * DROPX TRACKING API
- * 
- * Unified tracking system for both single and multi-merchant orders
- * Optimized for mobile applications
- * 
- * @author DropX Development Team
- * @version 2.0.0
- */
-
 /*********************************
  * API CONFIGURATION
  *********************************/
@@ -44,9 +34,6 @@ require_once __DIR__ . '/../includes/ResponseHandler.php';
 /*********************************
  * CONSTANTS
  *********************************/
-define('API_VERSION', '2.0.0');
-define('MIN_APP_VERSION', '1.5.0');
-
 define('ORDER_STATUSES', [
     'pending' => ['progress' => 0.1, 'label' => 'Order Placed', 'color' => '#FFA500'],
     'confirmed' => ['progress' => 0.2, 'label' => 'Confirmed', 'color' => '#4CAF50'],
