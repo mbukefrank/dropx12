@@ -1215,11 +1215,15 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
     
     $stmt = $conn->prepare($sql);
     
-    // Build parameters array
-    $params = array_merge([$userId], $trackableStatuses, [$limit]);
+    // Build parameters array - ensure limit is integer
+    $params = array_merge([$userId], $trackableStatuses, [(int)$limit]);
     
     // Execute with parameters
-    $stmt->execute($params);
+    if (!$stmt->execute($params)) {
+        $error = $stmt->errorInfo();
+        error_log("SQL Error in getTrackableOrders: " . print_r($error, true));
+        ResponseHandler::error('Database error: ' . $error[2], 500);
+    }
     
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
