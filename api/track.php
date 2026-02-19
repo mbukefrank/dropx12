@@ -510,8 +510,12 @@ function getTrackableOrderGroups($conn, $userId, $limit, $sortBy, $sortOrder) {
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
     $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
     
-    // Trackable statuses
-    $trackableStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    // Ensure limit is an integer
+    $limit = min(max((int)$limit, 1), 100);
+    
+    // Trackable statuses for orders within groups
+    $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
+    $statusPlaceholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
     
     // Get groups with at least one trackable order
     $sql = "SELECT DISTINCT
@@ -524,22 +528,29 @@ function getTrackableOrderGroups($conn, $userId, $limit, $sortBy, $sortOrder) {
                 COUNT(o.id) as order_count,
                 GROUP_CONCAT(DISTINCT m.name SEPARATOR ', ') as merchant_names,
                 SUM(CASE 
-                    WHEN o.status IN ('confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived') 
+                    WHEN o.status IN ($statusPlaceholders) 
                     THEN 1 ELSE 0 
                 END) as trackable_orders
             FROM order_groups og
             JOIN orders o ON og.id = o.order_group_id
             LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE og.user_id = :user_id
+            WHERE og.user_id = ?
             GROUP BY og.id
             HAVING trackable_orders > 0
             ORDER BY og.$sortBy $sortOrder
-            LIMIT :limit";
+            LIMIT ?";
     
     $stmt = $conn->prepare($sql);
-    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
-    $stmt->bindValue(':limit', (int)$limit, PDO::PARAM_INT);
-    $stmt->execute();
+    
+    // Build parameters array
+    $params = array_merge([$userId], $trackableStatuses, [$limit]);
+    
+    if (!$stmt->execute($params)) {
+        $error = $stmt->errorInfo();
+        error_log("SQL Error in getTrackableOrderGroups: " . print_r($error, true));
+        ResponseHandler::error('Database error: ' . $error[2], 500);
+    }
+    
     $groups = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     $formattedGroups = [];
@@ -1189,6 +1200,9 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
     $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
     
+    // Ensure limit is an integer
+    $limit = min(max((int)$limit, 1), 100);
+    
     // Trackable statuses (orders that can be tracked)
     $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
     
@@ -1215,10 +1229,9 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
     
     $stmt = $conn->prepare($sql);
     
-    // Build parameters array - ensure limit is integer
-    $params = array_merge([$userId], $trackableStatuses, [(int)$limit]);
+    // Build parameters array
+    $params = array_merge([$userId], $trackableStatuses, [$limit]);
     
-    // Execute with parameters
     if (!$stmt->execute($params)) {
         $error = $stmt->errorInfo();
         error_log("SQL Error in getTrackableOrders: " . print_r($error, true));

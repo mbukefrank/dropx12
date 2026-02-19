@@ -2,7 +2,6 @@
 /*********************************
  * DROPX WALLET API
  * Malawi Kwacha (MWK) Wallet System
- * Supports: Balance, Transactions, Top-ups, External Payments
  *********************************/
 
 /*********************************
@@ -43,7 +42,7 @@ require_once __DIR__ . '/../includes/ResponseHandler.php';
 $baseUrl = "https://dropx12-production.up.railway.app";
 
 /*********************************
- * CONSTANTS (check if already defined)
+ * CONSTANTS
  *********************************/
 if (!defined('CURRENCY')) define('CURRENCY', 'MWK');
 if (!defined('CURRENCY_SYMBOL')) define('CURRENCY_SYMBOL', 'MK');
@@ -105,11 +104,11 @@ function authenticateWithToken($conn, $token) {
 }
 
 /*********************************
- * WALLET FUNCTIONS
+ * WALLET FUNCTIONS - Using dropx_wallets table
  *********************************/
 function getOrCreateWallet($conn, $user_id) {
     // Check if wallet exists
-    $stmt = $conn->prepare("SELECT * FROM wallets WHERE user_id = :user_id LIMIT 1");
+    $stmt = $conn->prepare("SELECT * FROM dropx_wallets WHERE user_id = :user_id LIMIT 1");
     $stmt->execute([':user_id' => $user_id]);
     $wallet = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -119,7 +118,7 @@ function getOrCreateWallet($conn, $user_id) {
 
     // Create new wallet
     $stmt = $conn->prepare(
-        "INSERT INTO wallets (user_id, balance, currency) VALUES (:user_id, 0.00, 'MWK')"
+        "INSERT INTO dropx_wallets (user_id, balance, currency) VALUES (:user_id, 0.00, 'MWK')"
     );
     $stmt->execute([':user_id' => $user_id]);
     
@@ -134,19 +133,51 @@ function getOrCreateWallet($conn, $user_id) {
 
 function getWalletBalance($conn, $user_id) {
     $stmt = $conn->prepare(
-        "SELECT balance, currency FROM wallets WHERE user_id = :user_id AND is_active = 1"
+        "SELECT balance, currency FROM dropx_wallets WHERE user_id = :user_id AND is_active = 1"
     );
     $stmt->execute([':user_id' => $user_id]);
     return $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
+function updateWalletBalance($conn, $wallet_id, $new_balance) {
+    $stmt = $conn->prepare(
+        "UPDATE dropx_wallets SET balance = :balance WHERE id = :id"
+    );
+    return $stmt->execute([
+        ':balance' => $new_balance,
+        ':id' => $wallet_id
+    ]);
+}
+
+/*********************************
+ * TRANSACTION FUNCTIONS - Using wallet_transactions table
+ *********************************/
+function createTransaction($conn, $data) {
+    $stmt = $conn->prepare(
+        "INSERT INTO wallet_transactions 
+         (user_id, amount, type, reference_type, reference_id, partner, partner_reference, status, description)
+         VALUES 
+         (:user_id, :amount, :type, :reference_type, :reference_id, :partner, :partner_reference, :status, :description)"
+    );
+
+    return $stmt->execute([
+        ':user_id' => $data['user_id'],
+        ':amount' => $data['amount'],
+        ':type' => $data['type'],
+        ':reference_type' => $data['reference_type'] ?? null,
+        ':reference_id' => $data['reference_id'] ?? null,
+        ':partner' => $data['partner'] ?? null,
+        ':partner_reference' => $data['partner_reference'] ?? null,
+        ':status' => $data['status'] ?? 'completed',
+        ':description' => $data['description'] ?? ''
+    ]);
+}
+
 function getUserTransactions($conn, $user_id, $limit = 50, $offset = 0) {
     $stmt = $conn->prepare(
-        "SELECT t.*, w.currency 
-         FROM transactions t
-         JOIN wallets w ON t.wallet_id = w.id
-         WHERE t.user_id = :user_id
-         ORDER BY t.created_at DESC
+        "SELECT * FROM wallet_transactions 
+         WHERE user_id = :user_id
+         ORDER BY created_at DESC
          LIMIT :limit OFFSET :offset"
     );
     
@@ -158,67 +189,82 @@ function getUserTransactions($conn, $user_id, $limit = 50, $offset = 0) {
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
-function createTopupRequest($conn, $user_id, $amount, $method) {
-    // Generate reference code
-    $characters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    $code = '';
-    for ($i = 0; $i < 8; $i++) {
-        $code .= $characters[random_int(0, strlen($characters) - 1)];
+/*********************************
+ * EXTERNAL PAYMENTS FUNCTIONS - Using external_payments table for top-ups
+ *********************************/
+function createTopupRequest($conn, $user_id, $amount, $partner, $wallet_balance) {
+    // Generate payment code (4 digits)
+    $payment_code = str_pad(random_int(0, 9999), 4, '0', STR_PAD_LEFT);
+    
+    // Check if code exists
+    while (paymentCodeExists($conn, $payment_code)) {
+        $payment_code = str_pad(random_int(0, 9999), 4, '0', STR_PAD_LEFT);
     }
     
     $expires_at = date('Y-m-d H:i:s', strtotime('+24 hours'));
 
     $stmt = $conn->prepare(
-        "INSERT INTO topup_requests 
-         (user_id, amount, payment_method, reference_code, status, expires_at)
+        "INSERT INTO external_payments 
+         (payment_code, user_id, amount, wallet_balance_at_request, status, partner, expires_at)
          VALUES 
-         (:user_id, :amount, :method, :code, 'pending', :expires_at)"
+         (:payment_code, :user_id, :amount, :wallet_balance, 'pending', :partner, :expires_at)"
     );
 
     $stmt->execute([
+        ':payment_code' => $payment_code,
         ':user_id' => $user_id,
         ':amount' => $amount,
-        ':method' => $method,
-        ':code' => $code,
+        ':wallet_balance' => $wallet_balance,
+        ':partner' => $partner,
         ':expires_at' => $expires_at
     ]);
 
     return [
         'id' => $conn->lastInsertId(),
-        'reference_code' => $code,
+        'payment_code' => $payment_code,
         'amount' => $amount,
         'expires_at' => $expires_at
     ];
 }
 
-function verifyAndCompleteTopup($conn, $reference_code) {
+function paymentCodeExists($conn, $code) {
+    $stmt = $conn->prepare("SELECT id FROM external_payments WHERE payment_code = :code");
+    $stmt->execute([':code' => $code]);
+    return $stmt->fetch() ? true : false;
+}
+
+function verifyAndCompleteTopup($conn, $payment_code) {
     try {
         $conn->beginTransaction();
 
-        // Get the pending request
+        // Get the pending payment
         $stmt = $conn->prepare(
-            "SELECT * FROM topup_requests 
-             WHERE reference_code = :code AND status = 'pending' 
+            "SELECT * FROM external_payments 
+             WHERE payment_code = :code AND status = 'pending' 
              AND expires_at > NOW() FOR UPDATE"
         );
-        $stmt->execute([':code' => $reference_code]);
-        $request = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->execute([':code' => $payment_code]);
+        $payment = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        if (!$request) {
-            throw new Exception('Invalid or expired reference code');
+        if (!$payment) {
+            throw new Exception('Invalid or expired payment code');
         }
 
         // Get user's wallet
         $walletStmt = $conn->prepare(
-            "SELECT id, balance FROM wallets WHERE user_id = :user_id FOR UPDATE"
+            "SELECT id, balance FROM dropx_wallets WHERE user_id = :user_id FOR UPDATE"
         );
-        $walletStmt->execute([':user_id' => $request['user_id']]);
+        $walletStmt->execute([':user_id' => $payment['user_id']]);
         $wallet = $walletStmt->fetch(PDO::FETCH_ASSOC);
 
+        if (!$wallet) {
+            throw new Exception('Wallet not found');
+        }
+
         // Update wallet balance
-        $newBalance = $wallet['balance'] + $request['amount'];
+        $newBalance = $wallet['balance'] + $payment['amount'];
         $updateStmt = $conn->prepare(
-            "UPDATE wallets SET balance = :balance WHERE id = :id"
+            "UPDATE dropx_wallets SET balance = :balance WHERE id = :id"
         );
         $updateStmt->execute([
             ':balance' => $newBalance,
@@ -226,36 +272,30 @@ function verifyAndCompleteTopup($conn, $reference_code) {
         ]);
 
         // Create transaction record
-        $transStmt = $conn->prepare(
-            "INSERT INTO transactions 
-             (user_id, wallet_id, transaction_type, amount, balance_before, 
-              balance_after, description, reference_id, reference_type, status)
-             VALUES 
-             (:user_id, :wallet_id, 'credit', :amount, :balance_before, 
-              :balance_after, :description, :reference_id, 'topup', 'completed')"
-        );
-        
-        $transStmt->execute([
-            ':user_id' => $request['user_id'],
-            ':wallet_id' => $wallet['id'],
-            ':amount' => $request['amount'],
-            ':balance_before' => $wallet['balance'],
-            ':balance_after' => $newBalance,
-            ':description' => 'Wallet top-up via ' . $request['payment_method'],
-            ':reference_id' => $request['id']
-        ]);
+        $transactionData = [
+            'user_id' => $payment['user_id'],
+            'amount' => $payment['amount'],
+            'type' => 'credit',
+            'reference_type' => 'topup',
+            'reference_id' => $payment['id'],
+            'partner' => $payment['partner'],
+            'partner_reference' => $payment_code,
+            'status' => 'completed',
+            'description' => 'Wallet top-up via ' . $payment['partner']
+        ];
+        createTransaction($conn, $transactionData);
 
-        // Update top-up request status
-        $updateReqStmt = $conn->prepare(
-            "UPDATE topup_requests SET status = 'completed' WHERE id = :id"
+        // Update payment status
+        $updateStmt = $conn->prepare(
+            "UPDATE external_payments SET status = 'completed', completed_at = NOW() WHERE id = :id"
         );
-        $updateReqStmt->execute([':id' => $request['id']]);
+        $updateStmt->execute([':id' => $payment['id']]);
 
         $conn->commit();
 
         return [
             'success' => true,
-            'amount' => $request['amount'],
+            'amount' => $payment['amount'],
             'new_balance' => $newBalance,
             'transaction_id' => $conn->lastInsertId()
         ];
@@ -269,13 +309,16 @@ function verifyAndCompleteTopup($conn, $reference_code) {
     }
 }
 
-function processPayment($conn, $user_id, $amount, $order_id, $description) {
+/*********************************
+ * PAYMENT FUNCTIONS
+ *********************************/
+function processPayment($conn, $user_id, $amount, $order_id, $description, $partner = 'wallet') {
     try {
         $conn->beginTransaction();
 
         // Get wallet
         $walletStmt = $conn->prepare(
-            "SELECT id, balance FROM wallets WHERE user_id = :user_id AND is_active = 1 FOR UPDATE"
+            "SELECT id, balance FROM dropx_wallets WHERE user_id = :user_id AND is_active = 1 FOR UPDATE"
         );
         $walletStmt->execute([':user_id' => $user_id]);
         $wallet = $walletStmt->fetch(PDO::FETCH_ASSOC);
@@ -290,33 +333,20 @@ function processPayment($conn, $user_id, $amount, $order_id, $description) {
 
         // Update balance
         $newBalance = $wallet['balance'] - $amount;
-        $updateStmt = $conn->prepare(
-            "UPDATE wallets SET balance = :balance WHERE id = :id"
-        );
-        $updateStmt->execute([
-            ':balance' => $newBalance,
-            ':id' => $wallet['id']
-        ]);
+        updateWalletBalance($conn, $wallet['id'], $newBalance);
 
         // Create transaction
-        $transStmt = $conn->prepare(
-            "INSERT INTO transactions 
-             (user_id, wallet_id, transaction_type, amount, balance_before, 
-              balance_after, description, reference_id, reference_type, status)
-             VALUES 
-             (:user_id, :wallet_id, 'debit', :amount, :balance_before, 
-              :balance_after, :description, :reference_id, 'order', 'completed')"
-        );
-        
-        $transStmt->execute([
-            ':user_id' => $user_id,
-            ':wallet_id' => $wallet['id'],
-            ':amount' => $amount,
-            ':balance_before' => $wallet['balance'],
-            ':balance_after' => $newBalance,
-            ':description' => $description,
-            ':reference_id' => $order_id
-        ]);
+        $transactionData = [
+            'user_id' => $user_id,
+            'amount' => $amount,
+            'type' => 'debit',
+            'reference_type' => 'order',
+            'reference_id' => $order_id,
+            'partner' => $partner,
+            'status' => 'completed',
+            'description' => $description
+        ];
+        createTransaction($conn, $transactionData);
 
         $conn->commit();
 
@@ -336,25 +366,22 @@ function processPayment($conn, $user_id, $amount, $order_id, $description) {
     }
 }
 
-function getExternalPartners($conn) {
-    $stmt = $conn->prepare("SELECT * FROM external_partners WHERE is_active = 1");
-    $stmt->execute();
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
-}
-
+/*********************************
+ * GET WALLET STATS
+ *********************************/
 function getWalletStats($conn, $user_id) {
     // Get wallet balance
     $balance = getWalletBalance($conn, $user_id);
     
-    // Get transaction counts
+    // Get transaction stats
     $stmt = $conn->prepare(
         "SELECT 
             COUNT(*) as total_transactions,
-            SUM(CASE WHEN transaction_type = 'credit' THEN 1 ELSE 0 END) as total_credits,
-            SUM(CASE WHEN transaction_type = 'debit' THEN 1 ELSE 0 END) as total_debits,
-            SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE 0 END) as total_credited,
-            SUM(CASE WHEN transaction_type = 'debit' THEN amount ELSE 0 END) as total_debited
-         FROM transactions 
+            SUM(CASE WHEN type = 'credit' THEN 1 ELSE 0 END) as total_credits,
+            SUM(CASE WHEN type = 'debit' THEN 1 ELSE 0 END) as total_debits,
+            SUM(CASE WHEN type = 'credit' THEN amount ELSE 0 END) as total_credited,
+            SUM(CASE WHEN type = 'debit' THEN amount ELSE 0 END) as total_debited
+         FROM wallet_transactions 
          WHERE user_id = :user_id"
     );
     $stmt->execute([':user_id' => $user_id]);
@@ -377,33 +404,26 @@ function formatTransaction($t) {
         'amount' => floatval($t['amount']),
         'formatted_amount' => CURRENCY_SYMBOL . ' ' . number_format($t['amount'], 2),
         'description' => $t['description'],
-        'type' => $t['transaction_type'],
+        'type' => $t['type'],
         'status' => $t['status'],
         'date' => $t['created_at'],
         'formatted_date' => date('M d, Y • h:i A', strtotime($t['created_at'])),
-        'balance_after' => floatval($t['balance_after'])
+        'partner' => $t['partner'],
+        'reference' => $t['partner_reference']
     ];
 }
 
 /*********************************
- * ROUTER - EXACT PATTERN FROM merchants.php
+ * ROUTER
  *********************************/
 try {
     $method = $_SERVER['REQUEST_METHOD'];
     $requestUri = $_SERVER['REQUEST_URI'];
     
-    // Remove query string if present
+    // Parse URL
     $path = parse_url($requestUri, PHP_URL_PATH);
     $queryString = parse_url($requestUri, PHP_URL_QUERY);
-    
-    // Parse query parameters
     parse_str($queryString ?? '', $queryParams);
-    
-    error_log("=== WALLET ROUTER DEBUG ===");
-    error_log("Full URI: " . $requestUri);
-    error_log("Path: " . $path);
-    error_log("Query String: " . ($queryString ?: 'none'));
-    error_log("Method: " . $method);
     
     // Initialize database
     $conn = initDatabase();
@@ -413,131 +433,29 @@ try {
         ResponseHandler::error('Database connection failed', 500);
     }
     
-    // Get endpoint from query string (like in merchants.php)
+    // Get endpoint from query string
     $endpoint = $_GET['endpoint'] ?? '';
     
-    // Public endpoints (no auth required)
+    // Public test endpoint
     if ($endpoint === 'test') {
         ResponseHandler::success([
             'message' => 'Wallet API is working',
-            'endpoints' => [
-                'GET ?endpoint=balance' => 'Get wallet balance',
-                'GET ?endpoint=transactions' => 'Get recent transactions',
-                'GET ?endpoint=stats' => 'Get wallet statistics',
-                'GET ?endpoint=partners' => 'Get external partners',
-                'POST ?endpoint=topup' => 'Create top-up request',
-                'POST ?endpoint=verify' => 'Verify top-up payment',
-                'POST ?endpoint=debit' => 'Process payment',
-                'POST ?endpoint=login' => 'Login',
-                'POST ?endpoint=register' => 'Register'
+            'tables' => [
+                'dropx_wallets',
+                'wallet_transactions', 
+                'external_payments'
             ]
         ]);
-    }
-    
-    // Login endpoint (public)
-    if ($method === 'POST' && $endpoint === 'login') {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!$input) $input = $_POST;
-        
-        $email = $input['email'] ?? '';
-        $password = $input['password'] ?? '';
-        
-        $stmt = $conn->prepare("SELECT * FROM users WHERE email = :email AND is_active = 1");
-        $stmt->execute([':email' => $email]);
-        $user = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if ($user && password_verify($password, $user['password_hash'])) {
-            // Generate new token
-            $token = bin2hex(random_bytes(32));
-            $updateStmt = $conn->prepare(
-                "UPDATE users SET api_token = :token, api_token_expiry = DATE_ADD(NOW(), INTERVAL 30 DAY) WHERE id = :id"
-            );
-            $updateStmt->execute([':token' => $token, ':id' => $user['id']]);
-            
-            $_SESSION['user_id'] = $user['id'];
-            
-            ResponseHandler::success([
-                'user_id' => $user['id'],
-                'username' => $user['username'],
-                'email' => $user['email'],
-                'phone' => $user['phone'],
-                'token' => $token
-            ], 'Login successful');
-        } else {
-            ResponseHandler::error('Invalid email or password', 401);
-        }
-    }
-    
-    // Register endpoint (public)
-    if ($method === 'POST' && $endpoint === 'register') {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!$input) $input = $_POST;
-        
-        $username = $input['username'] ?? '';
-        $email = $input['email'] ?? '';
-        $phone = $input['phone'] ?? '';
-        $password = $input['password'] ?? '';
-        
-        // Validate input
-        $errors = [];
-        if (strlen($username) < 3) $errors[] = 'Username must be at least 3 characters';
-        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Invalid email';
-        if (!preg_match('/^[0-9]{10,12}$/', $phone)) $errors[] = 'Invalid phone number';
-        if (strlen($password) < 6) $errors[] = 'Password must be at least 6 characters';
-        
-        if (!empty($errors)) {
-            ResponseHandler::error('Validation failed', 400, $errors);
-        }
-        
-        // Check if user exists
-        $checkStmt = $conn->prepare(
-            "SELECT id FROM users WHERE email = :email OR phone = :phone"
-        );
-        $checkStmt->execute([':email' => $email, ':phone' => $phone]);
-        
-        if ($checkStmt->fetch()) {
-            ResponseHandler::error('Email or phone already registered', 409);
-        }
-        
-        // Create user
-        $password_hash = password_hash($password, PASSWORD_DEFAULT);
-        $token = bin2hex(random_bytes(32));
-        
-        $stmt = $conn->prepare(
-            "INSERT INTO users (username, email, phone, password_hash, api_token, api_token_expiry) 
-             VALUES (:username, :email, :phone, :password, :token, DATE_ADD(NOW(), INTERVAL 30 DAY))"
-        );
-        
-        $stmt->execute([
-            ':username' => $username,
-            ':email' => $email,
-            ':phone' => $phone,
-            ':password' => $password_hash,
-            ':token' => $token
-        ]);
-        
-        $userId = $conn->lastInsertId();
-        
-        // Create wallet
-        getOrCreateWallet($conn, $userId);
-        
-        ResponseHandler::success([
-            'user_id' => $userId,
-            'username' => $username,
-            'email' => $email,
-            'token' => $token
-        ], 'Registration successful', 201);
     }
     
     // Authenticate for protected endpoints
     $userId = authenticateUser($conn);
     
-    // If no user ID and not a public endpoint, return error
     if (!$userId && !in_array($endpoint, ['test', 'login', 'register'])) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Route protected endpoints based on $endpoint (like in merchants.php)
+    // Route endpoints
     switch ($endpoint) {
         case 'balance':
             if ($method === 'GET') {
@@ -561,11 +479,9 @@ try {
                 
                 if ($type === 'recent') {
                     $limit = min($limit, 10);
-                    $transactions = getUserTransactions($userId, $limit, 0);
-                } else {
-                    $transactions = getUserTransactions($userId, $limit, $offset);
                 }
                 
+                $transactions = getUserTransactions($conn, $userId, $limit, $offset);
                 $formatted = array_map('formatTransaction', $transactions);
                 
                 ResponseHandler::success([
@@ -592,23 +508,13 @@ try {
             }
             break;
             
-        case 'partners':
-            if ($method === 'GET') {
-                $partners = getExternalPartners($conn);
-                
-                ResponseHandler::success([
-                    'partners' => $partners
-                ]);
-            }
-            break;
-            
         case 'topup':
             if ($method === 'POST') {
                 $input = json_decode(file_get_contents('php://input'), true);
                 if (!$input) $input = $_POST;
                 
                 $amount = floatval($input['amount'] ?? 0);
-                $method = $input['method'] ?? '';
+                $partner = $input['method'] ?? ''; // 'airtel_money', 'mpamba', 'bank_transfer'
                 
                 // Validate
                 if ($amount < 100) {
@@ -619,39 +525,43 @@ try {
                 }
                 
                 $validMethods = ['airtel_money', 'mpamba', 'bank_transfer'];
-                if (!in_array($method, $validMethods)) {
+                if (!in_array($partner, $validMethods)) {
                     ResponseHandler::error('Invalid payment method', 400);
                 }
                 
-                $result = createTopupRequest($conn, $userId, $amount, $method);
+                // Get current wallet balance
+                $wallet = getWalletBalance($conn, $userId);
+                $wallet_balance = $wallet['balance'] ?? 0;
+                
+                $result = createTopupRequest($conn, $userId, $amount, $partner, $wallet_balance);
                 
                 // Get payment instructions
                 $instructions = [
                     'airtel_money' => [
                         'Send to: 0999 000 000',
-                        'Reference: ' . $result['reference_code'],
+                        'Payment Code: ' . $result['payment_code'],
                         'Amount: MWK ' . number_format($amount, 2)
                     ],
                     'mpamba' => [
                         'Send to: 0888 111 111',
-                        'Reference: ' . $result['reference_code'],
+                        'Payment Code: ' . $result['payment_code'],
                         'Amount: MWK ' . number_format($amount, 2)
                     ],
                     'bank_transfer' => [
                         'Bank: NBS Bank',
                         'Account: 1234567890',
-                        'Reference: DROPX-' . $result['reference_code'],
+                        'Reference: DROPX-' . $result['payment_code'],
                         'Amount: MWK ' . number_format($amount, 2)
                     ]
                 ];
                 
                 ResponseHandler::success([
-                    'reference_code' => $result['reference_code'],
+                    'payment_code' => $result['payment_code'],
                     'amount' => $amount,
                     'formatted_amount' => CURRENCY_SYMBOL . ' ' . number_format($amount, 2),
-                    'method' => $method,
+                    'method' => $partner,
                     'expires_at' => $result['expires_at'],
-                    'instructions' => $instructions[$method]
+                    'instructions' => $instructions[$partner]
                 ], 'Top-up request created');
             }
             break;
@@ -661,13 +571,13 @@ try {
                 $input = json_decode(file_get_contents('php://input'), true);
                 if (!$input) $input = $_POST;
                 
-                $reference_code = $input['reference_code'] ?? '';
+                $payment_code = $input['payment_code'] ?? $input['reference_code'] ?? '';
                 
-                if (empty($reference_code)) {
-                    ResponseHandler::error('Reference code required', 400);
+                if (empty($payment_code)) {
+                    ResponseHandler::error('Payment code required', 400);
                 }
                 
-                $result = verifyAndCompleteTopup($conn, $reference_code);
+                $result = verifyAndCompleteTopup($conn, $payment_code);
                 
                 if ($result['success']) {
                     ResponseHandler::success([
@@ -714,13 +624,6 @@ try {
                     ResponseHandler::error($result['error'], 400);
                 }
             }
-            break;
-            
-        case 'health':
-            ResponseHandler::success([
-                'status' => 'healthy',
-                'timestamp' => date('Y-m-d H:i:s')
-            ]);
             break;
             
         default:
