@@ -538,7 +538,7 @@ function getTrackableOrderGroups($conn, $userId, $limit, $sortBy, $sortOrder) {
     
     $stmt = $conn->prepare($sql);
     $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
-    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':limit', (int)$limit, PDO::PARAM_INT);
     $stmt->execute();
     $groups = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
@@ -1213,10 +1213,14 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
             ORDER BY o.$sortBy $sortOrder
             LIMIT ?";
     
+    $stmt = $conn->prepare($sql);
+    
+    // Build parameters array
     $params = array_merge([$userId], $trackableStatuses, [$limit]);
     
-    $stmt = $conn->prepare($sql);
+    // Execute with parameters
     $stmt->execute($params);
+    
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     $formattedOrders = [];
@@ -1242,7 +1246,6 @@ function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
         'orders' => $formattedOrders
     ]);
 }
-
 /*********************************
  * GET DRIVER LOCATION
  *********************************/
