@@ -1,55 +1,84 @@
 <?php
-/*********************************
- * ORDER TRACKING API - track.php
- * Handles all tracking-related endpoints for DropX
- * Supports both single merchant and multi-merchant orders
- *********************************/
+/**
+ * DROPX TRACKING API
+ * 
+ * Unified tracking system for both single and multi-merchant orders
+ * Optimized for mobile applications
+ * 
+ * @author DropX Development Team
+ * @version 2.0.0
+ */
 
 /*********************************
- * CORS Configuration
+ * API CONFIGURATION
  *********************************/
+
+// Error reporting (disable in production)
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/../logs/tracking-error.log');
+
+// Mobile-optimized headers
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
-header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, Cookie");
+header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Session-Token, X-App-Version, X-Platform");
+header("Access-Control-Max-Age: 3600");
 header("Content-Type: application/json; charset=UTF-8");
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Pragma: no-cache");
 
+// Handle preflight requests
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit();
 }
 
 /*********************************
- * ERROR REPORTING FOR DEBUGGING
+ * REQUIRED FILES
  *********************************/
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
- * SESSION CONFIGURATION
+ * CONSTANTS
  *********************************/
-function initializeSession() {
-    // Check if session token is in headers
-    $sessionToken = null;
-    
-    // 1. Check X-Session-Token header
-    if (isset($_SERVER['HTTP_X_SESSION_TOKEN'])) {
-        $sessionToken = $_SERVER['HTTP_X_SESSION_TOKEN'];
-    }
-    
-    // 2. Check Cookie header for PHPSESSID
-    if (!$sessionToken && isset($_SERVER['HTTP_COOKIE'])) {
-        $cookies = [];
-        parse_str(str_replace('; ', '&', $_SERVER['HTTP_COOKIE']), $cookies);
-        if (isset($cookies['PHPSESSID'])) {
-            $sessionToken = $cookies['PHPSESSID'];
-        }
-    }
-    
-    if (!$sessionToken) {
-        return false;
-    }
-    
+define('API_VERSION', '2.0.0');
+define('MIN_APP_VERSION', '1.5.0');
+
+define('ORDER_STATUSES', [
+    'pending' => ['progress' => 0.1, 'label' => 'Order Placed', 'color' => '#FFA500'],
+    'confirmed' => ['progress' => 0.2, 'label' => 'Confirmed', 'color' => '#4CAF50'],
+    'preparing' => ['progress' => 0.4, 'label' => 'Preparing', 'color' => '#2196F3'],
+    'ready' => ['progress' => 0.6, 'label' => 'Ready for Pickup', 'color' => '#9C27B0'],
+    'picked_up' => ['progress' => 0.8, 'label' => 'Picked Up', 'color' => '#FF9800'],
+    'on_the_way' => ['progress' => 0.9, 'label' => 'On The Way', 'color' => '#00BCD4'],
+    'arrived' => ['progress' => 0.95, 'label' => 'Arrived', 'color' => '#8BC34A'],
+    'delivered' => ['progress' => 1.0, 'label' => 'Delivered', 'color' => '#4CAF50'],
+    'cancelled' => ['progress' => 0.0, 'label' => 'Cancelled', 'color' => '#F44336']
+]);
+
+define('DROPX_STATUSES', [
+    'pending' => ['progress' => 0.1, 'label' => 'Order Received'],
+    'assigned' => ['progress' => 0.2, 'label' => 'Driver Assigned'],
+    'heading_to_pickup' => ['progress' => 0.3, 'label' => 'Heading to Pickup'],
+    'arrived_at_pickup' => ['progress' => 0.4, 'label' => 'Arrived at Merchant'],
+    'pickup_in_progress' => ['progress' => 0.5, 'label' => 'Picking Up'],
+    'picked_up' => ['progress' => 0.6, 'label' => 'Picked Up'],
+    'heading_to_delivery' => ['progress' => 0.7, 'label' => 'Heading to You'],
+    'arrived' => ['progress' => 0.9, 'label' => 'Arrived'],
+    'delivered' => ['progress' => 1.0, 'label' => 'Delivered']
+]);
+
+define('TRACKABLE_STATUSES', [
+    'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'
+]);
+
+/*********************************
+ * SESSION/AUTH CONFIG
+ *********************************/
+if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
         'lifetime' => 86400 * 30,
         'path' => '/',
@@ -58,1485 +87,754 @@ function initializeSession() {
         'httponly' => true,
         'samesite' => 'None'
     ]);
-    
-    session_id($sessionToken);
     session_start();
-    
-    return true;
 }
 
-/*********************************
- * AUTHENTICATION CHECK
- *********************************/
 function checkAuthentication() {
-    initializeSession();
+    $sessionToken = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? $_GET['session_token'] ?? null;
     
-    if (empty($_SESSION['user_id']) || empty($_SESSION['logged_in'])) {
-        return false;
+    if ($sessionToken) {
+        session_id($sessionToken);
+        session_start();
     }
     
-    return $_SESSION['user_id'];
+    if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
+        return $_SESSION['user_id'];
+    }
+    return null;
 }
 
 /*********************************
- * BASE URL CONFIGURATION
+ * BASE URL
  *********************************/
 $baseUrl = "https://dropx12-production.up.railway.app";
 
-require_once __DIR__ . '/../config/database.php';
-require_once __DIR__ . '/../includes/ResponseHandler.php';
-
 /*********************************
- * DROPX HUB CONFIGURATION
- * Central office where multi-merchant orders are consolidated
- *********************************/
-define('DROPX_HUB', [
-    'id' => 'hub_001',
-    'name' => 'DropX Central Consolidation Hub',
-    'address' => 'Area 3, Lilongwe, Malawi',
-    'phone' => '+265 999 123 456',
-    'latitude' => -13.962612,
-    'longitude' => 33.774119,
-    'operating_hours' => '24/7',
-    'manager' => 'John Banda'
-]);
-
-/*********************************
- * MAIN ROUTER
+ * MAIN HANDLER
  *********************************/
 try {
-    $method = $_SERVER['REQUEST_METHOD'];
-    
-    if ($method === 'POST') {
-        handlePostRequest();
-    } else {
-        ResponseHandler::error('Method not allowed', 405);
+    // Validate app version if provided
+    $appVersion = $_SERVER['HTTP_X_APP_VERSION'] ?? '0.0.0';
+    if (version_compare($appVersion, MIN_APP_VERSION, '<')) {
+        ResponseHandler::error('App update required', 426, [
+            'update_required' => true,
+            'min_version' => MIN_APP_VERSION
+        ]);
     }
-} catch (Exception $e) {
-    error_log("Track API Error: " . $e->getMessage());
-    ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
-}
 
-/*********************************
- * POST REQUESTS HANDLER
- *********************************/
-function handlePostRequest() {
-    global $baseUrl;
-    $db = new Database();
-    $conn = $db->getConnection();
-
+    // Get request data
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         $input = $_POST;
     }
     
-    $action = $input['action'] ?? '';
+    $action = $input['action'] ?? $_GET['action'] ?? '';
     
-    $userId = checkAuthentication();
-    if ($userId === false && !in_array($action, ['track_order', 'track_order_group'])) {
-        ResponseHandler::error('Authentication required. Please login.', 401);
+    if (empty($action)) {
+        ResponseHandler::error('Action parameter required', 400, 'MISSING_ACTION');
     }
 
+    // Initialize database
+    $db = new Database();
+    $conn = $db->getConnection();
+    
+    // Route to appropriate handler
     switch ($action) {
-        // Single order tracking
-        case 'track_order':
-            $orderIdentifier = $input['order_identifier'] ?? '';
-            if (!$orderIdentifier) {
-                ResponseHandler::error('Order identifier is required', 400);
-            }
-            getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId);
+        // Track an order (public - no auth required)
+        case 'track':
+            handleTrackOrder($conn, $input);
             break;
             
-        // Multi-merchant order group tracking
-        case 'track_order_group':
-            $orderGroupId = $input['order_group_id'] ?? '';
-            if (!$orderGroupId) {
-                ResponseHandler::error('Order group ID is required', 400);
-            }
-            trackOrderGroup($conn, $orderGroupId, $baseUrl, $userId);
-            break;
-            
-        // Get all trackable orders
-        case 'get_trackable':
-            $limit = $input['limit'] ?? 50;
-            $sortBy = $input['sort_by'] ?? 'created_at';
-            $sortOrder = $input['sort_order'] ?? 'DESC';
-            getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder);
-            break;
-            
-        // Get all trackable order groups
-        case 'get_trackable_groups':
-            $limit = $input['limit'] ?? 50;
-            $sortBy = $input['sort_by'] ?? 'created_at';
-            $sortOrder = $input['sort_order'] ?? 'DESC';
-            getTrackableOrderGroups($conn, $userId, $limit, $sortBy, $sortOrder);
-            break;
-            
-        // Get driver location for single order
+        // Get driver location (public tracking)
         case 'driver_location':
-            $orderId = $input['order_id'] ?? '';
-            if (!$orderId) {
-                ResponseHandler::error('Order ID is required', 400);
+            handleDriverLocation($conn, $input);
+            break;
+            
+        // Get real-time updates (public tracking)
+        case 'realtime':
+            handleRealTimeUpdates($conn, $input);
+            break;
+            
+        // Get route information (public tracking)
+        case 'route':
+            handleRouteInfo($conn, $input);
+            break;
+            
+        // Get tracking summary (requires auth)
+        case 'summary':
+            $userId = checkAuthentication();
+            if (!$userId) {
+                ResponseHandler::error('Authentication required', 401, 'AUTH_REQUIRED');
             }
-            getDriverLocation($conn, $userId, $orderId);
+            handleTrackingSummary($conn, $userId);
             break;
             
-        // Get all driver locations for a group
-        case 'driver_location_group':
-            $orderGroupId = $input['order_group_id'] ?? '';
-            if (!$orderGroupId) {
-                ResponseHandler::error('Order group ID is required', 400);
+        // Get all trackable orders for user (requires auth)
+        case 'get_trackable':
+            $userId = checkAuthentication();
+            if (!$userId) {
+                ResponseHandler::error('Authentication required', 401, 'AUTH_REQUIRED');
             }
-            getGroupDriverLocations($conn, $userId, $orderGroupId);
+            handleGetTrackableOrders($conn, $userId);
             break;
             
-        // Get real-time updates for single order
-        case 'realtime_updates':
-            $orderId = $input['order_id'] ?? '';
-            $lastUpdate = $input['last_update'] ?? null;
-            if (!$orderId) {
-                ResponseHandler::error('Order ID is required', 400);
+        // Get driver contact (requires auth)
+        case 'driver_contact':
+            $userId = checkAuthentication();
+            if (!$userId) {
+                ResponseHandler::error('Authentication required', 401, 'AUTH_REQUIRED');
             }
-            getRealTimeUpdates($conn, $userId, $orderId, $lastUpdate);
+            handleDriverContact($conn, $input, $userId);
             break;
             
-        // Get real-time updates for entire group
-        case 'realtime_updates_group':
-            $orderGroupId = $input['order_group_id'] ?? '';
-            $lastUpdate = $input['last_update'] ?? null;
-            if (!$orderGroupId) {
-                ResponseHandler::error('Order group ID is required', 400);
+        // Share tracking link (requires auth)
+        case 'share':
+            $userId = checkAuthentication();
+            if (!$userId) {
+                ResponseHandler::error('Authentication required', 401, 'AUTH_REQUIRED');
             }
-            getGroupRealTimeUpdates($conn, $userId, $orderGroupId, $lastUpdate);
-            break;
-            
-        // Call driver (get contact info)
-        case 'call_driver':
-            $orderId = $input['order_id'] ?? '';
-            if (!$orderId) {
-                ResponseHandler::error('Order ID is required', 400);
-            }
-            getDriverContact($conn, $userId, $orderId);
-            break;
-            
-        // Get all driver contacts for a group
-        case 'call_driver_group':
-            $orderGroupId = $input['order_group_id'] ?? '';
-            if (!$orderGroupId) {
-                ResponseHandler::error('Order group ID is required', 400);
-            }
-            getGroupDriverContacts($conn, $userId, $orderGroupId);
-            break;
-            
-        // Share tracking link for single order
-        case 'share_tracking':
-            $orderId = $input['order_id'] ?? '';
-            if (!$orderId) {
-                ResponseHandler::error('Order ID is required', 400);
-            }
-            shareTracking($conn, $userId, $orderId);
-            break;
-            
-        // Share tracking link for entire group
-        case 'share_tracking_group':
-            $orderGroupId = $input['order_group_id'] ?? '';
-            if (!$orderGroupId) {
-                ResponseHandler::error('Order group ID is required', 400);
-            }
-            shareGroupTracking($conn, $userId, $orderGroupId);
-            break;
-            
-        // Get latest active order
-        case 'latest_active':
-            getLatestActiveOrder($conn, $userId);
-            break;
-            
-        // Get latest active order group
-        case 'latest_active_group':
-            getLatestActiveOrderGroup($conn, $userId);
-            break;
-            
-        // Get tracking status summary
-        case 'tracking_summary':
-            getTrackingSummary($conn, $userId);
+            handleShareTracking($conn, $input, $userId);
             break;
             
         default:
-            ResponseHandler::error('Invalid action: ' . $action, 400);
+            ResponseHandler::error('Invalid action', 400, 'INVALID_ACTION');
     }
+    
+} catch (PDOException $e) {
+    error_log("Database Error: " . $e->getMessage());
+    ResponseHandler::error('Database error occurred', 500, 'DB_ERROR');
+} catch (Exception $e) {
+    error_log("API Error: " . $e->getMessage());
+    ResponseHandler::error('Server error occurred', 500, 'SERVER_ERROR');
 }
 
 /*********************************
- * TRACK ORDER GROUP
- * Retrieves detailed tracking for a multi-merchant order group
+ * TRACK ORDER HANDLER
+ * Public - no auth required
  *********************************/
-function trackOrderGroup($conn, $orderGroupId, $baseUrl, $userId = null) {
-    // Get order group info
-    $groupSql = "SELECT 
-                    og.*,
-                    u.full_name as user_name,
-                    u.phone as user_phone,
-                    u.email as user_email
-                FROM order_groups og
-                LEFT JOIN users u ON og.user_id = u.id
-                WHERE og.id = :group_id";
+function handleTrackOrder($conn, $input) {
+    $identifier = $input['tracking_id'] ?? $input['order_id'] ?? $input['order_number'] ?? '';
     
-    $params = [':group_id' => $orderGroupId];
-    
-    // If user is authenticated, check ownership
-    if ($userId) {
-        $groupSql .= " AND og.user_id = :user_id";
-        $params[':user_id'] = $userId;
-    }
-    
-    $groupStmt = $conn->prepare($groupSql);
-    $groupStmt->execute($params);
-    $group = $groupStmt->fetch(PDO::FETCH_ASSOC);
-
-    if (!$group) {
-        ResponseHandler::error('Order group not found', 404);
+    if (empty($identifier)) {
+        ResponseHandler::error('Tracking ID or Order ID required', 400, 'MISSING_ID');
     }
 
-    // Get all orders in this group with their tracking info
-    $ordersSql = "SELECT 
-                    o.id,
-                    o.order_number,
-                    o.user_id,
-                    o.merchant_id,
-                    o.driver_id,
-                    o.subtotal,
-                    o.delivery_fee,
-                    o.total_amount,
-                    o.payment_method,
-                    o.delivery_address,
-                    o.special_instructions,
-                    o.status,
-                    o.created_at,
-                    o.updated_at,
-                    m.name as merchant_name,
-                    m.address as merchant_address,
-                    m.phone as merchant_phone,
-                    m.image_url as merchant_image,
-                    m.latitude as merchant_latitude,
-                    m.longitude as merchant_longitude,
-                    d.name as driver_name,
-                    d.phone as driver_phone,
-                    d.current_latitude,
-                    d.current_longitude,
-                    d.vehicle_type,
-                    d.vehicle_number,
-                    d.image_url as driver_image,
-                    (
-                        SELECT status 
-                        FROM order_tracking 
-                        WHERE order_id = o.id 
-                        ORDER BY created_at DESC 
-                        LIMIT 1
-                    ) as tracking_status,
-                    (
-                        SELECT estimated_delivery 
-                        FROM order_tracking 
-                        WHERE order_id = o.id 
-                        ORDER BY created_at DESC 
-                        LIMIT 1
-                    ) as estimated_delivery,
-                    (
-                        SELECT location_updates 
-                        FROM order_tracking 
-                        WHERE order_id = o.id 
-                        ORDER BY created_at DESC 
-                        LIMIT 1
-                    ) as location_updates
-                FROM orders o
-                LEFT JOIN merchants m ON o.merchant_id = m.id
-                LEFT JOIN drivers d ON o.driver_id = d.id
-                WHERE o.order_group_id = :group_id
-                ORDER BY o.created_at";
-
-    $ordersStmt = $conn->prepare($ordersSql);
-    $ordersStmt->execute([':group_id' => $orderGroupId]);
-    $orders = $ordersStmt->fetchAll(PDO::FETCH_ASSOC);
-
-    // Get all order items for this group
-    $orderIds = array_column($orders, 'id');
-    $itemsByOrder = [];
+    // Try to find the order by various identifiers
+    $order = findTrackableOrder($conn, $identifier);
     
-    if (!empty($orderIds)) {
-        $placeholders = implode(',', array_fill(0, count($orderIds), '?'));
-        
-        $itemsSql = "SELECT 
-                        oi.order_id,
-                        oi.id,
-                        oi.item_name as name,
-                        oi.quantity,
-                        oi.unit_price as price,
-                        oi.total_price as total
-                    FROM order_items oi
-                    WHERE oi.order_id IN ($placeholders)
-                    ORDER BY oi.id";
-        
-        $itemsStmt = $conn->prepare($itemsSql);
-        $itemsStmt->execute($orderIds);
-        $allItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach ($allItems as $item) {
-            $itemsByOrder[$item['order_id']][] = $item;
-        }
+    if (!$order) {
+        ResponseHandler::error('Order not found', 404, 'ORDER_NOT_FOUND');
     }
 
-    // Format each order's tracking data
-    $formattedOrders = [];
-    $groupProgress = 0;
-    $totalProgress = 0;
-    $completedOrders = 0;
+    // Get all orders in the same group if this is a multi-merchant order
+    $groupOrders = [];
+    $pickupProgress = null;
+    $driver = null;
+    $timeline = [];
+    $waypoints = [];
+
+    if ($order['order_group_id']) {
+        // Get all orders in the group
+        $groupOrders = getGroupOrdersForTracking($conn, $order['order_group_id']);
+        
+        // Get pickup progress
+        $pickupProgress = getPickupProgress($conn, $order['order_group_id']);
+        
+        // Build timeline from group tracking
+        $timeline = getGroupTimeline($conn, $order['order_group_id']);
+        
+        // Get route waypoints
+        $waypoints = getGroupWaypoints($conn, $order['order_group_id']);
+    } else {
+        // Single order - build timeline from order tracking
+        $timeline = getOrderTimeline($conn, $order['id']);
+    }
+
+    // Get driver information if assigned
+    if ($order['driver_id']) {
+        $driver = getDriverTrackingInfo($conn, $order['driver_id']);
+    }
+
+    // Get estimated delivery times
+    $estimatedDelivery = $order['dropx_estimated_delivery_time'] ?? $order['estimated_delivery'];
     
-    foreach ($orders as $order) {
-        // Format merchant image
-        $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
-        
-        // Format driver image
-        $driverImage = formatImageUrl($order['driver_image'], $baseUrl, 'drivers');
-        
-        // Calculate progress for this order
-        $orderProgress = calculateDeliveryProgress($order['status']);
-        $totalProgress += $orderProgress;
-        
-        if ($orderProgress >= 1.0) {
-            $completedOrders++;
-        }
-        
-        // Parse location updates
-        $locationUpdates = [];
-        if (!empty($order['location_updates'])) {
-            $locationUpdates = json_decode($order['location_updates'], true);
-            if (!is_array($locationUpdates)) {
-                $locationUpdates = [];
-            }
-        }
-        
-        // Get items for this order
-        $orderItems = isset($itemsByOrder[$order['id']]) ? $itemsByOrder[$order['id']] : [];
-        
-        // Build driver info
-        $driverInfo = null;
-        if ($order['driver_id']) {
-            $driverInfo = [
-                'id' => $order['driver_id'],
-                'name' => $order['driver_name'] ?? 'Driver',
-                'phone' => $order['driver_phone'] ?? '',
-                'vehicle' => $order['vehicle_type'] ?? 'Motorcycle',
-                'vehicle_number' => $order['vehicle_number'] ?? '',
-                'image_url' => $driverImage,
-                'latitude' => floatval($order['current_latitude'] ?? 0),
-                'longitude' => floatval($order['current_longitude'] ?? 0)
-            ];
-        }
-        
-        // Build merchant info
-        $merchantInfo = [
+    // Calculate progress percentage
+    $progress = calculateTrackingProgress($order, $pickupProgress);
+    
+    // Get status display info
+    $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
+
+    // Build response
+    $response = [
+        'tracking' => [
+            'id' => $order['dropx_tracking_id'] ?? $order['order_number'],
+            'order_number' => $order['order_number'],
+            'order_id' => $order['id'],
+            'status' => $order['status'],
+            'dropx_status' => $order['dropx_pickup_status'],
+            'display_status' => $statusInfo['label'],
+            'status_color' => $statusInfo['color'],
+            'progress' => $progress,
+            'estimated_delivery' => $estimatedDelivery,
+            'estimated_pickup' => $order['dropx_estimated_pickup_time'],
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at'],
+            'is_multi_merchant' => !empty($order['order_group_id']),
+            'merchant_count' => $order['merchant_count'] ?? 1,
+            'pickup_progress' => $pickupProgress
+        ],
+        'delivery' => [
+            'address' => $order['delivery_address'],
+            'instructions' => $order['special_instructions']
+        ],
+        'merchant' => [
             'id' => $order['merchant_id'],
             'name' => $order['merchant_name'],
-            'address' => $order['merchant_address'] ?? '',
-            'phone' => $order['merchant_phone'] ?? '',
-            'image_url' => $merchantImage,
-            'latitude' => floatval($order['merchant_latitude'] ?? 0),
-            'longitude' => floatval($order['merchant_longitude'] ?? 0)
-        ];
-        
-        $formattedOrders[] = [
-            'id' => $order['id'],
-            'order_number' => $order['order_number'],
-            'status' => $order['status'],
-            'progress' => $orderProgress,
-            'merchant' => $merchantInfo,
-            'driver' => $driverInfo,
-            'items' => $orderItems,
-            'item_count' => count($orderItems),
-            'total_items' => array_sum(array_column($orderItems, 'quantity')),
-            'delivery_address' => $order['delivery_address'],
-            'estimated_delivery' => $order['estimated_delivery'],
-            'location_updates' => $locationUpdates,
-            'created_at' => $order['created_at'],
-            'updated_at' => $order['updated_at'],
-            'payment_method' => $order['payment_method'],
-            'amounts' => [
-                'subtotal' => floatval($order['subtotal']),
-                'delivery_fee' => floatval($order['delivery_fee']),
-                'total' => floatval($order['total_amount'])
-            ]
-        ];
-    }
-    
-    // Calculate overall group progress
-    $orderCount = count($orders);
-    $groupProgress = $orderCount > 0 ? $totalProgress / $orderCount : 0;
-    
-    // Determine overall group status
-    $groupStatus = determineGroupStatus($orders);
-    
-    // Build consolidated timeline
-    $consolidatedTimeline = buildGroupStatusTimeline($orders);
-    
-    ResponseHandler::success([
-        'group' => [
-            'id' => $group['id'],
-            'dropx_tracking_id' => $group['dropx_tracking_id'] ?? null,
-            'tracking_url' => $group['dropx_tracking_id'] ? "https://dropx.com/track/" . $group['dropx_tracking_id'] : null,
-            'user' => [
-                'name' => $group['user_name'] ?? '',
-                'phone' => $group['user_phone'] ?? '',
-                'email' => $group['user_email'] ?? ''
-            ],
-            'status' => $groupStatus,
-            'original_status' => $group['status'],
-            'progress' => $groupProgress,
-            'order_count' => $orderCount,
-            'completed_orders' => $completedOrders,
-            'created_at' => $group['created_at'],
-            'updated_at' => $group['updated_at'],
-            'total_amount' => floatval($group['total_amount'])
+            'address' => $order['merchant_address'],
+            'phone' => maskPhoneNumber($order['merchant_phone']),
+            'image' => formatImageUrl($order['merchant_image'])
         ],
-        'orders' => $formattedOrders,
-        'timeline' => $consolidatedTimeline
-    ]);
-}
-
-/*********************************
- * GET TRACKABLE ORDER GROUPS
- *********************************/
-function getTrackableOrderGroups($conn, $userId, $limit, $sortBy, $sortOrder) {
-    // Validate sort parameters
-    $allowedSortColumns = ['created_at', 'total_amount'];
-    $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
-    $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
-    
-    // Ensure limit is an integer
-    $limit = min(max((int)$limit, 1), 100);
-    
-    // Trackable statuses for orders within groups
-    $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
-    $statusPlaceholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
-    
-    // Get groups with at least one trackable order
-    $sql = "SELECT DISTINCT
-                og.id,
-                og.total_amount,
-                og.status,
-                og.created_at,
-                og.updated_at,
-                og.dropx_tracking_id,
-                COUNT(o.id) as order_count,
-                GROUP_CONCAT(DISTINCT m.name SEPARATOR ', ') as merchant_names,
-                SUM(CASE 
-                    WHEN o.status IN ($statusPlaceholders) 
-                    THEN 1 ELSE 0 
-                END) as trackable_orders
-            FROM order_groups og
-            JOIN orders o ON og.id = o.order_group_id
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE og.user_id = ?
-            GROUP BY og.id
-            HAVING trackable_orders > 0
-            ORDER BY og.$sortBy $sortOrder
-            LIMIT ?";
-    
-    $stmt = $conn->prepare($sql);
-    
-    // Build parameters array
-    $params = array_merge([$userId], $trackableStatuses, [$limit]);
-    
-    if (!$stmt->execute($params)) {
-        $error = $stmt->errorInfo();
-        error_log("SQL Error in getTrackableOrderGroups: " . print_r($error, true));
-        ResponseHandler::error('Database error: ' . $error[2], 500);
-    }
-    
-    $groups = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    $formattedGroups = [];
-    foreach ($groups as $group) {
-        $formattedGroups[] = [
-            'id' => $group['id'],
-            'dropx_tracking_id' => $group['dropx_tracking_id'],
-            'tracking_url' => $group['dropx_tracking_id'] ? "https://dropx.com/track/" . $group['dropx_tracking_id'] : null,
-            'merchant_names' => $group['merchant_names'],
-            'order_count' => intval($group['order_count']),
-            'total_amount' => floatval($group['total_amount']),
-            'status' => $group['status'],
-            'created_at' => $group['created_at'],
-            'updated_at' => $group['updated_at']
-        ];
-    }
-    
-    ResponseHandler::success([
-        'groups' => $formattedGroups
-    ]);
-}
-
-/*********************************
- * GET GROUP DRIVER LOCATIONS
- *********************************/
-function getGroupDriverLocations($conn, $userId, $orderGroupId) {
-    // Verify group belongs to user
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM order_groups 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderGroupId, $userId]);
-    
-    if (!$checkStmt->fetch()) {
-        ResponseHandler::error('Order group not found or not authorized', 403);
-    }
-
-    // Get all drivers for orders in this group
-    $stmt = $conn->prepare(
-        "SELECT 
-            o.id as order_id,
-            o.order_number,
-            o.status,
-            d.id as driver_id,
-            d.name as driver_name,
-            d.phone as driver_phone,
-            d.current_latitude,
-            d.current_longitude,
-            d.vehicle_type,
-            d.vehicle_number,
-            d.image_url,
-            m.name as merchant_name
-        FROM orders o
-        LEFT JOIN drivers d ON o.driver_id = d.id
-        LEFT JOIN merchants m ON o.merchant_id = m.id
-        WHERE o.order_group_id = ? AND o.driver_id IS NOT NULL"
-    );
-    $stmt->execute([$orderGroupId]);
-    $drivers = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    $formattedDrivers = [];
-    foreach ($drivers as $driver) {
-        global $baseUrl;
-        $driverImage = formatImageUrl($driver['image_url'], $baseUrl, 'drivers');
-        
-        $formattedDrivers[] = [
-            'order_id' => $driver['order_id'],
-            'order_number' => $driver['order_number'],
-            'merchant_name' => $driver['merchant_name'],
-            'order_status' => $driver['status'],
-            'driver' => [
-                'id' => $driver['driver_id'],
-                'name' => $driver['driver_name'] ?? 'Driver',
-                'phone' => $driver['driver_phone'] ?? '',
-                'vehicle' => $driver['vehicle_type'] ?? 'Motorcycle',
-                'vehicle_number' => $driver['vehicle_number'] ?? '',
-                'image_url' => $driverImage,
-                'location' => [
-                    'latitude' => floatval($driver['current_latitude'] ?? 0),
-                    'longitude' => floatval($driver['current_longitude'] ?? 0)
-                ]
-            ]
-        ];
-    }
-
-    ResponseHandler::success([
-        'order_group_id' => $orderGroupId,
-        'drivers' => $formattedDrivers
-    ]);
-}
-
-/*********************************
- * GET GROUP REAL-TIME UPDATES
- *********************************/
-function getGroupRealTimeUpdates($conn, $userId, $orderGroupId, $lastUpdate = null) {
-    // Verify group belongs to user
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM order_groups 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderGroupId, $userId]);
-    
-    if (!$checkStmt->fetch()) {
-        ResponseHandler::error('Order group not found or not authorized', 403);
-    }
-
-    // Parse last update timestamp
-    $lastUpdateTime = null;
-    if ($lastUpdate) {
-        try {
-            $lastUpdateTime = date('Y-m-d H:i:s', strtotime($lastUpdate));
-        } catch (Exception $e) {
-            $lastUpdateTime = null;
-        }
-    }
-
-    // Get all orders in group with their latest updates
-    $sql = "SELECT 
-                o.id,
-                o.order_number,
-                o.status,
-                o.updated_at as order_updated_at,
-                d.name as driver_name,
-                d.current_latitude,
-                d.current_longitude,
-                d.updated_at as driver_updated_at,
-                ot.status as tracking_status,
-                ot.location_updates,
-                ot.estimated_delivery,
-                ot.updated_at as tracking_updated_at
-            FROM orders o
-            LEFT JOIN drivers d ON o.driver_id = d.id
-            LEFT JOIN order_tracking ot ON o.id = ot.order_id
-            WHERE o.order_group_id = ?";
-    
-    $params = [$orderGroupId];
-    
-    if ($lastUpdateTime) {
-        $sql .= " AND (o.updated_at > ? OR d.updated_at > ? OR ot.updated_at > ?)";
-        $params[] = $lastUpdateTime;
-        $params[] = $lastUpdateTime;
-        $params[] = $lastUpdateTime;
-    }
-    
-    $sql .= " ORDER BY o.id, ot.updated_at DESC";
-    
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
-    $updates = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    // Group updates by order
-    $orderUpdates = [];
-    foreach ($updates as $update) {
-        if (!isset($orderUpdates[$update['id']])) {
-            // Parse location updates
-            $locationUpdates = [];
-            if (!empty($update['location_updates'])) {
-                $locationUpdates = json_decode($update['location_updates'], true);
-                if (!is_array($locationUpdates)) {
-                    $locationUpdates = [];
-                }
-            }
-            
-            $orderUpdates[$update['id']] = [
-                'order_id' => $update['id'],
-                'order_number' => $update['order_number'],
-                'status' => $update['status'],
-                'driver_location' => [
-                    'latitude' => floatval($update['current_latitude'] ?? 0),
-                    'longitude' => floatval($update['current_longitude'] ?? 0),
-                    'timestamp' => $update['driver_updated_at']
-                ],
-                'tracking' => [
-                    'status' => $update['tracking_status'],
-                    'estimated_delivery' => $update['estimated_delivery'],
-                    'location_updates' => $locationUpdates,
-                    'updated_at' => $update['tracking_updated_at']
-                ],
-                'updated_at' => max(
-                    $update['order_updated_at'] ?? '', 
-                    $update['driver_updated_at'] ?? '', 
-                    $update['tracking_updated_at'] ?? ''
-                )
-            ];
-        }
-    }
-
-    ResponseHandler::success([
-        'success' => true,
-        'has_updates' => !empty($orderUpdates),
-        'order_updates' => array_values($orderUpdates),
-        'server_timestamp' => date('Y-m-d H:i:s')
-    ]);
-}
-
-/*********************************
- * GET GROUP DRIVER CONTACTS
- *********************************/
-function getGroupDriverContacts($conn, $userId, $orderGroupId) {
-    // Verify group belongs to user
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM order_groups 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderGroupId, $userId]);
-    
-    if (!$checkStmt->fetch()) {
-        ResponseHandler::error('Order group not found or not authorized', 403);
-    }
-
-    // Get all drivers for this group
-    $stmt = $conn->prepare(
-        "SELECT 
-            o.id as order_id,
-            o.order_number,
-            d.id as driver_id,
-            d.name as driver_name,
-            d.phone as driver_phone,
-            m.name as merchant_name
-        FROM orders o
-        JOIN drivers d ON o.driver_id = d.id
-        JOIN merchants m ON o.merchant_id = m.id
-        WHERE o.order_group_id = ? AND o.driver_id IS NOT NULL"
-    );
-    $stmt->execute([$orderGroupId]);
-    $drivers = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    $formattedDrivers = [];
-    foreach ($drivers as $driver) {
-        $formattedDrivers[] = [
-            'order_id' => $driver['order_id'],
-            'order_number' => $driver['order_number'],
-            'merchant_name' => $driver['merchant_name'],
-            'driver' => [
-                'id' => $driver['driver_id'],
-                'name' => $driver['driver_name'],
-                'phone' => $driver['driver_phone'],
-                'callable' => true
-            ]
-        ];
-    }
-
-    ResponseHandler::success([
-        'order_group_id' => $orderGroupId,
-        'drivers' => $formattedDrivers
-    ]);
-}
-
-/*********************************
- * SHARE GROUP TRACKING
- *********************************/
-function shareGroupTracking($conn, $userId, $orderGroupId) {
-    // Verify group belongs to user
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM order_groups 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderGroupId, $userId]);
-    
-    if (!$checkStmt->fetch()) {
-        ResponseHandler::error('Order group not found or not authorized', 403);
-    }
-
-    // Get group details for sharing
-    $stmt = $conn->prepare(
-        "SELECT 
-            og.id,
-            og.total_amount,
-            og.dropx_tracking_id,
-            GROUP_CONCAT(DISTINCT m.name SEPARATOR ', ') as merchant_names,
-            COUNT(o.id) as order_count
-        FROM order_groups og
-        JOIN orders o ON og.id = o.order_group_id
-        JOIN merchants m ON o.merchant_id = m.id
-        WHERE og.id = ?
-        GROUP BY og.id"
-    );
-    $stmt->execute([$orderGroupId]);
-    $group = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    // Generate tracking URL
-    $trackingUrl = "https://dropx12-production.up.railway.app/api/track/group/" . $group['id'];
-    if ($group['dropx_tracking_id']) {
-        $trackingUrl = "https://dropx.com/track/" . $group['dropx_tracking_id'];
-    }
-    
-    // Generate sharing message
-    $message = "Track my multi-restaurant order from " . $group['merchant_names'] . ":\n" .
-               "Total: MK" . number_format($group['total_amount'], 2) . "\n" .
-               "Orders: " . $group['order_count'] . " different restaurants\n" .
-               "Track all here: " . $trackingUrl;
-
-    ResponseHandler::success([
-        'order_group_id' => $group['id'],
-        'tracking_url' => $trackingUrl,
-        'share_message' => $message,
-        'merchant_names' => $group['merchant_names'],
-        'order_count' => intval($group['order_count']),
-        'total_amount' => floatval($group['total_amount'])
-    ]);
-}
-
-/*********************************
- * GET LATEST ACTIVE ORDER GROUP
- *********************************/
-function getLatestActiveOrderGroup($conn, $userId) {
-    $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
-    $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
-    
-    $sql = "SELECT 
-                og.id,
-                og.total_amount,
-                og.status,
-                og.created_at,
-                og.updated_at,
-                og.dropx_tracking_id,
-                COUNT(o.id) as order_count,
-                GROUP_CONCAT(DISTINCT m.name SEPARATOR ', ') as merchant_names
-            FROM order_groups og
-            JOIN orders o ON og.id = o.order_group_id
-            JOIN merchants m ON o.merchant_id = m.id
-            WHERE og.user_id = ?";
-    
-    $sql .= " AND o.status IN (" . implode(',', array_fill(0, count($activeStatuses), '?')) . ")";
-    $sql .= " GROUP BY og.id ORDER BY og.created_at DESC LIMIT 1";
-    
-    $params = array_merge([$userId], $activeStatuses);
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
-    $group = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$group) {
-        ResponseHandler::success(['group' => null, 'message' => 'No active order groups']);
-        return;
-    }
-    
-    ResponseHandler::success([
-        'group' => [
-            'id' => $group['id'],
-            'dropx_tracking_id' => $group['dropx_tracking_id'],
-            'tracking_url' => $group['dropx_tracking_id'] ? "https://dropx.com/track/" . $group['dropx_tracking_id'] : null,
-            'merchant_names' => $group['merchant_names'],
-            'order_count' => intval($group['order_count']),
-            'status' => $group['status'],
-            'created_at' => $group['created_at'],
-            'updated_at' => $group['updated_at'],
-            'total_amount' => floatval($group['total_amount'])
-        ]
-    ]);
-}
-
-/*********************************
- * GET TRACKING SUMMARY
- * Provides a quick summary of all active tracking
- *********************************/
-function getTrackingSummary($conn, $userId) {
-    // Get single orders count
-    $singleSql = "SELECT 
-                    COUNT(*) as total_orders,
-                    SUM(CASE WHEN status IN ('confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived') THEN 1 ELSE 0 END) as active_orders
-                FROM orders
-                WHERE user_id = ? AND order_group_id IS NULL";
-    
-    $singleStmt = $conn->prepare($singleSql);
-    $singleStmt->execute([$userId]);
-    $singleStats = $singleStmt->fetch(PDO::FETCH_ASSOC);
-    
-    // Get group orders count
-    $groupSql = "SELECT 
-                    COUNT(DISTINCT og.id) as total_groups,
-                    SUM(CASE WHEN o.status IN ('confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived') THEN 1 ELSE 0 END) as active_orders_in_groups
-                FROM order_groups og
-                JOIN orders o ON og.id = o.order_group_id
-                WHERE og.user_id = ?";
-    
-    $groupStmt = $conn->prepare($groupSql);
-    $groupStmt->execute([$userId]);
-    $groupStats = $groupStmt->fetch(PDO::FETCH_ASSOC);
-    
-    // Get latest active order
-    $latestOrderSql = "SELECT 
-                        o.id,
-                        o.order_number,
-                        o.status,
-                        o.created_at,
-                        m.name as merchant_name
-                    FROM orders o
-                    LEFT JOIN merchants m ON o.merchant_id = m.id
-                    WHERE o.user_id = ? 
-                    AND o.status IN ('confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived')
-                    ORDER BY o.updated_at DESC
-                    LIMIT 1";
-    
-    $latestOrderStmt = $conn->prepare($latestOrderSql);
-    $latestOrderStmt->execute([$userId]);
-    $latestOrder = $latestOrderStmt->fetch(PDO::FETCH_ASSOC);
-    
-    // Get latest active group
-    $latestGroupSql = "SELECT 
-                        og.id,
-                        og.dropx_tracking_id,
-                        og.status,
-                        og.created_at,
-                        COUNT(o.id) as order_count,
-                        GROUP_CONCAT(DISTINCT m.name SEPARATOR ', ') as merchant_names
-                    FROM order_groups og
-                    JOIN orders o ON og.id = o.order_group_id
-                    JOIN merchants m ON o.merchant_id = m.id
-                    WHERE og.user_id = ? 
-                    AND o.status IN ('confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived')
-                    GROUP BY og.id
-                    ORDER BY og.updated_at DESC
-                    LIMIT 1";
-    
-    $latestGroupStmt = $conn->prepare($latestGroupSql);
-    $latestGroupStmt->execute([$userId]);
-    $latestGroup = $latestGroupStmt->fetch(PDO::FETCH_ASSOC);
-    
-    ResponseHandler::success([
-        'summary' => [
-            'total_orders' => intval($singleStats['total_orders'] ?? 0) + intval($groupStats['total_orders_in_groups'] ?? 0),
-            'active_orders' => intval($singleStats['active_orders'] ?? 0) + intval($groupStats['active_orders_in_groups'] ?? 0),
-            'active_groups' => intval($groupStats['total_groups'] ?? 0)
-        ],
-        'latest' => [
-            'order' => $latestOrder ? [
-                'id' => $latestOrder['id'],
-                'order_number' => $latestOrder['order_number'],
-                'status' => $latestOrder['status'],
-                'merchant_name' => $latestOrder['merchant_name'],
-                'created_at' => $latestOrder['created_at']
-            ] : null,
-            'group' => $latestGroup ? [
-                'id' => $latestGroup['id'],
-                'dropx_tracking_id' => $latestGroup['dropx_tracking_id'],
-                'tracking_url' => $latestGroup['dropx_tracking_id'] ? "https://dropx.com/track/" . $latestGroup['dropx_tracking_id'] : null,
-                'status' => $latestGroup['status'],
-                'merchant_names' => $latestGroup['merchant_names'],
-                'order_count' => intval($latestGroup['order_count']),
-                'created_at' => $latestGroup['created_at']
-            ] : null
-        ]
-    ]);
-}
-
-/*********************************
- * GET ORDER TRACKING - Single Order
- *********************************/
-function getOrderTracking($conn, $orderIdentifier, $baseUrl, $userId = null) {
-    // Check if order identifier is order_number or order_id
-    $isOrderNumber = !is_numeric($orderIdentifier) && preg_match('/^[A-Za-z0-9_-]+$/', $orderIdentifier);
-    
-    $sql = "SELECT 
-                o.id,
-                o.order_number,
-                o.user_id,
-                o.merchant_id,
-                o.driver_id,
-                o.subtotal,
-                o.delivery_fee,
-                o.total_amount,
-                o.payment_method,
-                o.delivery_address,
-                o.special_instructions,
-                o.status,
-                o.created_at,
-                o.updated_at,
-                o.order_group_id,
-                m.name as merchant_name,
-                m.address as merchant_address,
-                m.phone as merchant_phone,
-                m.image_url as merchant_image,
-                m.latitude as merchant_latitude,
-                m.longitude as merchant_longitude,
-                d.name as driver_name,
-                d.phone as driver_phone,
-                d.current_latitude,
-                d.current_longitude,
-                d.vehicle_type,
-                d.vehicle_number,
-                d.image_url as driver_image,
-                u.full_name as user_name,
-                u.phone as user_phone,
-                u.email as user_email
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            LEFT JOIN drivers d ON o.driver_id = d.id
-            LEFT JOIN users u ON o.user_id = u.id
-            WHERE ";
-    
-    if ($isOrderNumber) {
-        $sql .= "o.order_number = :identifier";
-        $params = [':identifier' => $orderIdentifier];
-    } else {
-        $sql .= "o.id = :identifier";
-        $params = [':identifier' => intval($orderIdentifier)];
-    }
-    
-    if ($userId) {
-        $sql .= " AND o.user_id = :user_id";
-        $params[':user_id'] = $userId;
-    }
-    
-    $sql .= " LIMIT 1";
-    
-    $orderStmt = $conn->prepare($sql);
-    $orderStmt->execute($params);
-    $order = $orderStmt->fetch(PDO::FETCH_ASSOC);
-
-    if (!$order) {
-        ResponseHandler::error('Order not found', 404);
-    }
-
-    // Get order items
-    $itemsStmt = $conn->prepare(
-        "SELECT 
-            oi.id,
-            oi.item_name as name,
-            oi.quantity,
-            oi.unit_price as price,
-            oi.total_price as total
-        FROM order_items oi
-        WHERE oi.order_id = :order_id
-        ORDER BY oi.id"
-    );
-    $itemsStmt->execute([':order_id' => $order['id']]);
-    $orderItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
-
-    // Get order tracking info
-    $trackingStmt = $conn->prepare(
-        "SELECT 
-            id,
-            status,
-            estimated_delivery,
-            location_updates,
-            created_at,
-            updated_at
-        FROM order_tracking
-        WHERE order_id = :order_id
-        ORDER BY created_at DESC
-        LIMIT 1"
-    );
-    $trackingStmt->execute([':order_id' => $order['id']]);
-    $trackingInfo = $trackingStmt->fetch(PDO::FETCH_ASSOC);
-
-    // Get sibling orders in same group if applicable
-    $siblingOrders = [];
-    if ($order['order_group_id']) {
-        $siblingStmt = $conn->prepare(
-            "SELECT 
-                o.id,
-                o.order_number,
-                o.status,
-                m.name as merchant_name,
-                m.image_url as merchant_image
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE o.order_group_id = :group_id 
-            AND o.id != :order_id
-            ORDER BY o.created_at"
-        );
-        $siblingStmt->execute([
-            ':group_id' => $order['order_group_id'],
-            ':order_id' => $order['id']
-        ]);
-        $siblingOrders = $siblingStmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        // Format sibling orders
-        foreach ($siblingOrders as &$sibling) {
-            $sibling['merchant_image'] = formatImageUrl($sibling['merchant_image'], $baseUrl, 'merchants');
-        }
-    }
-
-    // Format images
-    $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
-    $driverImage = formatImageUrl($order['driver_image'], $baseUrl, 'drivers');
-
-    // Calculate delivery progress
-    $deliveryProgress = calculateDeliveryProgress($order['status']);
-
-    // Build delivery status timeline
-    $deliveryStatus = buildDeliveryStatusTimeline($order, $trackingInfo);
-
-    // Build driver info
-    $driverInfo = null;
-    if ($order['driver_id']) {
-        $driverInfo = [
-            'id' => $order['driver_id'],
-            'name' => $order['driver_name'] ?? 'Driver',
-            'phone' => $order['driver_phone'] ?? '',
-            'vehicle' => $order['vehicle_type'] ?? 'Motorcycle',
-            'vehicle_number' => $order['vehicle_number'] ?? '',
-            'image_url' => $driverImage,
-            'latitude' => floatval($order['current_latitude'] ?? 0),
-            'longitude' => floatval($order['current_longitude'] ?? 0)
-        ];
-    }
-
-    // Build merchant info
-    $merchantInfo = [
-        'id' => $order['merchant_id'],
-        'name' => $order['merchant_name'],
-        'address' => $order['merchant_address'] ?? '',
-        'phone' => $order['merchant_phone'] ?? '',
-        'image_url' => $merchantImage,
-        'latitude' => floatval($order['merchant_latitude'] ?? 0),
-        'longitude' => floatval($order['merchant_longitude'] ?? 0)
+        'driver' => $driver,
+        'timeline' => $timeline,
+        'waypoints' => $waypoints
     ];
 
+    // Add group merchants if multi-merchant
+    if (!empty($groupOrders)) {
+        $response['merchants'] = array_map(function($gOrder) {
+            return [
+                'id' => $gOrder['merchant_id'],
+                'name' => $gOrder['merchant_name'],
+                'address' => $gOrder['merchant_address'],
+                'status' => $gOrder['status'],
+                'pickup_status' => $gOrder['pickup_status'],
+                'estimated_pickup' => $gOrder['estimated_pickup']
+            ];
+        }, $groupOrders);
+    }
+
+    ResponseHandler::success($response, 'Tracking information retrieved');
+}
+
+/*********************************
+ * DRIVER LOCATION HANDLER
+ * Public - no auth required
+ *********************************/
+function handleDriverLocation($conn, $input) {
+    $identifier = $input['tracking_id'] ?? $input['order_id'] ?? '';
+    
+    if (empty($identifier)) {
+        ResponseHandler::error('Tracking ID or Order ID required', 400, 'MISSING_ID');
+    }
+    
+    // Find the order first
+    $order = findTrackableOrder($conn, $identifier);
+    
+    if (!$order) {
+        ResponseHandler::error('Order not found', 404, 'ORDER_NOT_FOUND');
+    }
+    
+    if (!$order['driver_id']) {
+        ResponseHandler::success([
+            'has_driver' => false,
+            'message' => 'No driver assigned yet',
+            'estimated_pickup' => $order['dropx_estimated_pickup_time']
+        ]);
+    }
+    
+    // Get real-time driver location
+    $stmt = $conn->prepare("
+        SELECT 
+            d.id,
+            d.name,
+            d.current_latitude,
+            d.current_longitude,
+            d.updated_at as location_updated_at,
+            d.vehicle_type,
+            d.vehicle_number,
+            d.heading,
+            d.speed
+        FROM drivers d
+        WHERE d.id = ?
+    ");
+    $stmt->execute([$order['driver_id']]);
+    $driver = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$driver) {
+        ResponseHandler::error('Driver information not available', 404, 'DRIVER_NOT_FOUND');
+    }
+    
+    // Calculate ETA if possible
+    $eta = calculateETA($conn, $order['id'], $driver);
+    
     ResponseHandler::success([
-        'order' => [
-            'id' => $order['id'],
-            'order_number' => $order['order_number'],
-            'status' => $order['status'],
-            'created_at' => $order['created_at'],
-            'updated_at' => $order['updated_at'],
-            'order_group_id' => $order['order_group_id'],
-            'merchant' => $merchantInfo,
-            'delivery_address' => $order['delivery_address'],
-            'special_instructions' => $order['special_instructions'],
-            'payment_method' => $order['payment_method'],
-            'amounts' => [
-                'subtotal' => floatval($order['subtotal']),
-                'delivery_fee' => floatval($order['delivery_fee']),
-                'total' => floatval($order['total_amount'])
-            ]
+        'has_driver' => true,
+        'driver' => [
+            'id' => $driver['id'],
+            'name' => $driver['name'],
+            'vehicle' => $driver['vehicle_type'],
+            'vehicle_number' => $driver['vehicle_number']
         ],
-        'items' => $orderItems,
-        'sibling_orders' => $siblingOrders,
-        'tracking' => [
-            'current_status' => $order['status'],
-            'progress' => $deliveryProgress,
-            'estimated_delivery' => $trackingInfo['estimated_delivery'] ?? null,
-            'status_timeline' => $deliveryStatus,
-            'driver' => $driverInfo,
-            'last_updated' => $trackingInfo['updated_at'] ?? $order['updated_at']
+        'location' => [
+            'latitude' => floatval($driver['current_latitude']),
+            'longitude' => floatval($driver['current_longitude']),
+            'heading' => floatval($driver['heading'] ?? 0),
+            'speed' => floatval($driver['speed'] ?? 0),
+            'last_updated' => $driver['location_updated_at'],
+            'age_seconds' => time() - strtotime($driver['location_updated_at'])
+        ],
+        'estimated_arrival' => $eta,
+        'order_status' => $order['status']
+    ]);
+}
+
+/*********************************
+ * REAL-TIME UPDATES HANDLER
+ * Public - no auth required
+ * Returns only changes since last update
+ *********************************/
+function handleRealTimeUpdates($conn, $input) {
+    $identifier = $input['tracking_id'] ?? $input['order_id'] ?? '';
+    $lastUpdate = $input['last_update'] ?? null;
+    
+    if (empty($identifier)) {
+        ResponseHandler::error('Tracking ID or Order ID required', 400, 'MISSING_ID');
+    }
+    
+    // Find the order
+    $order = findTrackableOrder($conn, $identifier);
+    
+    if (!$order) {
+        ResponseHandler::error('Order not found', 404, 'ORDER_NOT_FOUND');
+    }
+    
+    $updates = [];
+    $hasUpdates = false;
+    $currentTime = date('Y-m-d H:i:s');
+    
+    // Check for order status update
+    if (!$lastUpdate || strtotime($order['updated_at']) > strtotime($lastUpdate)) {
+        $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
+        
+        $updates['order'] = [
+            'status' => $order['status'],
+            'dropx_status' => $order['dropx_pickup_status'],
+            'display_status' => $statusInfo['label'],
+            'progress' => calculateTrackingProgress($order, null),
+            'updated_at' => $order['updated_at']
+        ];
+        $hasUpdates = true;
+    }
+    
+    // Check for driver location update
+    if ($order['driver_id']) {
+        $stmt = $conn->prepare("
+            SELECT current_latitude, current_longitude, updated_at
+            FROM drivers
+            WHERE id = ? AND (? IS NULL OR updated_at > ?)
+        ");
+        $stmt->execute([$order['driver_id'], $lastUpdate, $lastUpdate]);
+        $driverLocation = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($driverLocation) {
+            $updates['driver_location'] = [
+                'latitude' => floatval($driverLocation['current_latitude']),
+                'longitude' => floatval($driverLocation['current_longitude']),
+                'updated_at' => $driverLocation['updated_at']
+            ];
+            $hasUpdates = true;
+        }
+    }
+    
+    // Check for group tracking updates
+    if ($order['order_group_id']) {
+        $stmt = $conn->prepare("
+            SELECT status, message, location_address, created_at
+            FROM group_tracking
+            WHERE order_group_id = ?
+            AND (? IS NULL OR created_at > ?)
+            ORDER BY created_at DESC
+        ");
+        $stmt->execute([$order['order_group_id'], $lastUpdate, $lastUpdate]);
+        $trackingUpdates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (!empty($trackingUpdates)) {
+            $updates['tracking_events'] = array_map(function($event) {
+                return [
+                    'status' => $event['status'],
+                    'message' => $event['message'],
+                    'location' => $event['location_address'],
+                    'timestamp' => $event['created_at']
+                ];
+            }, $trackingUpdates);
+            $hasUpdates = true;
+        }
+    }
+    
+    // Check for pickup status updates in multi-merchant orders
+    if ($order['order_group_id']) {
+        $stmt = $conn->prepare("
+            SELECT gp.merchant_id, m.name, gp.pickup_status, gp.actual_pickup_time
+            FROM group_pickups gp
+            JOIN merchants m ON gp.merchant_id = m.id
+            WHERE gp.order_group_id = ?
+            AND (? IS NULL OR gp.updated_at > ?)
+        ");
+        $stmt->execute([$order['order_group_id'], $lastUpdate, $lastUpdate]);
+        $pickupUpdates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (!empty($pickupUpdates)) {
+            $updates['pickup_updates'] = $pickupUpdates;
+            $hasUpdates = true;
+        }
+    }
+    
+    ResponseHandler::success([
+        'has_updates' => $hasUpdates,
+        'updates' => $updates,
+        'server_time' => $currentTime
+    ]);
+}
+
+/*********************************
+ * ROUTE INFORMATION HANDLER
+ * Public - no auth required
+ *********************************/
+function handleRouteInfo($conn, $input) {
+    $identifier = $input['tracking_id'] ?? $input['order_id'] ?? '';
+    
+    if (empty($identifier)) {
+        ResponseHandler::error('Tracking ID or Order ID required', 400, 'MISSING_ID');
+    }
+    
+    // Find the order
+    $order = findTrackableOrder($conn, $identifier);
+    
+    if (!$order) {
+        ResponseHandler::error('Order not found', 404, 'ORDER_NOT_FOUND');
+    }
+    
+    $waypoints = [];
+    
+    if ($order['order_group_id']) {
+        // Multi-merchant route
+        $waypoints = getGroupWaypoints($conn, $order['order_group_id'], true);
+    } else {
+        // Single order route - just merchant and delivery
+        $waypoints = [
+            [
+                'sequence' => 1,
+                'type' => 'pickup',
+                'name' => $order['merchant_name'],
+                'address' => $order['merchant_address'],
+                'location' => [
+                    'latitude' => floatval($order['merchant_lat'] ?? 0),
+                    'longitude' => floatval($order['merchant_lng'] ?? 0)
+                ],
+                'status' => $order['status'] === 'delivered' ? 'completed' : 
+                           (in_array($order['status'], ['picked_up', 'on_the_way', 'arrived']) ? 'completed' : 'pending'),
+                'estimated_arrival' => $order['dropx_estimated_pickup_time']
+            ],
+            [
+                'sequence' => 2,
+                'type' => 'dropoff',
+                'name' => 'Your Location',
+                'address' => $order['delivery_address'],
+                'location' => [
+                    'latitude' => 0, // Would need delivery coordinates
+                    'longitude' => 0
+                ],
+                'status' => $order['status'] === 'delivered' ? 'completed' : 'pending',
+                'estimated_arrival' => $order['dropx_estimated_delivery_time']
+            ]
+        ];
+    }
+    
+    // Get driver current location
+    $driverLocation = null;
+    if ($order['driver_id']) {
+        $stmt = $conn->prepare("
+            SELECT current_latitude, current_longitude
+            FROM drivers
+            WHERE id = ?
+        ");
+        $stmt->execute([$order['driver_id']]);
+        $driverLocation = $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+    
+    // Calculate next stop
+    $nextStop = null;
+    foreach ($waypoints as $wp) {
+        if ($wp['status'] === 'pending') {
+            $nextStop = $wp;
+            break;
+        }
+    }
+    
+    ResponseHandler::success([
+        'driver_location' => $driverLocation ? [
+            'latitude' => floatval($driverLocation['current_latitude']),
+            'longitude' => floatval($driverLocation['current_longitude'])
+        ] : null,
+        'waypoints' => $waypoints,
+        'next_stop' => $nextStop,
+        'progress' => [
+            'total' => count($waypoints),
+            'completed' => count(array_filter($waypoints, fn($wp) => $wp['status'] === 'completed')),
+            'percentage' => count($waypoints) > 0 
+                ? (count(array_filter($waypoints, fn($wp) => $wp['status'] === 'completed')) / count($waypoints)) * 100
+                : 0
         ]
     ]);
 }
 
 /*********************************
- * GET TRACKABLE ORDERS
+ * TRACKING SUMMARY HANDLER
+ * Requires authentication
  *********************************/
-function getTrackableOrders($conn, $userId, $limit, $sortBy, $sortOrder) {
-    // Validate sort parameters
-    $allowedSortColumns = ['created_at', 'order_number', 'total_amount', 'status'];
-    $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'created_at';
-    $sortOrder = strtoupper($sortOrder) === 'ASC' ? 'ASC' : 'DESC';
+function handleTrackingSummary($conn, $userId) {
+    // Get active tracking orders
+    $stmt = $conn->prepare("
+        SELECT 
+            o.id,
+            o.order_number,
+            o.status,
+            o.created_at,
+            o.order_group_id,
+            og.dropx_tracking_id,
+            og.dropx_pickup_status,
+            og.dropx_estimated_delivery_time,
+            m.name as merchant_name,
+            m.image_url as merchant_image,
+            d.name as driver_name,
+            d.current_latitude,
+            d.current_longitude,
+            COUNT(CASE WHEN o2.id IS NOT NULL THEN 1 END) as group_order_count
+        FROM orders o
+        LEFT JOIN merchants m ON o.merchant_id = m.id
+        LEFT JOIN drivers d ON o.driver_id = d.id
+        LEFT JOIN order_groups og ON o.order_group_id = og.id
+        LEFT JOIN orders o2 ON o.order_group_id = o2.order_group_id AND o2.id != o.id
+        WHERE o.user_id = ? 
+        AND o.status IN ('confirmed','preparing','ready','picked_up','on_the_way','arrived')
+        GROUP BY o.id
+        ORDER BY o.updated_at DESC
+        LIMIT 10
+    ");
+    $stmt->execute([$userId]);
+    $activeOrders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Ensure limit is an integer
-    $limit = min(max((int)$limit, 1), 100);
-    
-    // Trackable statuses (orders that can be tracked)
-    $trackableStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
-    
-    // Create placeholders for the IN clause
-    $placeholders = implode(',', array_fill(0, count($trackableStatuses), '?'));
-    
-    $sql = "SELECT 
-                o.id,
-                o.order_number,
-                o.status,
-                o.created_at,
-                o.updated_at,
-                o.total_amount,
-                o.payment_method,
-                o.order_group_id,
-                m.name as merchant_name,
-                m.image_url as merchant_image
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE o.user_id = ? 
-            AND o.status IN ($placeholders)
-            ORDER BY o.$sortBy $sortOrder
-            LIMIT ?";
-    
-    $stmt = $conn->prepare($sql);
-    
-    // Build parameters array
-    $params = array_merge([$userId], $trackableStatuses, [$limit]);
-    
-    if (!$stmt->execute($params)) {
-        $error = $stmt->errorInfo();
-        error_log("SQL Error in getTrackableOrders: " . print_r($error, true));
-        ResponseHandler::error('Database error: ' . $error[2], 500);
-    }
-    
-    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    // Count by status
+    $counts = [
+        'total_active' => count($activeOrders),
+        'preparing' => 0,
+        'picked_up' => 0,
+        'on_the_way' => 0,
+        'arrived' => 0
+    ];
     
     $formattedOrders = [];
-    foreach ($orders as $order) {
-        global $baseUrl;
-        $merchantImage = formatImageUrl($order['merchant_image'], $baseUrl, 'merchants');
+    foreach ($activeOrders as $order) {
+        // Update counts
+        if (isset($counts[$order['status']])) {
+            $counts[$order['status']]++;
+        }
+        
+        $isMultiMerchant = $order['group_order_count'] > 0;
+        $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
         
         $formattedOrders[] = [
             'id' => $order['id'],
             'order_number' => $order['order_number'],
+            'tracking_id' => $order['dropx_tracking_id'] ?? $order['order_number'],
+            'tracking_url' => "https://dropx.app/track/" . ($order['dropx_tracking_id'] ?? $order['order_number']),
             'status' => $order['status'],
-            'created_at' => $order['created_at'],
-            'updated_at' => $order['updated_at'],
-            'total_amount' => floatval($order['total_amount']),
-            'payment_method' => $order['payment_method'],
+            'display_status' => $statusInfo['label'],
+            'progress' => $statusInfo['progress'],
             'merchant_name' => $order['merchant_name'],
-            'merchant_image' => $merchantImage,
-            'order_group_id' => $order['order_group_id']
+            'merchant_image' => formatImageUrl($order['merchant_image']),
+            'driver_name' => $order['driver_name'],
+            'driver_location' => ($order['current_latitude'] && $order['current_longitude']) ? [
+                'lat' => floatval($order['current_latitude']),
+                'lng' => floatval($order['current_longitude'])
+            ] : null,
+            'estimated_delivery' => $order['dropx_estimated_delivery_time'],
+            'is_multi_merchant' => $isMultiMerchant,
+            'created_at' => $order['created_at']
         ];
     }
     
     ResponseHandler::success([
-        'orders' => $formattedOrders
-    ]);
-}
-/*********************************
- * GET DRIVER LOCATION
- *********************************/
-function getDriverLocation($conn, $userId, $orderId) {
-    // Verify the order belongs to the user
-    $checkStmt = $conn->prepare(
-        "SELECT id, driver_id, order_group_id FROM orders 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderId, $userId]);
-    $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$order) {
-        ResponseHandler::error('Order not found or not authorized', 403);
-    }
-
-    if (!$order['driver_id']) {
-        ResponseHandler::error('No driver assigned to this order yet', 404);
-    }
-
-    // Get driver location
-    $stmt = $conn->prepare(
-        "SELECT 
-            d.current_latitude,
-            d.current_longitude,
-            d.name,
-            d.phone,
-            d.vehicle_type,
-            d.vehicle_number,
-            d.image_url,
-            o.status,
-            o.updated_at as order_updated_at
-        FROM orders o
-        LEFT JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = ?"
-    );
-    $stmt->execute([$orderId]);
-    $driver = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    // Format driver image URL
-    global $baseUrl;
-    $driverImage = formatImageUrl($driver['image_url'], $baseUrl, 'drivers');
-
-    ResponseHandler::success([
-        'order_id' => $orderId,
-        'order_group_id' => $order['order_group_id'],
-        'driver_location' => [
-            'latitude' => floatval($driver['current_latitude'] ?? 0),
-            'longitude' => floatval($driver['current_longitude'] ?? 0),
-            'timestamp' => $driver['order_updated_at'] ?? date('Y-m-d H:i:s')
-        ],
-        'driver_info' => [
-            'name' => $driver['name'] ?? 'Driver',
-            'phone' => $driver['phone'] ?? '',
-            'vehicle' => $driver['vehicle_type'] ?? 'Motorcycle',
-            'vehicle_number' => $driver['vehicle_number'] ?? '',
-            'image_url' => $driverImage
-        ],
-        'order_status' => $driver['status']
+        'summary' => $counts,
+        'active_orders' => $formattedOrders
     ]);
 }
 
 /*********************************
- * GET REAL-TIME UPDATES
+ * GET TRACKABLE ORDERS HANDLER
+ * Requires authentication
  *********************************/
-function getRealTimeUpdates($conn, $userId, $orderId, $lastUpdate = null) {
-    // Verify the order belongs to the user
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM orders 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderId, $userId]);
-    
-    if (!$checkStmt->fetch()) {
-        ResponseHandler::error('Order not found or not authorized', 403);
-    }
-
-    // Parse last update timestamp
-    $lastUpdateTime = null;
-    if ($lastUpdate) {
-        try {
-            $lastUpdateTime = date('Y-m-d H:i:s', strtotime($lastUpdate));
-        } catch (Exception $e) {
-            $lastUpdateTime = null;
-        }
-    }
-
-    // Check for tracking updates
-    $trackingSql = "SELECT 
-            status,
-            location_updates,
-            estimated_delivery,
-            updated_at
-        FROM order_tracking
-        WHERE order_id = ?";
-    
-    $trackingParams = [$orderId];
-    
-    if ($lastUpdateTime) {
-        $trackingSql .= " AND updated_at > ?";
-        $trackingParams[] = $lastUpdateTime;
-    }
-    
-    $trackingSql .= " ORDER BY updated_at DESC LIMIT 1";
-    
-    $trackingStmt = $conn->prepare($trackingSql);
-    $trackingStmt->execute($trackingParams);
-    $trackingUpdate = $trackingStmt->fetch(PDO::FETCH_ASSOC);
-
-    // Get current driver location
-    $driverSql = "SELECT 
-            d.current_latitude,
-            d.current_longitude,
-            d.updated_at as timestamp
-        FROM orders o
-        LEFT JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = ?";
-    
-    $driverParams = [$orderId];
-    
-    if ($lastUpdateTime) {
-        $driverSql .= " AND d.updated_at > ?";
-        $driverParams[] = $lastUpdateTime;
-    }
-    
-    $driverStmt = $conn->prepare($driverSql);
-    $driverStmt->execute($driverParams);
-    $driverLocation = $driverStmt->fetch(PDO::FETCH_ASSOC);
-
-    ResponseHandler::success([
-        'success' => true,
-        'has_updates' => !empty($trackingUpdate) || !empty($driverLocation),
-        'tracking_update' => $trackingUpdate,
-        'driver_location' => $driverLocation,
-        'server_timestamp' => date('Y-m-d H:i:s')
-    ]);
-}
-
-/*********************************
- * GET DRIVER CONTACT
- *********************************/
-function getDriverContact($conn, $userId, $orderId) {
-    // Verify order belongs to user
-    $checkStmt = $conn->prepare(
-        "SELECT id, order_group_id FROM orders 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderId, $userId]);
-    $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$order) {
-        ResponseHandler::error('Order not found or not authorized', 403);
-    }
-
-    // Get driver phone number
-    $stmt = $conn->prepare(
-        "SELECT 
-            d.phone,
-            d.name,
-            o.order_number
-        FROM orders o
-        JOIN drivers d ON o.driver_id = d.id
-        WHERE o.id = ?"
-    );
-    $stmt->execute([$orderId]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    if (!$result) {
-        ResponseHandler::error('Driver not available', 404);
-    }
-
-    ResponseHandler::success([
-        'order_id' => $orderId,
-        'order_group_id' => $order['order_group_id'],
-        'driver' => [
-            'name' => $result['name'],
-            'phone' => $result['phone'],
-            'callable' => true
-        ]
-    ]);
-}
-
-/*********************************
- * SHARE TRACKING
- *********************************/
-function shareTracking($conn, $userId, $orderId) {
-    // Verify order belongs to user
-    $checkStmt = $conn->prepare(
-        "SELECT id, order_group_id FROM orders 
-         WHERE id = ? AND user_id = ?"
-    );
-    $checkStmt->execute([$orderId, $userId]);
-    $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$order) {
-        ResponseHandler::error('Order not found or not authorized', 403);
-    }
-
-    // Get order details for sharing
-    $stmt = $conn->prepare(
-        "SELECT 
+function handleGetTrackableOrders($conn, $userId) {
+    $stmt = $conn->prepare("
+        SELECT 
+            o.id,
             o.order_number,
             o.status,
-            m.name as merchant_name
+            o.created_at,
+            o.updated_at,
+            o.order_group_id,
+            og.dropx_tracking_id,
+            og.dropx_pickup_status,
+            og.dropx_estimated_delivery_time,
+            m.name as merchant_name,
+            m.image_url as merchant_image,
+            COUNT(CASE WHEN o2.id IS NOT NULL THEN 1 END) as group_order_count
         FROM orders o
-        JOIN merchants m ON o.merchant_id = m.id
-        WHERE o.id = ?"
-    );
-    $stmt->execute([$orderId]);
-    $orderDetails = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    // Generate tracking URL
-    $trackingUrl = "https://dropx12-production.up.railway.app/api/track/order/" . $orderDetails['order_number'];
+        LEFT JOIN merchants m ON o.merchant_id = m.id
+        LEFT JOIN order_groups og ON o.order_group_id = og.id
+        LEFT JOIN orders o2 ON o.order_group_id = o2.order_group_id AND o2.id != o.id
+        WHERE o.user_id = ? 
+        AND o.status IN ('confirmed','preparing','ready','picked_up','on_the_way','arrived')
+        GROUP BY o.id
+        ORDER BY o.updated_at DESC
+    ");
+    $stmt->execute([$userId]);
+    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Generate sharing message
-    $message = "Track my order from " . $orderDetails['merchant_name'] . ":\n" .
-               "Order: " . $orderDetails['order_number'] . "\n" .
-               "Status: " . $orderDetails['status'] . "\n" .
-               "Track here: " . $trackingUrl;
-
+    $formattedOrders = array_map(function($order) {
+        $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
+        
+        return [
+            'id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'tracking_id' => $order['dropx_tracking_id'] ?? $order['order_number'],
+            'tracking_url' => "https://dropx.app/track/" . ($order['dropx_tracking_id'] ?? $order['order_number']),
+            'status' => $order['status'],
+            'display_status' => $statusInfo['label'],
+            'progress' => $statusInfo['progress'],
+            'merchant_name' => $order['merchant_name'],
+            'merchant_image' => formatImageUrl($order['merchant_image']),
+            'estimated_delivery' => $order['dropx_estimated_delivery_time'],
+            'is_multi_merchant' => $order['group_order_count'] > 0,
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at']
+        ];
+    }, $orders);
+    
     ResponseHandler::success([
-        'order_id' => $orderId,
-        'order_group_id' => $order['order_group_id'],
-        'tracking_url' => $trackingUrl,
-        'share_message' => $message,
-        'order_number' => $orderDetails['order_number'],
-        'status' => $orderDetails['status']
+        'trackable_orders' => $formattedOrders,
+        'count' => count($formattedOrders)
     ]);
 }
 
 /*********************************
- * GET LATEST ACTIVE ORDER
+ * DRIVER CONTACT HANDLER
+ * Requires authentication
  *********************************/
-function getLatestActiveOrder($conn, $userId) {
-    $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
-    $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
+function handleDriverContact($conn, $input, $userId) {
+    $orderId = $input['order_id'] ?? '';
     
-    $sql = "SELECT 
-                o.id,
-                o.order_number,
-                o.status,
-                o.created_at,
-                o.updated_at,
-                o.total_amount,
-                o.order_group_id,
-                m.name as merchant_name
-            FROM orders o
-            LEFT JOIN merchants m ON o.merchant_id = m.id
-            WHERE o.user_id = ? 
-            AND o.status IN ($placeholders)
-            ORDER BY o.created_at DESC
-            LIMIT 1";
+    if (empty($orderId)) {
+        ResponseHandler::error('Order ID required', 400, 'MISSING_ORDER_ID');
+    }
     
-    $params = array_merge([$userId], $activeStatuses);
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
+    // Verify order belongs to user and get driver
+    $stmt = $conn->prepare("
+        SELECT o.driver_id
+        FROM orders o
+        WHERE o.id = ? AND o.user_id = ?
+    ");
+    $stmt->execute([$orderId, $userId]);
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$order) {
-        ResponseHandler::success(['order' => null, 'message' => 'No active orders']);
-        return;
+        ResponseHandler::error('Order not found', 404, 'ORDER_NOT_FOUND');
+    }
+    
+    if (!$order['driver_id']) {
+        ResponseHandler::error('No driver assigned yet', 404, 'NO_DRIVER');
+    }
+    
+    // Get driver contact info
+    $stmt = $conn->prepare("
+        SELECT 
+            id,
+            name,
+            phone,
+            whatsapp_number,
+            image_url,
+            vehicle_type,
+            vehicle_number,
+            rating
+        FROM drivers
+        WHERE id = ?
+    ");
+    $stmt->execute([$order['driver_id']]);
+    $driver = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$driver) {
+        ResponseHandler::error('Driver not found', 404, 'DRIVER_NOT_FOUND');
     }
     
     ResponseHandler::success([
-        'order' => [
-            'id' => $order['id'],
-            'order_number' => $order['order_number'],
-            'status' => $order['status'],
-            'created_at' => $order['created_at'],
-            'updated_at' => $order['updated_at'],
-            'total_amount' => floatval($order['total_amount']),
-            'merchant_name' => $order['merchant_name'],
-            'order_group_id' => $order['order_group_id']
+        'driver' => [
+            'id' => $driver['id'],
+            'name' => $driver['name'],
+            'phone' => $driver['phone'], // Full phone for authenticated users
+            'whatsapp' => $driver['whatsapp_number'],
+            'image' => formatImageUrl($driver['image_url']),
+            'vehicle' => $driver['vehicle_type'],
+            'vehicle_number' => $driver['vehicle_number'],
+            'rating' => floatval($driver['rating'] ?? 0)
         ]
+    ]);
+}
+
+/*********************************
+ * SHARE TRACKING HANDLER
+ * Requires authentication
+ *********************************/
+function handleShareTracking($conn, $input, $userId) {
+    $orderId = $input['order_id'] ?? '';
+    
+    if (empty($orderId)) {
+        ResponseHandler::error('Order ID required', 400, 'MISSING_ORDER_ID');
+    }
+    
+    // Get order details
+    $stmt = $conn->prepare("
+        SELECT 
+            o.order_number,
+            o.total_amount,
+            m.name as merchant_name,
+            og.dropx_tracking_id
+        FROM orders o
+        LEFT JOIN merchants m ON o.merchant_id = m.id
+        LEFT JOIN order_groups og ON o.order_group_id = og.id
+        WHERE o.id = ? AND o.user_id = ?
+    ");
+    $stmt->execute([$orderId, $userId]);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$order) {
+        ResponseHandler::error('Order not found', 404, 'ORDER_NOT_FOUND');
+    }
+    
+    $trackingId = $order['dropx_tracking_id'] ?? $order['order_number'];
+    $trackingUrl = "https://dropx.app/track/$trackingId";
+    
+    // Generate share message
+    $message = "Track my order from {$order['merchant_name']} on DropX!\n";
+    $message .= "Order #: {$order['order_number']}\n";
+    $message .= "Total: MK" . number_format($order['total_amount'], 2) . "\n";
+    $message .= $trackingUrl;
+    
+    ResponseHandler::success([
+        'tracking_id' => $trackingId,
+        'tracking_url' => $trackingUrl,
+        'share_message' => $message,
+        'deep_link' => "dropx://track/$trackingId",
+        'qr_code_url' => "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" . urlencode($trackingUrl)
     ]);
 }
 
@@ -1544,167 +842,395 @@ function getLatestActiveOrder($conn, $userId) {
  * HELPER FUNCTIONS
  *********************************/
 
-function formatImageUrl($imagePath, $baseUrl, $type = '') {
-    if (empty($imagePath)) {
-        return '';
-    }
+/**
+ * Find trackable order by various identifiers
+ */
+function findTrackableOrder($conn, $identifier) {
+    // Try to find by dropx_tracking_id first (from order_groups)
+    $sql = "SELECT 
+                o.*,
+                m.name as merchant_name,
+                m.address as merchant_address,
+                m.phone as merchant_phone,
+                m.image_url as merchant_image,
+                m.latitude as merchant_lat,
+                m.longitude as merchant_lng,
+                og.dropx_tracking_id,
+                og.dropx_pickup_status,
+                og.dropx_estimated_pickup_time,
+                og.dropx_estimated_delivery_time,
+                og.current_location_lat,
+                og.current_location_lng,
+                (
+                    SELECT COUNT(*) 
+                    FROM orders o2 
+                    WHERE o2.order_group_id = o.order_group_id
+                ) as merchant_count
+            FROM orders o
+            LEFT JOIN merchants m ON o.merchant_id = m.id
+            LEFT JOIN order_groups og ON o.order_group_id = og.id
+            WHERE o.order_number = :identifier 
+               OR o.id = :identifier 
+               OR og.dropx_tracking_id = :identifier
+            LIMIT 1";
     
-    // If it's already a full URL, use it as is
-    if (strpos($imagePath, 'http') === 0) {
-        return $imagePath;
-    }
-    
-    $folder = '';
-    switch ($type) {
-        case 'merchants':
-            $folder = 'uploads/merchants';
-            break;
-        case 'drivers':
-            $folder = 'uploads/drivers';
-            break;
-        default:
-            $folder = 'uploads';
-    }
-    
-    return rtrim($baseUrl, '/') . '/' . $folder . '/' . ltrim($imagePath, '/');
+    $stmt = $conn->prepare($sql);
+    $stmt->execute([':identifier' => $identifier]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
-function calculateDeliveryProgress($status) {
-    $statusWeights = [
-        'pending' => 0.1,
-        'confirmed' => 0.2,
-        'preparing' => 0.4,
-        'ready' => 0.6,
-        'picked_up' => 0.8,
-        'on_the_way' => 0.9,
-        'arrived' => 0.95,
-        'delivered' => 1.0,
-        'cancelled' => 0.0,
-        'refunded' => 0.0
+/**
+ * Get all orders in a group for tracking
+ */
+function getGroupOrdersForTracking($conn, $groupId) {
+    $stmt = $conn->prepare("
+        SELECT 
+            o.id,
+            o.order_number,
+            o.status,
+            o.merchant_id,
+            m.name as merchant_name,
+            m.address as merchant_address,
+            gp.pickup_status,
+            gp.actual_pickup_time,
+            gp.estimated_pickup_time
+        FROM orders o
+        JOIN merchants m ON o.merchant_id = m.id
+        LEFT JOIN group_pickups gp ON gp.order_group_id = o.order_group_id AND gp.merchant_id = m.id
+        WHERE o.order_group_id = ?
+        ORDER BY gp.pickup_order
+    ");
+    $stmt->execute([$groupId]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/**
+ * Get pickup progress for group order
+ */
+function getPickupProgress($conn, $groupId) {
+    $stmt = $conn->prepare("
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN pickup_status = 'picked_up' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN pickup_status = 'pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN pickup_status = 'in_progress' THEN 1 ELSE 0 END) as in_progress
+        FROM group_pickups
+        WHERE order_group_id = ?
+    ");
+    $stmt->execute([$groupId]);
+    $progress = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    $total = intval($progress['total']);
+    $completed = intval($progress['completed']);
+    
+    return [
+        'total' => $total,
+        'completed' => $completed,
+        'remaining' => $total - $completed,
+        'percentage' => $total > 0 ? round(($completed / $total) * 100) : 0,
+        'details' => $progress
     ];
-    
-    return $statusWeights[strtolower($status)] ?? 0.1;
 }
 
-function buildDeliveryStatusTimeline($order, $trackingInfo) {
+/**
+ * Get group timeline from tracking history
+ */
+function getGroupTimeline($conn, $groupId) {
+    $stmt = $conn->prepare("
+        SELECT 
+            status,
+            message,
+            location_address,
+            created_at as timestamp
+        FROM group_tracking
+        WHERE order_group_id = ?
+        ORDER BY created_at ASC
+    ");
+    $stmt->execute([$groupId]);
+    $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
     $timeline = [];
-    
-    // Add order created
-    $timeline[] = [
-        'status' => 'order_placed',
-        'description' => 'Order placed successfully',
-        'timestamp' => $order['created_at'],
-        'icon' => 'shopping_bag',
-        'color' => 'green'
-    ];
-    
-    // Add current status from tracking if available
-    if (!empty($trackingInfo['status'])) {
+    foreach ($events as $event) {
         $timeline[] = [
-            'status' => strtolower(str_replace(' ', '_', $trackingInfo['status'])),
-            'description' => getStatusDescription($trackingInfo['status']),
-            'timestamp' => $trackingInfo['created_at'] ?? $order['updated_at'],
-            'icon' => getStatusIcon($trackingInfo['status']),
-            'color' => getStatusColor($trackingInfo['status']),
-            'is_current' => true
+            'id' => 'event_' . count($timeline),
+            'status' => $event['status'],
+            'title' => DROPX_STATUSES[$event['status']]['label'] ?? $event['status'],
+            'description' => $event['message'],
+            'location' => $event['location_address'],
+            'timestamp' => $event['timestamp'],
+            'icon' => getStatusIcon($event['status'])
         ];
     }
     
     return $timeline;
 }
 
-function buildGroupStatusTimeline($orders) {
-    $allEvents = [];
+/**
+ * Get single order timeline
+ */
+function getOrderTimeline($conn, $orderId) {
+    $timeline = [];
     
-    foreach ($orders as $order) {
-        $allEvents[] = [
-            'order_id' => $order['id'],
-            'order_number' => $order['order_number'],
-            'merchant_name' => $order['merchant_name'],
-            'status' => $order['status'],
-            'timestamp' => $order['updated_at'],
-            'description' => getStatusDescription($order['status'])
+    // Get order creation
+    $stmt = $conn->prepare("SELECT created_at FROM orders WHERE id = ?");
+    $stmt->execute([$orderId]);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    $timeline[] = [
+        'id' => 'order_placed',
+        'status' => 'pending',
+        'title' => 'Order Placed',
+        'description' => 'Your order has been received',
+        'timestamp' => $order['created_at'],
+        'icon' => 'shopping_bag'
+    ];
+    
+    // Get status history
+    $stmt = $conn->prepare("
+        SELECT new_status, reason, created_at as timestamp
+        FROM order_status_history
+        WHERE order_id = ?
+        ORDER BY created_at ASC
+    ");
+    $stmt->execute([$orderId]);
+    $history = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    foreach ($history as $event) {
+        if ($event['new_status'] !== 'pending') { // Skip pending as we already added it
+            $timeline[] = [
+                'id' => 'status_' . $event['new_status'],
+                'status' => $event['new_status'],
+                'title' => ORDER_STATUSES[$event['new_status']]['label'] ?? $event['new_status'],
+                'description' => $event['reason'] ?? 'Status updated',
+                'timestamp' => $event['timestamp'],
+                'icon' => getStatusIcon($event['new_status'])
+            ];
+        }
+    }
+    
+    return $timeline;
+}
+
+/**
+ * Get group route waypoints
+ */
+function getGroupWaypoints($conn, $groupId, $includeDetails = false) {
+    $waypoints = [];
+    
+    // Get pickup points in order
+    $stmt = $conn->prepare("
+        SELECT 
+            gp.pickup_order as sequence,
+            'pickup' as type,
+            m.name,
+            m.address,
+            m.latitude,
+            m.longitude,
+            gp.pickup_status as status,
+            gp.estimated_pickup_time as estimated_arrival,
+            gp.actual_pickup_time as actual_arrival
+        FROM group_pickups gp
+        JOIN merchants m ON gp.merchant_id = m.id
+        WHERE gp.order_group_id = ?
+        ORDER BY gp.pickup_order
+    ");
+    $stmt->execute([$groupId]);
+    $pickups = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    foreach ($pickups as $pickup) {
+        $waypoints[] = [
+            'sequence' => intval($pickup['sequence']),
+            'type' => 'pickup',
+            'name' => $pickup['name'],
+            'address' => $pickup['address'],
+            'location' => [
+                'latitude' => floatval($pickup['latitude'] ?? 0),
+                'longitude' => floatval($pickup['longitude'] ?? 0)
+            ],
+            'status' => $pickup['status'] === 'picked_up' ? 'completed' : 
+                       ($pickup['status'] === 'in_progress' ? 'in_progress' : 'pending'),
+            'estimated_arrival' => $pickup['estimated_arrival'],
+            'actual_arrival' => $pickup['actual_arrival']
         ];
     }
     
-    // Sort by timestamp
-    usort($allEvents, function($a, $b) {
-        return strtotime($b['timestamp']) - strtotime($a['timestamp']);
-    });
+    // Get delivery point from any order in the group
+    $stmt = $conn->prepare("
+        SELECT delivery_address
+        FROM orders
+        WHERE order_group_id = ?
+        LIMIT 1
+    ");
+    $stmt->execute([$groupId]);
+    $delivery = $stmt->fetch(PDO::FETCH_ASSOC);
     
-    return $allEvents;
+    if ($delivery) {
+        $waypoints[] = [
+            'sequence' => count($waypoints) + 1,
+            'type' => 'dropoff',
+            'name' => 'Your Location',
+            'address' => $delivery['delivery_address'],
+            'location' => [
+                'latitude' => 0,
+                'longitude' => 0
+            ],
+            'status' => 'pending',
+            'estimated_arrival' => null,
+            'actual_arrival' => null
+        ];
+    }
+    
+    return $waypoints;
 }
 
-function getStatusDescription($status) {
-    $descriptions = [
-        'pending' => 'Order has been placed',
-        'confirmed' => 'Restaurant has accepted your order',
-        'preparing' => 'Chef is preparing your meal',
-        'ready' => 'Your order is ready for pickup',
-        'picked_up' => 'Driver has picked up your order',
-        'on_the_way' => 'Driver is on the way to you',
-        'arrived' => 'Driver has arrived at your location',
-        'delivered' => 'Order delivered successfully'
+/**
+ * Get driver tracking information
+ */
+function getDriverTrackingInfo($conn, $driverId) {
+    $stmt = $conn->prepare("
+        SELECT 
+            id,
+            name,
+            phone,
+            image_url,
+            vehicle_type,
+            vehicle_number,
+            current_latitude,
+            current_longitude,
+            updated_at as location_updated_at,
+            rating
+        FROM drivers
+        WHERE id = ?
+    ");
+    $stmt->execute([$driverId]);
+    $driver = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$driver) {
+        return null;
+    }
+    
+    return [
+        'id' => $driver['id'],
+        'name' => $driver['name'],
+        'phone' => maskPhoneNumber($driver['phone']),
+        'image' => formatImageUrl($driver['image_url']),
+        'vehicle' => $driver['vehicle_type'],
+        'vehicle_number' => $driver['vehicle_number'],
+        'location' => ($driver['current_latitude'] && $driver['current_longitude']) ? [
+            'latitude' => floatval($driver['current_latitude']),
+            'longitude' => floatval($driver['current_longitude']),
+            'last_updated' => $driver['location_updated_at']
+        ] : null,
+        'rating' => floatval($driver['rating'] ?? 0)
     ];
-    
-    return $descriptions[strtolower($status)] ?? 'Status updated';
 }
 
+/**
+ * Calculate tracking progress percentage
+ */
+function calculateTrackingProgress($order, $pickupProgress = null) {
+    if ($order['status'] === 'delivered') {
+        return 100;
+    }
+    
+    if ($order['status'] === 'cancelled') {
+        return 0;
+    }
+    
+    // If multi-merchant, use pickup progress
+    if ($order['order_group_id'] && $pickupProgress) {
+        return $pickupProgress['percentage'];
+    }
+    
+    // Otherwise use status-based progress
+    return (ORDER_STATUSES[$order['status']]['progress'] ?? 0.1) * 100;
+}
+
+/**
+ * Get status display information
+ */
+function getStatusDisplayInfo($orderStatus, $dropxStatus = null) {
+    // If we have DropX status and order is in tracking phase
+    if ($dropxStatus && in_array($orderStatus, TRACKABLE_STATUSES)) {
+        return [
+            'label' => DROPX_STATUSES[$dropxStatus]['label'] ?? $orderStatus,
+            'progress' => (DROPX_STATUSES[$dropxStatus]['progress'] ?? 0.1) * 100,
+            'color' => '#2196F3' // Default blue for DropX
+        ];
+    }
+    
+    // Otherwise use order status
+    return [
+        'label' => ORDER_STATUSES[$orderStatus]['label'] ?? $orderStatus,
+        'progress' => (ORDER_STATUSES[$orderStatus]['progress'] ?? 0.1) * 100,
+        'color' => ORDER_STATUSES[$orderStatus]['color'] ?? '#999999'
+    ];
+}
+
+/**
+ * Calculate ETA based on driver location and route
+ */
+function calculateETA($conn, $orderId, $driver) {
+    // This would use Google Maps Distance Matrix API in production
+    // For now, return estimated delivery time from database
+    $stmt = $conn->prepare("
+        SELECT dropx_estimated_delivery_time
+        FROM orders o
+        LEFT JOIN order_groups og ON o.order_group_id = og.id
+        WHERE o.id = ?
+    ");
+    $stmt->execute([$orderId]);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    return $result['dropx_estimated_delivery_time'] ?? null;
+}
+
+/**
+ * Get icon for status
+ */
 function getStatusIcon($status) {
     $icons = [
         'pending' => 'shopping_bag',
         'confirmed' => 'check_circle',
         'preparing' => 'restaurant',
-        'ready' => 'done_all',
-        'picked_up' => 'local_shipping',
-        'on_the_way' => 'directions_bike',
+        'ready' => 'package',
+        'picked_up' => 'motorcycle',
+        'on_the_way' => 'directions',
         'arrived' => 'location_on',
-        'delivered' => 'home'
+        'delivered' => 'check_circle',
+        'cancelled' => 'cancel',
+        'assigned' => 'person',
+        'heading_to_pickup' => 'navigation',
+        'arrived_at_pickup' => 'store',
+        'pickup_in_progress' => 'inventory',
+        'heading_to_delivery' => 'directions'
     ];
     
-    return $icons[strtolower($status)] ?? 'info';
+    return $icons[$status] ?? 'circle';
 }
 
-function getStatusColor($status) {
-    $colors = [
-        'pending' => 'grey',
-        'confirmed' => 'blue',
-        'preparing' => 'orange',
-        'ready' => 'green',
-        'picked_up' => 'purple',
-        'on_the_way' => 'indigo',
-        'arrived' => 'teal',
-        'delivered' => 'green'
-    ];
+/**
+ * Format image URL
+ */
+function formatImageUrl($path) {
+    global $baseUrl;
     
-    return $colors[strtolower($status)] ?? 'grey';
+    if (empty($path)) {
+        return '';
+    }
+    
+    if (strpos($path, 'http') === 0) {
+        return $path;
+    }
+    
+    return rtrim($baseUrl, '/') . '/uploads/' . ltrim($path, '/');
 }
 
-function determineGroupStatus($orders) {
-    $statuses = array_column($orders, 'status');
-    
-    if (empty($statuses)) {
-        return 'pending';
-    }
-    
-    // If any order is in progress, group is in progress
-    $inProgressStatuses = ['confirmed', 'preparing', 'ready', 'picked_up', 'on_the_way', 'arrived'];
-    foreach ($statuses as $status) {
-        if (in_array($status, $inProgressStatuses)) {
-            return 'in_progress';
-        }
-    }
-    
-    // If all orders are delivered
-    $allDelivered = array_reduce($statuses, function($carry, $status) {
-        return $carry && ($status === 'delivered');
-    }, true);
-    
-    if ($allDelivered) {
-        return 'completed';
-    }
-    
-    // Otherwise, mixed status
-    return 'mixed';
+/**
+ * Mask phone number for privacy in public tracking
+ */
+function maskPhoneNumber($phone) {
+    if (empty($phone) || strlen($phone) < 8) return $phone;
+    return substr($phone, 0, 4) . '****' . substr($phone, -4);
 }
 ?>
