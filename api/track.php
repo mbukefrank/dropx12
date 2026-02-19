@@ -215,16 +215,16 @@ function handleTrackOrder($conn, $input) {
         // Get all orders in the group
         $groupOrders = getGroupOrdersForTracking($conn, $order['order_group_id']);
         
-        // Get pickup progress
+        // Get pickup progress (based on order statuses)
         $pickupProgress = getPickupProgress($conn, $order['order_group_id']);
         
-        // Build timeline from group tracking
+        // Build timeline from order_tracking table
         $timeline = getGroupTimeline($conn, $order['order_group_id']);
         
         // Get route waypoints
         $waypoints = getGroupWaypoints($conn, $order['order_group_id']);
     } else {
-        // Single order - build timeline from order tracking
+        // Single order - build timeline from order_tracking
         $timeline = getOrderTimeline($conn, $order['id']);
     }
 
@@ -234,7 +234,7 @@ function handleTrackOrder($conn, $input) {
     }
 
     // Get estimated delivery times
-    $estimatedDelivery = $order['dropx_estimated_delivery_time'] ?? $order['estimated_delivery'];
+    $estimatedDelivery = $order['dropx_estimated_delivery_time'] ?? null;
     
     // Calculate progress percentage
     $progress = calculateTrackingProgress($order, $pickupProgress);
@@ -285,8 +285,8 @@ function handleTrackOrder($conn, $input) {
                 'name' => $gOrder['merchant_name'],
                 'address' => $gOrder['merchant_address'],
                 'status' => $gOrder['status'],
-                'pickup_status' => $gOrder['pickup_status'],
-                'estimated_pickup' => $gOrder['estimated_pickup']
+                'pickup_status' => $gOrder['status'], // Use order status as pickup status
+                'estimated_pickup' => null
             ];
         }, $groupOrders);
     }
@@ -424,45 +424,68 @@ function handleRealTimeUpdates($conn, $input) {
         }
     }
     
-    // Check for group tracking updates
+    // Check for tracking updates from order_tracking table
     if ($order['order_group_id']) {
+        // Get all order IDs in the group
+        $stmt = $conn->prepare("SELECT id FROM orders WHERE order_group_id = ?");
+        $stmt->execute([$order['order_group_id']]);
+        $orderIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        
+        if (!empty($orderIds)) {
+            $placeholders = implode(',', array_fill(0, count($orderIds), '?'));
+            $params = $orderIds;
+            if ($lastUpdate) {
+                $params[] = $lastUpdate;
+            }
+            
+            $sql = "
+                SELECT ot.*, o.order_number
+                FROM order_tracking ot
+                JOIN orders o ON ot.order_id = o.id
+                WHERE ot.order_id IN ($placeholders)
+            ";
+            
+            if ($lastUpdate) {
+                $sql .= " AND ot.created_at > ?";
+            }
+            
+            $sql .= " ORDER BY ot.created_at DESC";
+            
+            $stmt = $conn->prepare($sql);
+            $stmt->execute($params);
+            $trackingUpdates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            if (!empty($trackingUpdates)) {
+                $updates['tracking_events'] = array_map(function($event) {
+                    return [
+                        'status' => $event['status'],
+                        'message' => "Order #{$event['order_number']} status updated to {$event['status']}",
+                        'timestamp' => $event['created_at']
+                    ];
+                }, $trackingUpdates);
+                $hasUpdates = true;
+            }
+        }
+    } else {
+        // Single order tracking updates
         $stmt = $conn->prepare("
-            SELECT status, message, location_address, created_at
-            FROM group_tracking
-            WHERE order_group_id = ?
-            AND (? IS NULL OR created_at > ?)
-            ORDER BY created_at DESC
+            SELECT ot.*
+            FROM order_tracking ot
+            WHERE ot.order_id = ?
+            AND (? IS NULL OR ot.created_at > ?)
+            ORDER BY ot.created_at DESC
         ");
-        $stmt->execute([$order['order_group_id'], $lastUpdate, $lastUpdate]);
+        $stmt->execute([$order['id'], $lastUpdate, $lastUpdate]);
         $trackingUpdates = $stmt->fetchAll(PDO::FETCH_ASSOC);
         
         if (!empty($trackingUpdates)) {
             $updates['tracking_events'] = array_map(function($event) {
                 return [
                     'status' => $event['status'],
-                    'message' => $event['message'],
-                    'location' => $event['location_address'],
+                    'message' => "Status updated to {$event['status']}",
                     'timestamp' => $event['created_at']
                 ];
             }, $trackingUpdates);
-            $hasUpdates = true;
-        }
-    }
-    
-    // Check for pickup status updates in multi-merchant orders
-    if ($order['order_group_id']) {
-        $stmt = $conn->prepare("
-            SELECT gp.merchant_id, m.name, gp.pickup_status, gp.actual_pickup_time
-            FROM group_pickups gp
-            JOIN merchants m ON gp.merchant_id = m.id
-            WHERE gp.order_group_id = ?
-            AND (? IS NULL OR gp.updated_at > ?)
-        ");
-        $stmt->execute([$order['order_group_id'], $lastUpdate, $lastUpdate]);
-        $pickupUpdates = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        if (!empty($pickupUpdates)) {
-            $updates['pickup_updates'] = $pickupUpdates;
             $hasUpdates = true;
         }
     }
@@ -558,9 +581,13 @@ function handleRouteInfo($conn, $input) {
         'next_stop' => $nextStop,
         'progress' => [
             'total' => count($waypoints),
-            'completed' => count(array_filter($waypoints, fn($wp) => $wp['status'] === 'completed')),
+            'completed' => count(array_filter($waypoints, function($wp) { 
+                return $wp['status'] === 'completed'; 
+            })),
             'percentage' => count($waypoints) > 0 
-                ? (count(array_filter($waypoints, fn($wp) => $wp['status'] === 'completed')) / count($waypoints)) * 100
+                ? (count(array_filter($waypoints, function($wp) { 
+                    return $wp['status'] === 'completed'; 
+                  })) / count($waypoints)) * 100
                 : 0
         ]
     ]);
@@ -587,12 +614,11 @@ function handleTrackingSummary($conn, $userId) {
             d.name as driver_name,
             d.current_latitude,
             d.current_longitude,
-            COUNT(CASE WHEN o2.id IS NOT NULL THEN 1 END) as group_order_count
+            (SELECT COUNT(*) FROM orders o2 WHERE o2.order_group_id = o.order_group_id) as group_order_count
         FROM orders o
         LEFT JOIN merchants m ON o.merchant_id = m.id
         LEFT JOIN drivers d ON o.driver_id = d.id
         LEFT JOIN order_groups og ON o.order_group_id = og.id
-        LEFT JOIN orders o2 ON o.order_group_id = o2.order_group_id AND o2.id != o.id
         WHERE o.user_id = ? 
         AND o.status IN ('confirmed','preparing','ready','picked_up','on_the_way','arrived')
         GROUP BY o.id
@@ -618,7 +644,7 @@ function handleTrackingSummary($conn, $userId) {
             $counts[$order['status']]++;
         }
         
-        $isMultiMerchant = $order['group_order_count'] > 0;
+        $isMultiMerchant = ($order['group_order_count'] ?? 0) > 1;
         $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
         
         $formattedOrders[] = [
@@ -666,11 +692,10 @@ function handleGetTrackableOrders($conn, $userId) {
             og.dropx_estimated_delivery_time,
             m.name as merchant_name,
             m.image_url as merchant_image,
-            COUNT(CASE WHEN o2.id IS NOT NULL THEN 1 END) as group_order_count
+            (SELECT COUNT(*) FROM orders o2 WHERE o2.order_group_id = o.order_group_id) as group_order_count
         FROM orders o
         LEFT JOIN merchants m ON o.merchant_id = m.id
         LEFT JOIN order_groups og ON o.order_group_id = og.id
-        LEFT JOIN orders o2 ON o.order_group_id = o2.order_group_id AND o2.id != o.id
         WHERE o.user_id = ? 
         AND o.status IN ('confirmed','preparing','ready','picked_up','on_the_way','arrived')
         GROUP BY o.id
@@ -693,7 +718,7 @@ function handleGetTrackableOrders($conn, $userId) {
             'merchant_name' => $order['merchant_name'],
             'merchant_image' => formatImageUrl($order['merchant_image']),
             'estimated_delivery' => $order['dropx_estimated_delivery_time'],
-            'is_multi_merchant' => $order['group_order_count'] > 0,
+            'is_multi_merchant' => ($order['group_order_count'] ?? 0) > 1,
             'created_at' => $order['created_at'],
             'updated_at' => $order['updated_at']
         ];
@@ -848,13 +873,38 @@ function findTrackableOrder($conn, $identifier) {
             LEFT JOIN merchants m ON o.merchant_id = m.id
             LEFT JOIN order_groups og ON o.order_group_id = og.id
             WHERE o.order_number = :identifier 
-               OR o.id = :identifier 
-               OR og.dropx_tracking_id = :identifier
+               OR o.id = :identifier2
+               OR og.dropx_tracking_id = :identifier3
             LIMIT 1";
     
     $stmt = $conn->prepare($sql);
-    $stmt->execute([':identifier' => $identifier]);
-    return $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->execute([
+        ':identifier' => $identifier,
+        ':identifier2' => $identifier,
+        ':identifier3' => $identifier
+    ]);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    // If not found, try searching in order_tracking
+    if (!$order) {
+        $sql = "SELECT o.*, m.name as merchant_name, m.address as merchant_address,
+                       m.phone as merchant_phone, m.image_url as merchant_image
+                FROM orders o
+                LEFT JOIN merchants m ON o.merchant_id = m.id
+                LEFT JOIN order_tracking ot ON o.id = ot.order_id
+                WHERE ot.id = :identifier 
+                   OR ot.order_id = :identifier2
+                LIMIT 1";
+        
+        $stmt = $conn->prepare($sql);
+        $stmt->execute([
+            ':identifier' => $identifier,
+            ':identifier2' => $identifier
+        ]);
+        $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+    
+    return $order;
 }
 
 /**
@@ -868,18 +918,23 @@ function getGroupOrdersForTracking($conn, $groupId) {
             o.status,
             o.merchant_id,
             m.name as merchant_name,
-            m.address as merchant_address,
-            gp.pickup_status,
-            gp.actual_pickup_time,
-            gp.estimated_pickup_time
+            m.address as merchant_address
         FROM orders o
         JOIN merchants m ON o.merchant_id = m.id
-        LEFT JOIN group_pickups gp ON gp.order_group_id = o.order_group_id AND gp.merchant_id = m.id
         WHERE o.order_group_id = ?
-        ORDER BY gp.pickup_order
+        ORDER BY o.id
     ");
     $stmt->execute([$groupId]);
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Add pickup status based on order status
+    foreach ($orders as &$order) {
+        $order['pickup_status'] = $order['status'];
+        $order['actual_pickup_time'] = null;
+        $order['estimated_pickup_time'] = null;
+    }
+    
+    return $orders;
 }
 
 /**
@@ -889,11 +944,11 @@ function getPickupProgress($conn, $groupId) {
     $stmt = $conn->prepare("
         SELECT 
             COUNT(*) as total,
-            SUM(CASE WHEN pickup_status = 'picked_up' THEN 1 ELSE 0 END) as completed,
-            SUM(CASE WHEN pickup_status = 'pending' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN pickup_status = 'in_progress' THEN 1 ELSE 0 END) as in_progress
-        FROM group_pickups
-        WHERE order_group_id = ?
+            SUM(CASE WHEN o.status IN ('picked_up', 'on_the_way', 'arrived', 'delivered') THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN o.status IN ('confirmed', 'preparing', 'ready') THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN o.status = 'picked_up' THEN 1 ELSE 0 END) as in_progress
+        FROM orders o
+        WHERE o.order_group_id = ?
     ");
     $stmt->execute([$groupId]);
     $progress = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -911,46 +966,65 @@ function getPickupProgress($conn, $groupId) {
 }
 
 /**
- * Get group timeline from tracking history
+ * Get group timeline from order_tracking table
  */
 function getGroupTimeline($conn, $groupId) {
-    $stmt = $conn->prepare("
-        SELECT 
-            status,
-            message,
-            location_address,
-            created_at as timestamp
-        FROM group_tracking
-        WHERE order_group_id = ?
-        ORDER BY created_at ASC
-    ");
+    // First get all orders in the group
+    $stmt = $conn->prepare("SELECT id, order_number FROM orders WHERE order_group_id = ?");
     $stmt->execute([$groupId]);
-    $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     $timeline = [];
-    foreach ($events as $event) {
-        $timeline[] = [
-            'id' => 'event_' . count($timeline),
-            'status' => $event['status'],
-            'title' => DROPX_STATUSES[$event['status']]['label'] ?? $event['status'],
-            'description' => $event['message'],
-            'location' => $event['location_address'],
-            'timestamp' => $event['timestamp'],
-            'icon' => getStatusIcon($event['status'])
-        ];
+    
+    if (!empty($orders)) {
+        $orderIds = array_column($orders, 'id');
+        $orderMap = [];
+        foreach ($orders as $order) {
+            $orderMap[$order['id']] = $order['order_number'];
+        }
+        
+        $placeholders = implode(',', array_fill(0, count($orderIds), '?'));
+        
+        // Get tracking info from order_tracking
+        $stmt = $conn->prepare("
+            SELECT 
+                ot.status,
+                ot.created_at as timestamp
+            FROM order_tracking ot
+            WHERE ot.order_id IN ($placeholders)
+            ORDER BY ot.created_at ASC
+        ");
+        $stmt->execute($orderIds);
+        $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        foreach ($events as $event) {
+            $timeline[] = [
+                'id' => 'event_' . count($timeline),
+                'status' => $event['status'],
+                'title' => ORDER_STATUSES[$event['status']]['label'] ?? $event['status'],
+                'description' => "Order status updated to " . (ORDER_STATUSES[$event['status']]['label'] ?? $event['status']),
+                'timestamp' => $event['timestamp'],
+                'icon' => getStatusIcon($event['status'])
+            ];
+        }
     }
+    
+    // Sort by timestamp
+    usort($timeline, function($a, $b) {
+        return strtotime($a['timestamp']) - strtotime($b['timestamp']);
+    });
     
     return $timeline;
 }
 
 /**
- * Get single order timeline
+ * Get single order timeline from order_tracking table
  */
 function getOrderTimeline($conn, $orderId) {
     $timeline = [];
     
     // Get order creation
-    $stmt = $conn->prepare("SELECT created_at FROM orders WHERE id = ?");
+    $stmt = $conn->prepare("SELECT created_at, order_number FROM orders WHERE id = ?");
     $stmt->execute([$orderId]);
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
     
@@ -958,15 +1032,15 @@ function getOrderTimeline($conn, $orderId) {
         'id' => 'order_placed',
         'status' => 'pending',
         'title' => 'Order Placed',
-        'description' => 'Your order has been received',
+        'description' => "Order #{$order['order_number']} has been received",
         'timestamp' => $order['created_at'],
         'icon' => 'shopping_bag'
     ];
     
-    // Get status history
+    // Get tracking history from order_tracking
     $stmt = $conn->prepare("
-        SELECT new_status, reason, created_at as timestamp
-        FROM order_status_history
+        SELECT status, created_at as timestamp
+        FROM order_tracking
         WHERE order_id = ?
         ORDER BY created_at ASC
     ");
@@ -974,14 +1048,14 @@ function getOrderTimeline($conn, $orderId) {
     $history = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     foreach ($history as $event) {
-        if ($event['new_status'] !== 'pending') { // Skip pending as we already added it
+        if ($event['status'] !== 'pending') { // Skip pending as we already added it
             $timeline[] = [
-                'id' => 'status_' . $event['new_status'],
-                'status' => $event['new_status'],
-                'title' => ORDER_STATUSES[$event['new_status']]['label'] ?? $event['new_status'],
-                'description' => $event['reason'] ?? 'Status updated',
+                'id' => 'status_' . $event['status'],
+                'status' => $event['status'],
+                'title' => ORDER_STATUSES[$event['status']]['label'] ?? $event['status'],
+                'description' => 'Status updated to ' . (ORDER_STATUSES[$event['status']]['label'] ?? $event['status']),
                 'timestamp' => $event['timestamp'],
-                'icon' => getStatusIcon($event['new_status'])
+                'icon' => getStatusIcon($event['status'])
             ];
         }
     }
@@ -995,29 +1069,36 @@ function getOrderTimeline($conn, $orderId) {
 function getGroupWaypoints($conn, $groupId, $includeDetails = false) {
     $waypoints = [];
     
-    // Get pickup points in order
+    // Get all orders in the group as pickup points
     $stmt = $conn->prepare("
         SELECT 
-            gp.pickup_order as sequence,
-            'pickup' as type,
+            o.id,
+            o.merchant_id,
             m.name,
             m.address,
             m.latitude,
             m.longitude,
-            gp.pickup_status as status,
-            gp.estimated_pickup_time as estimated_arrival,
-            gp.actual_pickup_time as actual_arrival
-        FROM group_pickups gp
-        JOIN merchants m ON gp.merchant_id = m.id
-        WHERE gp.order_group_id = ?
-        ORDER BY gp.pickup_order
+            o.status,
+            ROW_NUMBER() OVER (ORDER BY o.id) as sequence
+        FROM orders o
+        JOIN merchants m ON o.merchant_id = m.id
+        WHERE o.order_group_id = ?
+        ORDER BY o.id
     ");
     $stmt->execute([$groupId]);
     $pickups = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
+    $sequence = 1;
     foreach ($pickups as $pickup) {
+        $status = 'pending';
+        if (in_array($pickup['status'], ['delivered', 'arrived', 'on_the_way', 'picked_up'])) {
+            $status = 'completed';
+        } elseif ($pickup['status'] === 'ready') {
+            $status = 'in_progress';
+        }
+        
         $waypoints[] = [
-            'sequence' => intval($pickup['sequence']),
+            'sequence' => $sequence++,
             'type' => 'pickup',
             'name' => $pickup['name'],
             'address' => $pickup['address'],
@@ -1025,10 +1106,9 @@ function getGroupWaypoints($conn, $groupId, $includeDetails = false) {
                 'latitude' => floatval($pickup['latitude'] ?? 0),
                 'longitude' => floatval($pickup['longitude'] ?? 0)
             ],
-            'status' => $pickup['status'] === 'picked_up' ? 'completed' : 
-                       ($pickup['status'] === 'in_progress' ? 'in_progress' : 'pending'),
-            'estimated_arrival' => $pickup['estimated_arrival'],
-            'actual_arrival' => $pickup['actual_arrival']
+            'status' => $status,
+            'estimated_arrival' => null,
+            'actual_arrival' => null
         ];
     }
     
@@ -1044,7 +1124,7 @@ function getGroupWaypoints($conn, $groupId, $includeDetails = false) {
     
     if ($delivery) {
         $waypoints[] = [
-            'sequence' => count($waypoints) + 1,
+            'sequence' => $sequence,
             'type' => 'dropoff',
             'name' => 'Your Location',
             'address' => $delivery['delivery_address'],
