@@ -399,10 +399,13 @@ function getWalletStats($conn, $user_id) {
  * FORMATTING FUNCTIONS
  *********************************/
 function formatTransaction($t) {
+    // Force MK as the currency symbol regardless of what CURRENCY_SYMBOL is defined as
+    $currency = 'MK'; // Hardcode it here to bypass any incorrect constant
+    
     return [
         'id' => $t['id'],
         'amount' => floatval($t['amount']),
-        'formatted_amount' => CURRENCY_SYMBOL . ' ' . number_format($t['amount'], 2),
+        'formatted_amount' => $currency . ' ' . number_format($t['amount'], 2),
         'description' => $t['description'],
         'type' => $t['type'],
         'status' => $t['status'],
