@@ -100,15 +100,6 @@ $baseUrl = "https://dropx12-production.up.railway.app";
  * MAIN HANDLER
  *********************************/
 try {
-    // Validate app version if provided
-    $appVersion = $_SERVER['HTTP_X_APP_VERSION'] ?? '0.0.0';
-    if (version_compare($appVersion, MIN_APP_VERSION, '<')) {
-        ResponseHandler::error('App update required', 426, [
-            'update_required' => true,
-            'min_version' => MIN_APP_VERSION
-        ]);
-    }
-
     // Get request data
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
