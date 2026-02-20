@@ -3,7 +3,7 @@
  * CHECKOUT SCREEN - DROPX WALLET ONLY
  * Malawi Kwacha (MWK)
  * 4-Character Alphanumeric External Codes
- * WITH FULL MULTI-MERCHANT SUPPORT - DEBUG VERSION
+ * SINGLE MERCHANT ONLY
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -220,7 +220,7 @@ function getActiveCart($conn, $userId) {
 /*********************************
  * GET CART ITEMS WITH MERCHANT DETAILS
  *********************************/
-function getCartItemsWithMerchants($conn, $cartId) {
+function getCartItemsWithMerchant($conn, $cartId) {
     debug_log("Getting cart items for cart", $cartId);
     
     $stmt = $conn->prepare(
@@ -240,7 +240,7 @@ function getCartItemsWithMerchants($conn, $cartId) {
          JOIN merchants m ON mi.merchant_id = m.id
          WHERE ci.cart_id = :cart_id
          AND ci.is_active = 1
-         ORDER BY m.id, mi.name"
+         ORDER BY mi.name"
     );
     $stmt->execute([':cart_id' => $cartId]);
     $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -250,31 +250,34 @@ function getCartItemsWithMerchants($conn, $cartId) {
 }
 
 /*********************************
- * GROUP CART ITEMS BY MERCHANT
+ * CALCULATE CART TOTALS (SINGLE MERCHANT)
  *********************************/
-function groupItemsByMerchant($items) {
-    $merchants = [];
-    $totalSubtotal = 0;
+function calculateCartTotals($conn, $cartId, $userId, $items) {
+    debug_log("Calculating totals for cart", $cartId);
+    
+    if (empty($items)) {
+        return null;
+    }
+    
+    // Get merchant info from first item (all items same merchant)
+    $merchantId = $items[0]['merchant_id'];
+    $merchantName = $items[0]['merchant_name'];
+    $deliveryFee = floatval($items[0]['merchant_delivery_fee'] ?? 1500.00);
+    $minimumOrder = floatval($items[0]['merchant_minimum'] ?? 0);
+    
+    // Calculate subtotal
+    $subtotal = 0;
+    $itemCount = 0;
+    $totalQuantity = 0;
+    $formattedItems = [];
     
     foreach ($items as $item) {
-        $merchantId = $item['merchant_id'];
-        
-        if (!isset($merchants[$merchantId])) {
-            $merchants[$merchantId] = [
-                'merchant_id' => $merchantId,
-                'merchant_name' => $item['merchant_name'],
-                'delivery_fee' => floatval($item['merchant_delivery_fee'] ?? 1500.00),
-                'minimum_order' => floatval($item['merchant_minimum'] ?? 0),
-                'items' => [],
-                'subtotal' => 0,
-                'item_count' => 0,
-                'total_quantity' => 0
-            ];
-        }
-        
         $itemTotal = floatval($item['price']) * intval($item['quantity']);
+        $subtotal += $itemTotal;
+        $itemCount++;
+        $totalQuantity += intval($item['quantity']);
         
-        $merchants[$merchantId]['items'][] = [
+        $formattedItems[] = [
             'id' => $item['id'],
             'menu_item_id' => $item['menu_item_id'],
             'name' => $item['item_name'],
@@ -284,24 +287,15 @@ function groupItemsByMerchant($items) {
             'formatted_price' => 'MK' . number_format($item['price'], 2),
             'formatted_total' => 'MK' . number_format($itemTotal, 2)
         ];
-        
-        $merchants[$merchantId]['subtotal'] += $itemTotal;
-        $merchants[$merchantId]['item_count']++;
-        $merchants[$merchantId]['total_quantity'] += intval($item['quantity']);
-        $totalSubtotal += $itemTotal;
     }
     
-    return ['merchants' => $merchants, 'total_subtotal' => $totalSubtotal];
-}
-
-/*********************************
- * CALCULATE CART TOTALS WITH MERCHANT BREAKDOWN
- *********************************/
-function calculateCartTotalsWithMerchants($conn, $cartId, $userId, $merchants, $totalSubtotal) {
-    debug_log("Calculating totals for cart", $cartId);
-    
-    // Global calculations
-    $discount = 0;
+    // Check minimum order
+    $minimumMet = true;
+    $shortfall = 0;
+    if ($minimumOrder > 0 && $subtotal < $minimumOrder) {
+        $minimumMet = false;
+        $shortfall = $minimumOrder - $subtotal;
+    }
     
     // Get cart discount if any
     $cartStmt = $conn->prepare("SELECT applied_discount FROM carts WHERE id = :cart_id");
@@ -309,88 +303,51 @@ function calculateCartTotalsWithMerchants($conn, $cartId, $userId, $merchants, $
     $cartData = $cartStmt->fetch(PDO::FETCH_ASSOC);
     $discount = floatval($cartData['applied_discount'] ?? 0);
     
-    // Apply discount proportionally if it exists
-    $adjustedSubtotal = max(0, $totalSubtotal - $discount);
+    // Apply discount
+    $adjustedSubtotal = max(0, $subtotal - $discount);
     
-    // Global fees
-    $globalServiceFee = max(500.00, $adjustedSubtotal * 0.02);
-    $globalTaxRate = 0.165;
+    // Calculate fees
+    $serviceFee = max(500.00, $adjustedSubtotal * 0.02);
+    $taxRate = 0.165;
     
-    // Calculate per-merchant totals
-    $merchantTotals = [];
-    $totalDeliveryFees = 0;
-    $totalServiceFees = 0;
-    $totalTaxAmounts = 0;
-    $totalAmount = 0;
+    // Calculate tax
+    $taxableAmount = $adjustedSubtotal + $deliveryFee + $serviceFee;
+    $taxAmount = round($taxableAmount * $taxRate, 2);
     
-    foreach ($merchants as $merchantId => $merchant) {
-        // Calculate this merchant's share of discount (proportional to their subtotal)
-        $merchantRatio = $merchant['subtotal'] / $totalSubtotal;
-        $merchantDiscount = round($discount * $merchantRatio, 2);
-        $merchantAdjustedSubtotal = $merchant['subtotal'] - $merchantDiscount;
-        
-        // Use merchant's delivery fee
-        $deliveryFee = $merchant['delivery_fee'];
-        
-        // Calculate merchant's share of service fee
-        $serviceFee = round($globalServiceFee * $merchantRatio, 2);
-        
-        // Calculate tax (applies to subtotal + delivery + service fee)
-        $taxableAmount = $merchantAdjustedSubtotal + $deliveryFee + $serviceFee;
-        $taxAmount = round($taxableAmount * $globalTaxRate, 2);
-        
-        // Merchant total
-        $merchantTotal = $taxableAmount + $taxAmount;
-        
-        $merchantTotals[$merchantId] = [
-            'merchant_id' => $merchantId,
-            'merchant_name' => $merchant['merchant_name'],
-            'subtotal' => round($merchant['subtotal'], 2),
-            'subtotal_formatted' => 'MK' . number_format($merchant['subtotal'], 2),
-            'discount' => $merchantDiscount,
-            'discount_formatted' => 'MK' . number_format($merchantDiscount, 2),
-            'adjusted_subtotal' => $merchantAdjustedSubtotal,
-            'adjusted_subtotal_formatted' => 'MK' . number_format($merchantAdjustedSubtotal, 2),
-            'delivery_fee' => $deliveryFee,
-            'delivery_fee_formatted' => 'MK' . number_format($deliveryFee, 2),
-            'service_fee' => $serviceFee,
-            'service_fee_formatted' => 'MK' . number_format($serviceFee, 2),
-            'tax_amount' => $taxAmount,
-            'tax_amount_formatted' => 'MK' . number_format($taxAmount, 2),
-            'total' => $merchantTotal,
-            'total_formatted' => 'MK' . number_format($merchantTotal, 2),
-            'item_count' => $merchant['item_count'],
-            'total_quantity' => $merchant['total_quantity']
-        ];
-        
-        $totalDeliveryFees += $deliveryFee;
-        $totalServiceFees += $serviceFee;
-        $totalTaxAmounts += $taxAmount;
-        $totalAmount += $merchantTotal;
-    }
+    // Total
+    $totalAmount = $taxableAmount + $taxAmount;
     
     return [
-        'merchant_totals' => $merchantTotals,
-        'global' => [
-            'subtotal' => round($totalSubtotal, 2),
-            'subtotal_formatted' => 'MK' . number_format($totalSubtotal, 2),
-            'discount' => round($discount, 2),
-            'discount_formatted' => 'MK' . number_format($discount, 2),
-            'adjusted_subtotal' => round($adjustedSubtotal, 2),
-            'adjusted_subtotal_formatted' => 'MK' . number_format($adjustedSubtotal, 2),
-            'total_delivery_fees' => round($totalDeliveryFees, 2),
-            'total_delivery_fees_formatted' => 'MK' . number_format($totalDeliveryFees, 2),
-            'total_service_fees' => round($totalServiceFees, 2),
-            'total_service_fees_formatted' => 'MK' . number_format($totalServiceFees, 2),
-            'total_tax' => round($totalTaxAmounts, 2),
-            'total_tax_formatted' => 'MK' . number_format($totalTaxAmounts, 2),
-            'total_amount' => round($totalAmount, 2),
-            'total_amount_formatted' => 'MK' . number_format($totalAmount, 2),
-            'tax_rate' => '16.5%',
-            'item_count' => array_sum(array_column($merchantTotals, 'item_count')),
-            'total_quantity' => array_sum(array_column($merchantTotals, 'total_quantity')),
-            'currency' => 'MWK'
-        ]
+        'merchant' => [
+            'id' => $merchantId,
+            'name' => $merchantName,
+            'delivery_fee' => $deliveryFee,
+            'delivery_fee_formatted' => 'MK' . number_format($deliveryFee, 2),
+            'minimum_order' => $minimumOrder,
+            'minimum_order_formatted' => 'MK' . number_format($minimumOrder, 2),
+            'minimum_met' => $minimumMet,
+            'shortfall' => $shortfall,
+            'shortfall_formatted' => 'MK' . number_format($shortfall, 2)
+        ],
+        'items' => $formattedItems,
+        'subtotal' => round($subtotal, 2),
+        'subtotal_formatted' => 'MK' . number_format($subtotal, 2),
+        'discount' => round($discount, 2),
+        'discount_formatted' => 'MK' . number_format($discount, 2),
+        'adjusted_subtotal' => round($adjustedSubtotal, 2),
+        'adjusted_subtotal_formatted' => 'MK' . number_format($adjustedSubtotal, 2),
+        'delivery_fee' => $deliveryFee,
+        'delivery_fee_formatted' => 'MK' . number_format($deliveryFee, 2),
+        'service_fee' => round($serviceFee, 2),
+        'service_fee_formatted' => 'MK' . number_format($serviceFee, 2),
+        'tax_amount' => $taxAmount,
+        'tax_amount_formatted' => 'MK' . number_format($taxAmount, 2),
+        'total_amount' => round($totalAmount, 2),
+        'total_amount_formatted' => 'MK' . number_format($totalAmount, 2),
+        'item_count' => $itemCount,
+        'total_quantity' => $totalQuantity,
+        'tax_rate' => '16.5%',
+        'currency' => 'MWK'
     ];
 }
 
@@ -425,30 +382,6 @@ function validateCart($conn, $cartId) {
     $result = $stmt->fetch(PDO::FETCH_ASSOC);
     
     return intval($result['count'] ?? 0) > 0;
-}
-
-/*********************************
- * VALIDATE MERCHANT MINIMUM ORDERS
- *********************************/
-function validateMerchantMinimums($merchants) {
-    $violations = [];
-    
-    foreach ($merchants as $merchantId => $merchant) {
-        if ($merchant['minimum_order'] > 0 && $merchant['subtotal'] < $merchant['minimum_order']) {
-            $violations[] = [
-                'merchant_id' => $merchantId,
-                'merchant_name' => $merchant['merchant_name'],
-                'minimum' => $merchant['minimum_order'],
-                'minimum_formatted' => 'MK' . number_format($merchant['minimum_order'], 2),
-                'current' => $merchant['subtotal'],
-                'current_formatted' => 'MK' . number_format($merchant['subtotal'], 2),
-                'shortfall' => $merchant['minimum_order'] - $merchant['subtotal'],
-                'shortfall_formatted' => 'MK' . number_format($merchant['minimum_order'] - $merchant['subtotal'], 2)
-            ];
-        }
-    }
-    
-    return $violations;
 }
 
 /*********************************
@@ -491,44 +424,21 @@ function createExternalPayment($conn, $userId, $cartId, $amount, $walletBalance)
 }
 
 /*********************************
- * CREATE ORDER GROUP
+ * CREATE SINGLE ORDER (REPLACES ORDER GROUP)
  *********************************/
-function createOrderGroup($conn, $userId, $cartId, $totalAmount) {
-    debug_log("Creating order group", ['user' => $userId, 'cart' => $cartId, 'amount' => $totalAmount]);
-    
-    $stmt = $conn->prepare(
-        "INSERT INTO order_groups (user_id, cart_id, total_amount, status, created_at)
-         VALUES (:user_id, :cart_id, :total_amount, 'pending', NOW())"
-    );
-    
-    $stmt->execute([
-        ':user_id' => $userId,
-        ':cart_id' => $cartId,
-        ':total_amount' => $totalAmount
-    ]);
-    
-    $groupId = $conn->lastInsertId();
-    debug_log("Order group created", $groupId);
-    
-    return $groupId;
-}
-
-/*********************************
- * CREATE MERCHANT ORDER (FIXED)
- *********************************/
-function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $merchantTotals, $deliveryAddress, $paymentMethod = 'dropx_wallet') {
-    debug_log("Creating merchant order", ['merchant' => $merchantId, 'group' => $orderGroupId]);
+function createSingleOrder($conn, $userId, $cartId, $totals, $deliveryAddress, $paymentMethod = 'dropx_wallet') {
+    debug_log("Creating single order", ['user' => $userId, 'cart' => $cartId]);
     
     // Generate unique order number
-    $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT) . '-' . $merchantId;
+    $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
     
     $stmt = $conn->prepare(
         "INSERT INTO orders 
-            (order_number, user_id, merchant_id, order_group_id, 
+            (order_number, user_id, merchant_id, 
              subtotal, discount_amount, delivery_fee, service_fee, tax_amount, total_amount,
              payment_method, payment_status, delivery_address, status, created_at, updated_at)
          VALUES 
-            (:order_number, :user_id, :merchant_id, :order_group_id,
+            (:order_number, :user_id, :merchant_id,
              :subtotal, :discount, :delivery_fee, :service_fee, :tax_amount, :total_amount,
              :payment_method, 'paid', :delivery_address, 'confirmed', NOW(), NOW())"
     );
@@ -536,14 +446,13 @@ function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $mercha
     $params = [
         ':order_number' => $orderNumber,
         ':user_id' => $userId,
-        ':merchant_id' => $merchantId,
-        ':order_group_id' => $orderGroupId,
-        ':subtotal' => $merchantTotals['subtotal'],
-        ':discount' => $merchantTotals['discount'],
-        ':delivery_fee' => $merchantTotals['delivery_fee'],
-        ':service_fee' => $merchantTotals['service_fee'],
-        ':tax_amount' => $merchantTotals['tax_amount'],
-        ':total_amount' => $merchantTotals['total'],
+        ':merchant_id' => $totals['merchant']['id'],
+        ':subtotal' => $totals['subtotal'],
+        ':discount' => $totals['discount'],
+        ':delivery_fee' => $totals['delivery_fee'],
+        ':service_fee' => $totals['service_fee'],
+        ':tax_amount' => $totals['tax_amount'],
+        ':total_amount' => $totals['total_amount'],
         ':payment_method' => $paymentMethod,
         ':delivery_address' => $deliveryAddress
     ];
@@ -561,7 +470,7 @@ function createMerchantOrder($conn, $userId, $merchantId, $orderGroupId, $mercha
 }
 
 /*********************************
- * ADD ORDER ITEMS (FIXED)
+ * ADD ORDER ITEMS
  *********************************/
 function addOrderItems($conn, $orderId, $items) {
     debug_log("Adding items to order", ['order' => $orderId, 'item_count' => count($items)]);
@@ -615,21 +524,20 @@ function createOrderTracking($conn, $orderId) {
 }
 
 /*********************************
- * PROCESS DROPX WALLET PAYMENT - MULTI-MERCHANT (COMPLETELY REWRITTEN FOR DEBUGGING)
+ * PROCESS WALLET PAYMENT - SINGLE ORDER
  *********************************/
-function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTotals, $globalTotals) {
+function processWalletPayment($conn, $userId, $cartId, $items, $totals) {
     debug_log("=== STARTING PAYMENT PROCESSING ===");
     debug_log("Params", [
         'user' => $userId,
         'cart' => $cartId,
-        'total' => $globalTotals['total_amount'],
-        'merchant_count' => count($merchants)
+        'total' => $totals['total_amount']
     ]);
     
     try {
         $conn->beginTransaction();
         
-        $totalAmount = $globalTotals['total_amount'];
+        $totalAmount = $totals['total_amount'];
         
         // STEP 1: Check wallet balance
         debug_log("STEP 1: Checking wallet balance");
@@ -673,7 +581,7 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
                 (:user_id, :amount, 'debit', 'cart', :reference_id, 'completed', :description)"
         );
         
-        $description = 'Payment for multi-merchant order from cart #' . $cartId;
+        $description = 'Payment for order from cart #' . $cartId;
         $txnParams = [
             ':user_id' => $userId,
             ':amount' => $totalAmount,
@@ -691,48 +599,26 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
             : 'Default Address';
         debug_log("Delivery address", $deliveryAddress);
         
-        // STEP 5: Create order group
-        debug_log("STEP 5: Creating order group");
-        $orderGroupId = createOrderGroup($conn, $userId, $cartId, $totalAmount);
+        // STEP 5: Create single order
+        debug_log("STEP 5: Creating order");
+        $orderData = createSingleOrder(
+            $conn, 
+            $userId, 
+            $cartId, 
+            $totals, 
+            $deliveryAddress
+        );
         
-        // STEP 6: Create orders for each merchant
-        debug_log("STEP 6: Creating merchant orders");
-        $createdOrders = [];
+        // STEP 6: Add order items
+        debug_log("STEP 6: Adding order items");
+        addOrderItems($conn, $orderData['order_id'], $items);
         
-        foreach ($merchantTotals as $merchantId => $totals) {
-            debug_log("Processing merchant", $merchantId);
-            
-            // Get items for this merchant
-            $merchantItems = $merchants[$merchantId]['items'];
-            
-            // Create order
-            $orderData = createMerchantOrder(
-                $conn, 
-                $userId, 
-                $merchantId, 
-                $orderGroupId, 
-                $totals, 
-                $deliveryAddress
-            );
-            
-            // Add order items
-            addOrderItems($conn, $orderData['order_id'], $merchantItems);
-            
-            // Create tracking
-            createOrderTracking($conn, $orderData['order_id']);
-            
-            $createdOrders[] = [
-                'order_id' => $orderData['order_id'],
-                'order_number' => $orderData['order_number'],
-                'merchant_id' => $merchantId,
-                'merchant_name' => $merchants[$merchantId]['merchant_name'],
-                'total' => $totals['total'],
-                'total_formatted' => $totals['total_formatted']
-            ];
-        }
+        // STEP 7: Create tracking
+        debug_log("STEP 7: Creating tracking");
+        createOrderTracking($conn, $orderData['order_id']);
         
-        // STEP 7: Clear the cart
-        debug_log("STEP 7: Clearing cart");
+        // STEP 8: Clear the cart
+        debug_log("STEP 8: Clearing cart");
         $clearCartStmt = $conn->prepare(
             "UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id"
         );
@@ -743,20 +629,15 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
         );
         $updateCartStmt->execute([':cart_id' => $cartId]);
         
-        // STEP 8: Update order group status
-        debug_log("STEP 8: Updating order group");
-        $updateGroupStmt = $conn->prepare(
-            "UPDATE order_groups SET status = 'completed' WHERE id = :group_id"
-        );
-        $updateGroupStmt->execute([':group_id' => $orderGroupId]);
-        
         $conn->commit();
         debug_log("=== PAYMENT COMPLETED SUCCESSFULLY ===");
         
         return [
             'success' => true,
-            'order_group_id' => $orderGroupId,
-            'orders' => $createdOrders,
+            'order_id' => $orderData['order_id'],
+            'order_number' => $orderData['order_number'],
+            'merchant_id' => $totals['merchant']['id'],
+            'merchant_name' => $totals['merchant']['name'],
             'total_amount' => $totalAmount,
             'total_amount_formatted' => 'MK' . number_format($totalAmount, 2),
             'new_balance' => $wallet['balance'] - $totalAmount,
@@ -766,7 +647,7 @@ function processWalletPayment($conn, $userId, $cartId, $merchants, $merchantTota
     } catch (Exception $e) {
         $conn->rollBack();
         debug_log("!!! PAYMENT ERROR: " . $e->getMessage());
-        error_log("Multi-merchant payment error: " . $e->getMessage());
+        error_log("Payment error: " . $e->getMessage());
         error_log("Stack trace: " . $e->getTraceAsString());
         
         return [
@@ -822,25 +703,34 @@ try {
             ResponseHandler::error('Cart is empty', 400);
         }
         
-        // Get all cart items with merchant details
-        $items = getCartItemsWithMerchants($conn, $cart['id']);
+        // Get all cart items
+        $items = getCartItemsWithMerchant($conn, $cart['id']);
         
-        // Group items by merchant
-        $groupedData = groupItemsByMerchant($items);
-        $merchants = $groupedData['merchants'];
-        $totalSubtotal = $groupedData['total_subtotal'];
-        
-        // Validate merchant minimums
-        $minimumViolations = validateMerchantMinimums($merchants);
-        if (!empty($minimumViolations)) {
-            ResponseHandler::error([
-                'message' => 'Some merchants have minimum order requirements',
-                'violations' => $minimumViolations
-            ], 400);
+        // Check if all items are from same merchant
+        $merchantIds = array_unique(array_column($items, 'merchant_id'));
+        if (count($merchantIds) > 1) {
+            debug_log("Cart contains items from multiple merchants", $merchantIds);
+            ResponseHandler::error('Cart contains items from multiple merchants. Please checkout each merchant separately.', 400);
         }
         
-        // Calculate totals with merchant breakdown
-        $totals = calculateCartTotalsWithMerchants($conn, $cart['id'], $userId, $merchants, $totalSubtotal);
+        // Calculate totals
+        $totals = calculateCartTotals($conn, $cart['id'], $userId, $items);
+        
+        // Check minimum order
+        if (!$totals['merchant']['minimum_met']) {
+            ResponseHandler::error([
+                'message' => 'Minimum order requirement not met',
+                'violation' => [
+                    'merchant_name' => $totals['merchant']['name'],
+                    'minimum' => $totals['merchant']['minimum_order'],
+                    'minimum_formatted' => $totals['merchant']['minimum_order_formatted'],
+                    'current' => $totals['subtotal'],
+                    'current_formatted' => $totals['subtotal_formatted'],
+                    'shortfall' => $totals['merchant']['shortfall'],
+                    'shortfall_formatted' => $totals['merchant']['shortfall_formatted']
+                ]
+            ], 400);
+        }
         
         // Get user address and wallet
         $address = getUserDefaultAddress($conn, $userId);
@@ -849,9 +739,28 @@ try {
         // Prepare response
         $response = [
             'cart_id' => $cart['id'],
-            'merchants' => array_values($merchants),
-            'merchant_totals' => array_values($totals['merchant_totals']),
-            'totals' => $totals['global'],
+            'merchant' => $totals['merchant'],
+            'items' => $totals['items'],
+            'totals' => [
+                'subtotal' => $totals['subtotal'],
+                'subtotal_formatted' => $totals['subtotal_formatted'],
+                'discount' => $totals['discount'],
+                'discount_formatted' => $totals['discount_formatted'],
+                'adjusted_subtotal' => $totals['adjusted_subtotal'],
+                'adjusted_subtotal_formatted' => $totals['adjusted_subtotal_formatted'],
+                'delivery_fee' => $totals['delivery_fee'],
+                'delivery_fee_formatted' => $totals['delivery_fee_formatted'],
+                'service_fee' => $totals['service_fee'],
+                'service_fee_formatted' => $totals['service_fee_formatted'],
+                'tax_amount' => $totals['tax_amount'],
+                'tax_amount_formatted' => $totals['tax_amount_formatted'],
+                'total_amount' => $totals['total_amount'],
+                'total_amount_formatted' => $totals['total_amount_formatted'],
+                'item_count' => $totals['item_count'],
+                'total_quantity' => $totals['total_quantity'],
+                'tax_rate' => $totals['tax_rate'],
+                'currency' => $totals['currency']
+            ],
             'delivery_address' => $address ? [
                 'id' => $address['id'],
                 'label' => $address['label'] ?? 'Home',
@@ -865,16 +774,16 @@ try {
                 'balance' => $wallet['balance'],
                 'balance_formatted' => 'MK' . number_format($wallet['balance'], 2),
                 'is_active' => $wallet['is_active'],
-                'sufficient' => $wallet['balance'] >= $totals['global']['total_amount'],
-                'shortfall' => $wallet['balance'] >= $totals['global']['total_amount'] ? 0 : 
-                              round($totals['global']['total_amount'] - $wallet['balance'], 2),
-                'shortfall_formatted' => $wallet['balance'] >= $totals['global']['total_amount'] ? 'MK0.00' : 
-                              'MK' . number_format($totals['global']['total_amount'] - $wallet['balance'], 2)
+                'sufficient' => $wallet['balance'] >= $totals['total_amount'],
+                'shortfall' => $wallet['balance'] >= $totals['total_amount'] ? 0 : 
+                              round($totals['total_amount'] - $wallet['balance'], 2),
+                'shortfall_formatted' => $wallet['balance'] >= $totals['total_amount'] ? 'MK0.00' : 
+                              'MK' . number_format($totals['total_amount'] - $wallet['balance'], 2)
             ],
             'payment_options' => [
                 'dropx_wallet' => [
                     'available' => $wallet['exists'] && $wallet['is_active'],
-                    'can_pay' => $wallet['balance'] >= $totals['global']['total_amount']
+                    'can_pay' => $wallet['balance'] >= $totals['total_amount']
                 ],
                 'external' => [
                     'available' => true,
@@ -936,23 +845,22 @@ try {
                 }
                 
                 // Get items and calculate totals
-                $items = getCartItemsWithMerchants($conn, $cartId);
-                $groupedData = groupItemsByMerchant($items);
-                $totals = calculateCartTotalsWithMerchants(
-                    $conn, 
-                    $cartId, 
-                    $userId, 
-                    $groupedData['merchants'], 
-                    $groupedData['total_subtotal']
-                );
+                $items = getCartItemsWithMerchant($conn, $cartId);
+                
+                // Check if all items are from same merchant
+                $merchantIds = array_unique(array_column($items, 'merchant_id'));
+                if (count($merchantIds) > 1) {
+                    ResponseHandler::error('Cart contains items from multiple merchants', 400);
+                }
+                
+                $totals = calculateCartTotals($conn, $cartId, $userId, $items);
                 
                 $_SESSION['checkout_' . $cartId] = [
                     'cart_id' => $cartId,
                     'user_id' => $userId,
-                    'amount' => $totals['global']['total_amount'],
-                    'merchant_data' => $groupedData['merchants'],
-                    'merchant_totals' => $totals['merchant_totals'],
-                    'global_totals' => $totals['global'],
+                    'amount' => $totals['total_amount'],
+                    'items' => $totals['items'],
+                    'totals' => $totals,
                     'initiated_at' => date('Y-m-d H:i:s')
                 ];
                 
@@ -960,9 +868,9 @@ try {
                 
                 ResponseHandler::success([
                     'cart_id' => $cartId,
-                    'amount' => $totals['global']['total_amount'],
-                    'amount_formatted' => 'MK' . number_format($totals['global']['total_amount'], 2),
-                    'merchant_count' => count($groupedData['merchants'])
+                    'amount' => $totals['total_amount'],
+                    'amount_formatted' => 'MK' . number_format($totals['total_amount'], 2),
+                    'merchant_name' => $totals['merchant']['name']
                 ]);
                 break;
             
@@ -986,22 +894,22 @@ try {
                     ResponseHandler::error('Please initiate checkout first', 400);
                 }
                 
-                // Process the multi-merchant payment
+                // Process the payment
                 $result = processWalletPayment(
                     $conn, 
                     $userId, 
                     $cartId, 
-                    $session['merchant_data'],
-                    $session['merchant_totals'],
-                    $session['global_totals']
+                    $session['items'],
+                    $session['totals']
                 );
                 
                 if ($result['success']) {
                     unset($_SESSION['checkout_' . $cartId]);
                     
                     ResponseHandler::success([
-                        'order_group_id' => $result['order_group_id'],
-                        'orders' => $result['orders'],
+                        'order_id' => $result['order_id'],
+                        'order_number' => $result['order_number'],
+                        'merchant_name' => $result['merchant_name'],
                         'total_amount' => $result['total_amount'],
                         'total_amount_formatted' => $result['total_amount_formatted'],
                         'new_balance' => $result['new_balance'],
@@ -1026,17 +934,16 @@ try {
                 }
                 
                 // Get items and calculate totals
-                $items = getCartItemsWithMerchants($conn, $cartId);
-                $groupedData = groupItemsByMerchant($items);
-                $totals = calculateCartTotalsWithMerchants(
-                    $conn, 
-                    $cartId, 
-                    $userId, 
-                    $groupedData['merchants'], 
-                    $groupedData['total_subtotal']
-                );
+                $items = getCartItemsWithMerchant($conn, $cartId);
                 
-                $amount = $totals['global']['total_amount'];
+                // Check if all items are from same merchant
+                $merchantIds = array_unique(array_column($items, 'merchant_id'));
+                if (count($merchantIds) > 1) {
+                    ResponseHandler::error('Cart contains items from multiple merchants', 400);
+                }
+                
+                $totals = calculateCartTotals($conn, $cartId, $userId, $items);
+                $amount = $totals['total_amount'];
                 $wallet = checkDropXWalletBalance($conn, $userId);
                 
                 $externalPayment = createExternalPayment(
@@ -1051,7 +958,7 @@ try {
                     'payment_id' => $externalPayment['payment_id'],
                     'cart_id' => $cartId,
                     'amount' => $amount,
-                    'merchant_count' => count($groupedData['merchants'])
+                    'merchant_name' => $totals['merchant']['name']
                 ];
                 
                 ResponseHandler::success([
@@ -1061,7 +968,7 @@ try {
                     'amount_formatted' => 'MK' . number_format($amount, 2),
                     'expires_at' => $externalPayment['expires_at'],
                     'expiry_minutes' => 30,
-                    'merchant_count' => count($groupedData['merchants']),
+                    'merchant_name' => $totals['merchant']['name'],
                     'accepted_partners' => [
                         'TNM Mpamba',
                         'Airtel Money',
@@ -1074,8 +981,7 @@ try {
                         '💰 Amount: MK' . number_format($amount, 2),
                         '⏱️  Expires: ' . date('h:i A', strtotime($externalPayment['expires_at'])),
                         '📍 Show this code at any TNM Mpamba, Airtel Money, or Bank branch',
-                        '✅ Pay cash, we add funds to your wallet instantly',
-                        '🛍️  This covers ' . count($groupedData['merchants']) . ' merchant(s) in one payment'
+                        '✅ Pay cash, we add funds to your wallet instantly'
                     ]
                 ]);
                 break;
