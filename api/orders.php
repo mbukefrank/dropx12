@@ -5,6 +5,10 @@
 // Start output buffering to prevent headers already sent error
 ob_start();
 
+// Turn off display_errors for production
+ini_set('display_errors', 0);
+error_reporting(E_ALL & ~E_WARNING & ~E_NOTICE); // Ignore warnings and notices
+
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
@@ -24,6 +28,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
  *********************************/
 // Set error handler to catch warnings and convert to exceptions
 set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    // Don't throw exception for undefined array key warnings
+    if (strpos($errstr, 'Undefined array key') !== false) {
+        return true; // Suppress the warning
+    }
     throw new ErrorException($errstr, 0, $errno, $errfile, $errline);
 });
 
@@ -426,21 +434,45 @@ function handleGetOrders($conn, $input, $userId) {
  *********************************/
 function createOrder($conn, $data, $userId) {
     try {
-        // Validate required data
-        $requiredFields = ['merchant_id', 'items', 'delivery_address'];
-        foreach ($requiredFields as $field) {
-            if (empty($data[$field])) {
-                ob_clean();
-                ResponseHandler::error("Missing required field: $field", 400);
+        // Validate data existence
+        if (!is_array($data)) {
+            ob_clean();
+            ResponseHandler::error('Invalid request data', 400);
+            return;
+        }
+        
+        // Check each required field with isset
+        $requiredFields = [
+            'merchant_id' => 'Merchant ID',
+            'items' => 'Order items',
+            'delivery_address' => 'Delivery address'
+        ];
+        
+        $missingFields = [];
+        foreach ($requiredFields as $field => $label) {
+            if (!isset($data[$field])) {
+                $missingFields[] = $label;
+            } elseif (is_array($data[$field]) && empty($data[$field])) {
+                $missingFields[] = $label . ' (cannot be empty)';
+            } elseif (!is_array($data[$field]) && trim($data[$field]) === '') {
+                $missingFields[] = $label . ' (cannot be empty)';
             }
+        }
+        
+        if (!empty($missingFields)) {
+            ob_clean();
+            ResponseHandler::error("Missing required fields: " . implode(', ', $missingFields), 400);
+            return;
         }
 
         $merchantId = $data['merchant_id'];
         $items = $data['items'];
         
+        // Validate items is an array
         if (!is_array($items) || empty($items)) {
             ob_clean();
-            ResponseHandler::error('No items in order', 400);
+            ResponseHandler::error('Items must be a non-empty array', 400);
+            return;
         }
 
         // Validate merchant exists and is open
@@ -457,20 +489,31 @@ function createOrder($conn, $data, $userId) {
         if (!$merchant) {
             ob_clean();
             ResponseHandler::error("Merchant not found or inactive", 404);
+            return;
         }
         
         if (!$merchant['is_open']) {
             ob_clean();
             ResponseHandler::error("Merchant {$merchant['name']} is currently closed", 400);
+            return;
         }
 
         // Calculate subtotal
         $subtotal = 0;
         foreach ($items as $item) {
-            if (empty($item['name']) || empty($item['quantity']) || empty($item['price'])) {
+            // Validate each item has required fields
+            if (!isset($item['name']) || !isset($item['quantity']) || !isset($item['price'])) {
                 ob_clean();
                 ResponseHandler::error('Invalid item data - each item must have name, quantity, and price', 400);
+                return;
             }
+            
+            if (empty($item['name']) || $item['quantity'] <= 0 || $item['price'] <= 0) {
+                ob_clean();
+                ResponseHandler::error('Invalid item values - name cannot be empty, quantity and price must be positive', 400);
+                return;
+            }
+            
             $subtotal += $item['price'] * $item['quantity'];
         }
 
@@ -481,6 +524,7 @@ function createOrder($conn, $data, $userId) {
                 "Order must be at least " . number_format($merchant['minimum_order'], 2), 
                 400
             );
+            return;
         }
 
         $deliveryFee = $merchant['delivery_fee'];
@@ -565,10 +609,10 @@ function createOrder($conn, $data, $userId) {
 
         ob_clean();
         ResponseHandler::success([
-            'order_id' => $orderId,
+            'order_id' => (int)$orderId,
             'order_number' => $orderNumber,
             'message' => 'Order created successfully'
-        ], 201);
+        ], 'Order created successfully', 201);
 
     } catch (Exception $e) {
         if ($conn->inTransaction()) {
@@ -590,6 +634,7 @@ function cancelOrder($conn, $data, $userId) {
         if (!$orderId) {
             ob_clean();
             ResponseHandler::error('Order ID is required', 400);
+            return;
         }
 
         // Check if order exists and belongs to user
@@ -607,6 +652,7 @@ function cancelOrder($conn, $data, $userId) {
         if (!$order) {
             ob_clean();
             ResponseHandler::error('Order not found', 404);
+            return;
         }
 
         // Check if order can be cancelled
@@ -614,6 +660,7 @@ function cancelOrder($conn, $data, $userId) {
         if (!in_array($order['status'], $cancellableStatuses)) {
             ob_clean();
             ResponseHandler::error('Order cannot be cancelled at this stage', 400);
+            return;
         }
 
         // Begin transaction
@@ -679,6 +726,7 @@ function reorder($conn, $data, $userId) {
         if (!$orderId) {
             ob_clean();
             ResponseHandler::error('Order ID is required', 400);
+            return;
         }
 
         // Get original order details
@@ -705,6 +753,7 @@ function reorder($conn, $data, $userId) {
         if (empty($items)) {
             ob_clean();
             ResponseHandler::error('Order not found', 404);
+            return;
         }
 
         // Check if merchant is still active
@@ -717,11 +766,13 @@ function reorder($conn, $data, $userId) {
         if (!$merchant || !$merchant['is_active']) {
             ob_clean();
             ResponseHandler::error('Merchant is no longer available', 400);
+            return;
         }
 
         if (!$merchant['is_open']) {
             ob_clean();
             ResponseHandler::error('Merchant is currently closed', 400);
+            return;
         }
 
         // Prepare reorder data
@@ -815,6 +866,7 @@ function updateOrder($conn, $data, $userId) {
         if (!$orderId) {
             ob_clean();
             ResponseHandler::error('Order ID is required', 400);
+            return;
         }
 
         // Check if order exists and belongs to user
@@ -832,6 +884,7 @@ function updateOrder($conn, $data, $userId) {
         if (!$order) {
             ob_clean();
             ResponseHandler::error('Order not found', 404);
+            return;
         }
 
         // Check if order can be modified
@@ -839,6 +892,7 @@ function updateOrder($conn, $data, $userId) {
         if (!in_array($order['status'], $modifiableStatuses)) {
             ob_clean();
             ResponseHandler::error('Order cannot be modified at this stage', 400);
+            return;
         }
 
         // Build update query dynamically
@@ -856,6 +910,7 @@ function updateOrder($conn, $data, $userId) {
         if (empty($updates)) {
             ob_clean();
             ResponseHandler::error('No fields to update', 400);
+            return;
         }
 
         $updates[] = "updated_at = NOW()";
@@ -884,6 +939,7 @@ function updateDeliveryAddress($conn, $data, $userId) {
         if (!$orderId || !$newAddress) {
             ob_clean();
             ResponseHandler::error('Order ID and new address are required', 400);
+            return;
         }
 
         // Check if order exists and belongs to user
@@ -901,6 +957,7 @@ function updateDeliveryAddress($conn, $data, $userId) {
         if (!$order) {
             ob_clean();
             ResponseHandler::error('Order not found', 404);
+            return;
         }
 
         // Check if order can have address changed
@@ -908,6 +965,7 @@ function updateDeliveryAddress($conn, $data, $userId) {
         if (!in_array($order['status'], $addressChangeableStatuses)) {
             ob_clean();
             ResponseHandler::error('Delivery address cannot be changed at this stage', 400);
+            return;
         }
 
         // Begin transaction
@@ -999,6 +1057,7 @@ function getOrderDetails($conn, $orderId, $userId) {
         if (!$order) {
             ob_clean();
             ResponseHandler::error('Order not found', 404);
+            return;
         }
 
         // Parse items data
