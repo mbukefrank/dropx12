@@ -190,6 +190,9 @@ function handleTrackOrder($conn, $input, $userId) {
     $progress = calculateTrackingProgress($order);
     $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
 
+    // Check if order can be cancelled (only pending or confirmed status)
+    $cancellable = in_array($order['status'], ['pending', 'confirmed']);
+
     $response = [
         'tracking' => [
             'id' => $order['order_number'],
@@ -203,7 +206,8 @@ function handleTrackOrder($conn, $input, $userId) {
             'estimated_delivery' => $estimatedDelivery,
             'estimated_pickup' => $order['dropx_estimated_pickup_time'],
             'created_at' => $order['created_at'],
-            'updated_at' => $order['updated_at']
+            'updated_at' => $order['updated_at'],
+            'cancellable' => $cancellable  // Add this to inform UI if cancel button should show
         ],
         'delivery' => [
             'address' => $order['delivery_address'],
@@ -213,8 +217,8 @@ function handleTrackOrder($conn, $input, $userId) {
             'id' => $order['merchant_id'],
             'name' => $order['merchant_name'],
             'address' => $order['merchant_address'],
-            'phone' => $order['merchant_phone'],
-            'image' => formatImageUrl($order['merchant_image'])
+            'phone' => $order['merchant_phone']
+            // REMOVED: 'image' => formatImageUrl($order['merchant_image'])
         ],
         'driver' => $driver,
         'timeline' => $timeline
@@ -455,7 +459,6 @@ function handleTrackingSummary($conn, $userId) {
             o.status,
             o.created_at,
             m.name as merchant_name,
-            m.image_url as merchant_image,
             d.name as driver_name,
             d.current_latitude,
             d.current_longitude
@@ -495,7 +498,6 @@ function handleTrackingSummary($conn, $userId) {
             'display_status' => $statusInfo['label'],
             'progress' => $statusInfo['progress'],
             'merchant_name' => $order['merchant_name'],
-            'merchant_image' => formatImageUrl($order['merchant_image']),
             'driver_name' => $order['driver_name'],
             'driver_location' => ($order['current_latitude'] && $order['current_longitude']) ? [
                 'lat' => floatval($order['current_latitude']),
@@ -519,8 +521,7 @@ function handleGetTrackableOrders($conn, $userId) {
             o.status,
             o.created_at,
             o.updated_at,
-            m.name as merchant_name,
-            m.image_url as merchant_image
+            m.name as merchant_name
         FROM orders o
         LEFT JOIN merchants m ON o.merchant_id = m.id
         WHERE o.user_id = ? 
@@ -542,7 +543,6 @@ function handleGetTrackableOrders($conn, $userId) {
             'display_status' => $statusInfo['label'],
             'progress' => $statusInfo['progress'],
             'merchant_name' => $order['merchant_name'],
-            'merchant_image' => formatImageUrl($order['merchant_image']),
             'created_at' => $order['created_at'],
             'updated_at' => $order['updated_at']
         ];
@@ -585,8 +585,8 @@ function handleDriverContact($conn, $input, $userId) {
             whatsapp_number,
             image_url,
             vehicle_type,
-            vehicle_number,
-            rating
+            vehicle_number
+            // REMOVED: rating
         FROM drivers
         WHERE id = ?
     ");
@@ -605,8 +605,8 @@ function handleDriverContact($conn, $input, $userId) {
             'whatsapp' => $driver['whatsapp_number'],
             'image' => formatImageUrl($driver['image_url']),
             'vehicle' => $driver['vehicle_type'],
-            'vehicle_number' => $driver['vehicle_number'],
-            'rating' => floatval($driver['rating'] ?? 0)
+            'vehicle_number' => $driver['vehicle_number']
+            // REMOVED: 'rating' => floatval($driver['rating'] ?? 0)
         ]
     ]);
 }
@@ -661,7 +661,6 @@ function findUserOrder($conn, $identifier, $userId) {
                 m.name as merchant_name,
                 m.address as merchant_address,
                 m.phone as merchant_phone,
-                m.image_url as merchant_image,
                 m.latitude as merchant_lat,
                 m.longitude as merchant_lng
             FROM orders o
@@ -683,8 +682,7 @@ function findUserOrder($conn, $identifier, $userId) {
                     o.*,
                     m.name as merchant_name,
                     m.address as merchant_address,
-                    m.phone as merchant_phone,
-                    m.image_url as merchant_image
+                    m.phone as merchant_phone
                 FROM orders o
                 LEFT JOIN merchants m ON o.merchant_id = m.id
                 LEFT JOIN order_tracking ot ON o.id = ot.order_id
@@ -756,8 +754,8 @@ function getDriverTrackingInfo($conn, $driverId) {
             vehicle_number,
             current_latitude,
             current_longitude,
-            updated_at as location_updated_at,
-            rating
+            updated_at as location_updated_at
+            // REMOVED: rating
         FROM drivers
         WHERE id = ?
     ");
@@ -779,8 +777,8 @@ function getDriverTrackingInfo($conn, $driverId) {
             'latitude' => floatval($driver['current_latitude']),
             'longitude' => floatval($driver['current_longitude']),
             'last_updated' => $driver['location_updated_at']
-        ] : null,
-        'rating' => floatval($driver['rating'] ?? 0)
+        ] : null
+        // REMOVED: 'rating' => floatval($driver['rating'] ?? 0)
     ];
 }
 
