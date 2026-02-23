@@ -166,6 +166,10 @@ try {
  * HANDLER FUNCTIONS
  *********************************/
 
+/**
+ * Handle track order request
+ * Returns complete tracking information for an order
+ */
 function handleTrackOrder($conn, $input, $userId) {
     $identifier = $input['tracking_id'] ?? $input['order_id'] ?? $input['order_number'] ?? '';
     
@@ -207,7 +211,7 @@ function handleTrackOrder($conn, $input, $userId) {
             'estimated_pickup' => $order['dropx_estimated_pickup_time'],
             'created_at' => $order['created_at'],
             'updated_at' => $order['updated_at'],
-            'cancellable' => $cancellable  // Add this to inform UI if cancel button should show
+            'cancellable' => $cancellable
         ],
         'delivery' => [
             'address' => $order['delivery_address'],
@@ -218,7 +222,6 @@ function handleTrackOrder($conn, $input, $userId) {
             'name' => $order['merchant_name'],
             'address' => $order['merchant_address'],
             'phone' => $order['merchant_phone']
-            // REMOVED: 'image' => formatImageUrl($order['merchant_image'])
         ],
         'driver' => $driver,
         'timeline' => $timeline
@@ -227,6 +230,10 @@ function handleTrackOrder($conn, $input, $userId) {
     ResponseHandler::success($response, 'Tracking information retrieved');
 }
 
+/**
+ * Handle driver location request
+ * Returns real-time driver location information
+ */
 function handleDriverLocation($conn, $input, $userId) {
     $identifier = $input['tracking_id'] ?? $input['order_id'] ?? '';
     
@@ -292,6 +299,10 @@ function handleDriverLocation($conn, $input, $userId) {
     ]);
 }
 
+/**
+ * Handle real-time updates request
+ * Returns any updates since last_update timestamp
+ */
 function handleRealTimeUpdates($conn, $input, $userId) {
     $identifier = $input['tracking_id'] ?? $input['order_id'] ?? '';
     $lastUpdate = $input['last_update'] ?? null;
@@ -310,6 +321,7 @@ function handleRealTimeUpdates($conn, $input, $userId) {
     $hasUpdates = false;
     $currentTime = date('Y-m-d H:i:s');
     
+    // Check for order status updates
     if (!$lastUpdate || strtotime($order['updated_at']) > strtotime($lastUpdate)) {
         $statusInfo = getStatusDisplayInfo($order['status'], $order['dropx_pickup_status']);
         
@@ -323,6 +335,7 @@ function handleRealTimeUpdates($conn, $input, $userId) {
         $hasUpdates = true;
     }
     
+    // Check for driver location updates
     if ($order['driver_id']) {
         $stmt = $conn->prepare("
             SELECT current_latitude, current_longitude, updated_at
@@ -342,6 +355,7 @@ function handleRealTimeUpdates($conn, $input, $userId) {
         }
     }
     
+    // Check for tracking events
     $stmt = $conn->prepare("
         SELECT ot.*
         FROM order_tracking ot
@@ -370,6 +384,10 @@ function handleRealTimeUpdates($conn, $input, $userId) {
     ]);
 }
 
+/**
+ * Handle route information request
+ * Returns waypoints and route progress
+ */
 function handleRouteInfo($conn, $input, $userId) {
     $identifier = $input['tracking_id'] ?? $input['order_id'] ?? '';
     
@@ -430,6 +448,10 @@ function handleRouteInfo($conn, $input, $userId) {
         }
     }
     
+    $completedCount = count(array_filter($waypoints, function($wp) { 
+        return $wp['status'] === 'completed'; 
+    }));
+    
     ResponseHandler::success([
         'driver_location' => $driverLocation ? [
             'latitude' => floatval($driverLocation['current_latitude']),
@@ -439,18 +461,18 @@ function handleRouteInfo($conn, $input, $userId) {
         'next_stop' => $nextStop,
         'progress' => [
             'total' => count($waypoints),
-            'completed' => count(array_filter($waypoints, function($wp) { 
-                return $wp['status'] === 'completed'; 
-            })),
+            'completed' => $completedCount,
             'percentage' => count($waypoints) > 0 
-                ? (count(array_filter($waypoints, function($wp) { 
-                    return $wp['status'] === 'completed'; 
-                  })) / count($waypoints)) * 100
+                ? ($completedCount / count($waypoints)) * 100
                 : 0
         ]
     ]);
 }
 
+/**
+ * Handle tracking summary request
+ * Returns summary of all active orders for the user
+ */
 function handleTrackingSummary($conn, $userId) {
     $stmt = $conn->prepare("
         SELECT 
@@ -513,6 +535,10 @@ function handleTrackingSummary($conn, $userId) {
     ]);
 }
 
+/**
+ * Handle get trackable orders request
+ * Returns list of orders that can be tracked
+ */
 function handleGetTrackableOrders($conn, $userId) {
     $stmt = $conn->prepare("
         SELECT 
@@ -554,6 +580,10 @@ function handleGetTrackableOrders($conn, $userId) {
     ]);
 }
 
+/**
+ * Handle driver contact request
+ * Returns driver contact information
+ */
 function handleDriverContact($conn, $input, $userId) {
     $orderId = $input['order_id'] ?? '';
     
@@ -586,7 +616,6 @@ function handleDriverContact($conn, $input, $userId) {
             image_url,
             vehicle_type,
             vehicle_number
-            // REMOVED: rating
         FROM drivers
         WHERE id = ?
     ");
@@ -606,11 +635,14 @@ function handleDriverContact($conn, $input, $userId) {
             'image' => formatImageUrl($driver['image_url']),
             'vehicle' => $driver['vehicle_type'],
             'vehicle_number' => $driver['vehicle_number']
-            // REMOVED: 'rating' => floatval($driver['rating'] ?? 0)
         ]
     ]);
 }
 
+/**
+ * Handle share tracking request
+ * Returns shareable tracking information
+ */
 function handleShareTracking($conn, $input, $userId) {
     $orderId = $input['order_id'] ?? '';
     
@@ -655,6 +687,9 @@ function handleShareTracking($conn, $input, $userId) {
  * HELPER FUNCTIONS
  *********************************/
 
+/**
+ * Find an order belonging to a user by various identifiers
+ */
 function findUserOrder($conn, $identifier, $userId) {
     $sql = "SELECT 
                 o.*,
@@ -702,6 +737,9 @@ function findUserOrder($conn, $identifier, $userId) {
     return $order;
 }
 
+/**
+ * Get order timeline/status history
+ */
 function getOrderTimeline($conn, $orderId) {
     $timeline = [];
     
@@ -709,6 +747,7 @@ function getOrderTimeline($conn, $orderId) {
     $stmt->execute([$orderId]);
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
     
+    // Add order placed event
     $timeline[] = [
         'id' => 'order_placed',
         'status' => 'pending',
@@ -718,6 +757,7 @@ function getOrderTimeline($conn, $orderId) {
         'icon' => 'shopping_bag'
     ];
     
+    // Get tracking history
     $stmt = $conn->prepare("
         SELECT status, created_at as timestamp
         FROM order_tracking
@@ -743,6 +783,9 @@ function getOrderTimeline($conn, $orderId) {
     return $timeline;
 }
 
+/**
+ * Get driver tracking information
+ */
 function getDriverTrackingInfo($conn, $driverId) {
     $stmt = $conn->prepare("
         SELECT 
@@ -755,7 +798,6 @@ function getDriverTrackingInfo($conn, $driverId) {
             current_latitude,
             current_longitude,
             updated_at as location_updated_at
-            // REMOVED: rating
         FROM drivers
         WHERE id = ?
     ");
@@ -778,10 +820,12 @@ function getDriverTrackingInfo($conn, $driverId) {
             'longitude' => floatval($driver['current_longitude']),
             'last_updated' => $driver['location_updated_at']
         ] : null
-        // REMOVED: 'rating' => floatval($driver['rating'] ?? 0)
     ];
 }
 
+/**
+ * Calculate tracking progress percentage
+ */
 function calculateTrackingProgress($order) {
     if ($order['status'] === 'delivered') {
         return 100;
@@ -794,6 +838,9 @@ function calculateTrackingProgress($order) {
     return (ORDER_STATUSES[$order['status']]['progress'] ?? 0.1) * 100;
 }
 
+/**
+ * Get display information for a status
+ */
 function getStatusDisplayInfo($orderStatus, $dropxStatus = null) {
     if ($dropxStatus && in_array($orderStatus, TRACKABLE_STATUSES)) {
         return [
@@ -810,6 +857,9 @@ function getStatusDisplayInfo($orderStatus, $dropxStatus = null) {
     ];
 }
 
+/**
+ * Calculate Estimated Time of Arrival
+ */
 function calculateETA($conn, $orderId, $driver) {
     $stmt = $conn->prepare("
         SELECT dropx_estimated_delivery_time
@@ -822,6 +872,9 @@ function calculateETA($conn, $orderId, $driver) {
     return $result['dropx_estimated_delivery_time'] ?? null;
 }
 
+/**
+ * Get icon name for a status
+ */
 function getStatusIcon($status) {
     $icons = [
         'pending' => 'shopping_bag',
@@ -843,6 +896,9 @@ function getStatusIcon($status) {
     return $icons[$status] ?? 'circle';
 }
 
+/**
+ * Format image URL with base URL
+ */
 function formatImageUrl($path) {
     global $baseUrl;
     
