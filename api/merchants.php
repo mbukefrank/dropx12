@@ -122,7 +122,7 @@ try {
 }
 
 /*********************************
- * GET MERCHANTS LIST - FIXED WITH CORRECT COLUMN NAMES
+ * GET MERCHANTS LIST
  *********************************/
 function getMerchantsList($conn, $baseUrl) {
     $page = max(1, intval($_GET['page'] ?? 1));
@@ -197,7 +197,6 @@ function getMerchantsList($conn, $baseUrl) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // CORRECTED: Using actual column names from your table
     $sql = "SELECT 
                 m.id,
                 m.name,
@@ -363,7 +362,6 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
             COUNT(*) as item_count
         FROM menu_items 
         WHERE merchant_id = :merchant_id
-        AND is_active = 1
         AND is_available = 1
         GROUP BY COALESCE(NULLIF(category, ''), 'Uncategorized')
         ORDER BY name
@@ -390,7 +388,6 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
         FROM menu_items mi
         WHERE mi.merchant_id = :merchant_id
         AND mi.is_popular = 1
-        AND mi.is_active = 1
         AND mi.is_available = 1
         ORDER BY mi.sort_order, mi.name
         LIMIT 6"
@@ -461,13 +458,13 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
 }
 
 /*********************************
- * GET MERCHANT MENU
+ * GET MERCHANT MENU - FIXED
  *********************************/
 function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = true) {
     error_log("=== MENU DEBUG START ===");
     error_log("Getting menu for merchant ID: " . $merchantId);
     
-    // 1. Verify merchant exists
+    // Verify merchant exists
     $checkStmt = $conn->prepare(
         "SELECT id, name, business_type FROM merchants 
          WHERE id = :id AND is_active = 1"
@@ -482,7 +479,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     
     error_log("Merchant found: " . $merchant['name']);
 
-    // 2. Get ALL menu items for this merchant
+    // Get menu items - FIXED: removed is_active, using is_available only
     $menuStmt = $conn->prepare(
         "SELECT 
             id,
@@ -494,11 +491,13 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
             item_type,
             is_available,
             is_popular,
-            preparation_time
+            preparation_time,
+            unit_type,
+            unit_value,
+            options_json
         FROM menu_items 
         WHERE merchant_id = :merchant_id
         AND is_available = 1
-        AND is_active = 1
         ORDER BY category, name ASC"
     );
     
@@ -507,7 +506,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     
     error_log("Found " . count($menuItems) . " menu items");
 
-    // 3. Group items by category
+    // Group items by category
     $categories = [];
     $totalItems = 0;
     
@@ -521,6 +520,15 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
             ];
         }
         
+        // Parse options_json if it exists
+        $options = [];
+        if (!empty($item['options_json'])) {
+            $options = json_decode($item['options_json'], true);
+            if (!is_array($options)) {
+                $options = [];
+            }
+        }
+        
         // Format item
         $formattedItem = [
             'id' => $item['id'],
@@ -530,22 +538,25 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
             'image_url' => formatMenuItemImage($item['image_url'], $baseUrl),
             'category' => $item['category'],
             'item_type' => $item['item_type'] ?? 'food',
+            'unit_type' => $item['unit_type'] ?? 'piece',
+            'unit_value' => floatval($item['unit_value'] ?? 1),
             'is_available' => boolval($item['is_available']),
             'is_popular' => boolval($item['is_popular']),
-            'preparation_time' => intval($item['preparation_time'] ?? 15)
+            'preparation_time' => intval($item['preparation_time'] ?? 15),
+            'options' => $options
         ];
         
         $categories[$categoryName]['items'][] = $formattedItem;
         $totalItems++;
     }
     
-    // 4. Convert to indexed array
+    // Convert to indexed array
     $menuList = array_values($categories);
     
     error_log("Organized into " . count($menuList) . " categories");
     error_log("Total items: " . $totalItems);
     
-    // 5. Return the response
+    // Return the response
     $responseData = [
         'merchant_id' => $merchantId,
         'merchant_name' => $merchant['name'],
@@ -579,7 +590,7 @@ function formatMenuItemImage($imagePath, $baseUrl) {
 }
 
 /*********************************
- * GET MERCHANT CATEGORIES
+ * GET MERCHANT CATEGORIES - FIXED
  *********************************/
 function getMerchantCategories($conn, $merchantId, $baseUrl) {
     $checkStmt = $conn->prepare(
@@ -593,6 +604,7 @@ function getMerchantCategories($conn, $merchantId, $baseUrl) {
         ResponseHandler::error('Merchant not found or inactive', 404);
     }
 
+    // FIXED: removed is_active, using is_available only
     $categoriesStmt = $conn->prepare(
         "SELECT 
             COALESCE(NULLIF(category, ''), 'Uncategorized') as name,
@@ -600,7 +612,6 @@ function getMerchantCategories($conn, $merchantId, $baseUrl) {
             GROUP_CONCAT(DISTINCT item_type) as item_types
         FROM menu_items 
         WHERE merchant_id = :merchant_id
-        AND is_active = 1
         AND is_available = 1
         GROUP BY COALESCE(NULLIF(category, ''), 'Uncategorized')
         ORDER BY name ASC"
@@ -625,6 +636,7 @@ function getMerchantCategories($conn, $merchantId, $baseUrl) {
         ];
     }
 
+    // Quick order categories
     $quickOrderCategoriesStmt = $conn->prepare(
         "SELECT 
             COALESCE(NULLIF(qo.category, ''), 'Quick Orders') as name,
@@ -1030,6 +1042,9 @@ function reportMerchant($conn, $data) {
     ResponseHandler::success([], 'Report submitted successfully');
 }
 
+/*********************************
+ * SEARCH MENU ITEMS - FIXED
+ *********************************/
 function searchMenuItems($conn, $data, $baseUrl) {
     $merchantId = $data['merchant_id'] ?? null;
     $query = trim($data['query'] ?? '');
@@ -1056,7 +1071,8 @@ function searchMenuItems($conn, $data, $baseUrl) {
         ResponseHandler::error('Merchant not found or inactive', 404);
     }
 
-    $whereConditions = ["mi.merchant_id = :merchant_id", "mi.is_active = 1"];
+    // FIXED: removed is_active, using is_available only
+    $whereConditions = ["mi.merchant_id = :merchant_id", "mi.is_available = 1"];
     $params = [':merchant_id' => $merchantId];
 
     if ($query) {
