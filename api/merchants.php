@@ -122,7 +122,7 @@ try {
 }
 
 /*********************************
- * GET MERCHANTS LIST - FIXED COLUMN NAME
+ * GET MERCHANTS LIST - FIXED WITH CORRECT COLUMN NAMES
  *********************************/
 function getMerchantsList($conn, $baseUrl) {
     $page = max(1, intval($_GET['page'] ?? 1));
@@ -135,7 +135,7 @@ function getMerchantsList($conn, $baseUrl) {
     $sortOrder = strtoupper($_GET['sort_order'] ?? 'DESC');
     $minRating = floatval($_GET['min_rating'] ?? 0);
     $isOpen = $_GET['is_open'] ?? null;
-    $isPromoted = $_GET['is_promoted'] ?? null;
+    $isFeatured = $_GET['is_featured'] ?? null;
     $businessType = $_GET['business_type'] ?? '';
     $cuisineType = $_GET['cuisine_type'] ?? '';
     $deliveryFee = $_GET['delivery_fee'] ?? null;
@@ -173,9 +173,9 @@ function getMerchantsList($conn, $baseUrl) {
         $params[':is_open'] = $isOpen === 'true' ? 1 : 0;
     }
 
-    if ($isPromoted !== null) {
-        $whereConditions[] = "m.is_promoted = :is_promoted";
-        $params[':is_promoted'] = $isPromoted === 'true' ? 1 : 0;
+    if ($isFeatured !== null) {
+        $whereConditions[] = "m.is_featured = :is_featured";
+        $params[':is_featured'] = $isFeatured === 'true' ? 1 : 0;
     }
 
     if ($deliveryFee !== null) {
@@ -197,7 +197,7 @@ function getMerchantsList($conn, $baseUrl) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // FIXED: Changed m.item_types to m.cuisine_type
+    // CORRECTED: Using actual column names from your table
     $sql = "SELECT 
                 m.id,
                 m.name,
@@ -209,15 +209,16 @@ function getMerchantsList($conn, $baseUrl) {
                 CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
                 m.image_url,
                 m.is_open,
-                m.is_promoted,
+                m.is_featured,
                 m.delivery_fee,
                 m.min_order_amount,
                 m.delivery_radius,
+                m.distance,
                 m.created_at,
                 m.updated_at
             FROM merchants m
             $whereClause
-            ORDER BY m.is_promoted DESC, m.$sortBy $sortOrder
+            ORDER BY m.is_featured DESC, m.$sortBy $sortOrder
             LIMIT :limit OFFSET :offset";
 
     $stmt = $conn->prepare($sql);
@@ -303,23 +304,25 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
             m.cuisine_type,
             m.rating,
             m.review_count,
-            CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
             m.image_url,
             m.logo_url,
             m.is_open,
-            m.is_promoted,
+            m.is_featured,
             m.address,
             m.phone,
             m.email,
             m.latitude,
             m.longitude,
-            m.operating_hours,
+            m.opening_hours,
             m.tags,
             m.payment_methods,
             m.delivery_fee,
             m.min_order_amount,
+            m.free_delivery_threshold,
             m.delivery_radius,
             m.delivery_time,
+            m.preparation_time,
+            m.distance,
             m.created_at,
             m.updated_at
         FROM merchants m
@@ -333,6 +336,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
         ResponseHandler::error('Merchant not found', 404);
     }
 
+    // Get merchant reviews
     $reviewsStmt = $conn->prepare(
         "SELECT 
             mr.id,
@@ -352,6 +356,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
     $reviewsStmt->execute([':merchant_id' => $merchantId]);
     $reviews = $reviewsStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Get menu categories summary
     $categoriesStmt = $conn->prepare(
         "SELECT DISTINCT 
             COALESCE(NULLIF(category, ''), 'Uncategorized') as name,
@@ -368,6 +373,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
     $categoriesStmt->execute([':merchant_id' => $merchantId]);
     $categories = $categoriesStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Get popular menu items
     $popularItemsStmt = $conn->prepare(
         "SELECT 
             mi.id,
@@ -386,13 +392,14 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
         AND mi.is_popular = 1
         AND mi.is_active = 1
         AND mi.is_available = 1
-        ORDER BY mi.display_order, mi.name
+        ORDER BY mi.sort_order, mi.name
         LIMIT 6"
     );
     
     $popularItemsStmt->execute([':merchant_id' => $merchantId]);
     $popularMenuItems = $popularItemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Get quick orders for this merchant
     $quickOrdersStmt = $conn->prepare(
         "SELECT 
             qo.id,
@@ -414,6 +421,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
     $quickOrdersStmt->execute([':merchant_id' => $merchantId]);
     $quickOrders = $quickOrdersStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Check if favorite
     $isFavorite = false;
     if (!empty($_SESSION['user_id'])) {
         $favStmt = $conn->prepare(
@@ -453,7 +461,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
 }
 
 /*********************************
- * GET MERCHANT MENU - SIMPLIFIED & FIXED
+ * GET MERCHANT MENU
  *********************************/
 function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = true) {
     error_log("=== MENU DEBUG START ===");
@@ -474,7 +482,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     
     error_log("Merchant found: " . $merchant['name']);
 
-    // 2. Get ALL menu items for this merchant (simplified query)
+    // 2. Get ALL menu items for this merchant
     $menuStmt = $conn->prepare(
         "SELECT 
             id,
@@ -498,34 +506,8 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     $menuItems = $menuStmt->fetchAll(PDO::FETCH_ASSOC);
     
     error_log("Found " . count($menuItems) . " menu items");
-    
-    // Debug: Show first few items
-    if (!empty($menuItems)) {
-        for ($i = 0; $i < min(3, count($menuItems)); $i++) {
-            error_log("Item $i: " . $menuItems[$i]['name'] . " | Category: " . $menuItems[$i]['category']);
-        }
-    } else {
-        error_log("NO MENU ITEMS FOUND! Check database for merchant_id = " . $merchantId);
-        
-        // Check what's actually in the database
-        $debugStmt = $conn->prepare(
-            "SELECT COUNT(*) as count FROM menu_items WHERE merchant_id = :merchant_id"
-        );
-        $debugStmt->execute([':merchant_id' => $merchantId]);
-        $debugResult = $debugStmt->fetch(PDO::FETCH_ASSOC);
-        error_log("Total menu items in DB: " . $debugResult['count']);
-        
-        // Check availability
-        $debugStmt2 = $conn->prepare(
-            "SELECT COUNT(*) as count FROM menu_items 
-             WHERE merchant_id = :merchant_id AND is_available = 1"
-        );
-        $debugStmt2->execute([':merchant_id' => $merchantId]);
-        $debugResult2 = $debugStmt2->fetch(PDO::FETCH_ASSOC);
-        error_log("Available menu items: " . $debugResult2['count']);
-    }
 
-    // 3. Group items by category (SIMPLIFIED)
+    // 3. Group items by category
     $categories = [];
     $totalItems = 0;
     
@@ -563,23 +545,19 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     error_log("Organized into " . count($menuList) . " categories");
     error_log("Total items: " . $totalItems);
     
-    // 5. Return the response in EXACT format Flutter expects
+    // 5. Return the response
     $responseData = [
         'merchant_id' => $merchantId,
         'merchant_name' => $merchant['name'],
         'business_type' => $merchant['business_type'],
-        'menu' => $menuList,  // This is what Flutter reads
+        'menu' => $menuList,
         'total_items' => $totalItems,
         'total_categories' => count($menuList),
-        'includes_quick_orders' => false  // Temporarily disable quick orders for debugging
+        'includes_quick_orders' => false
     ];
     
-    error_log("=== FINAL RESPONSE DATA ===");
-    error_log("Categories count: " . count($menuList));
-    error_log("Response structure ready");
     error_log("=== MENU DEBUG END ===");
     
-    // Return SUCCESS response with data
     ResponseHandler::success([
         'success' => true,
         'message' => 'Menu retrieved successfully',
@@ -966,9 +944,10 @@ function getFavoriteMerchants($conn, $data, $baseUrl) {
                 CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
                 m.image_url,
                 m.is_open,
-                m.is_promoted,
+                m.is_featured,
                 m.delivery_fee,
                 m.min_order_amount,
+                m.distance,
                 m.created_at,
                 ufm.created_at as favorited_at
             FROM merchants m
@@ -1081,7 +1060,7 @@ function searchMenuItems($conn, $data, $baseUrl) {
     $params = [':merchant_id' => $merchantId];
 
     if ($query) {
-        $whereConditions[] = "(mi.name LIKE :query OR mi.description LIKE :query OR mi.ingredients LIKE :query)";
+        $whereConditions[] = "(mi.name LIKE :query OR mi.description LIKE :query)";
         $params[':query'] = "%$query%";
     }
 
@@ -1118,8 +1097,7 @@ function searchMenuItems($conn, $data, $baseUrl) {
                 mi.unit_value,
                 mi.is_available,
                 mi.is_popular,
-                mi.options,
-                mi.ingredients,
+                mi.options_json as options,
                 mi.preparation_time,
                 mi.created_at,
                 mi.updated_at
@@ -1206,7 +1184,6 @@ function formatMerchantListData($m, $baseUrl) {
         }
     }
     
-    // FIXED: Changed from item_types to cuisine_type
     $cuisineTypes = [];
     if (!empty($m['cuisine_type'])) {
         $cuisineTypes = json_decode($m['cuisine_type'], true);
@@ -1226,11 +1203,12 @@ function formatMerchantListData($m, $baseUrl) {
         'delivery_info' => $m['delivery_info'] ?? '',
         'image_url' => $imageUrl,
         'is_open' => boolval($m['is_open'] ?? false),
-        'is_promoted' => boolval($m['is_promoted'] ?? false),
+        'is_featured' => boolval($m['is_featured'] ?? false),
         'delivery_fee' => floatval($m['delivery_fee'] ?? 0),
         'formatted_delivery_fee' => 'MK ' . number_format(floatval($m['delivery_fee'] ?? 0), 2),
         'min_order_amount' => floatval($m['min_order_amount'] ?? 0),
         'delivery_radius' => intval($m['delivery_radius'] ?? 5),
+        'distance' => floatval($m['distance'] ?? 0),
         'created_at' => $m['created_at'] ?? '',
         'updated_at' => $m['updated_at'] ?? ''
     ];
@@ -1255,7 +1233,6 @@ function formatMerchantDetailData($m, $baseUrl) {
         }
     }
     
-    // FIXED: Changed from item_types to cuisine_type
     $cuisineTypes = [];
     if (!empty($m['cuisine_type'])) {
         $cuisineTypes = json_decode($m['cuisine_type'], true);
@@ -1281,8 +1258,8 @@ function formatMerchantDetailData($m, $baseUrl) {
     }
 
     $operatingHours = [];
-    if (!empty($m['operating_hours'])) {
-        $operatingHours = json_decode($m['operating_hours'], true);
+    if (!empty($m['opening_hours'])) {
+        $operatingHours = json_decode($m['opening_hours'], true);
         if (!is_array($operatingHours)) {
             $operatingHours = [];
         }
@@ -1297,11 +1274,10 @@ function formatMerchantDetailData($m, $baseUrl) {
         'cuisine_types' => $cuisineTypes,
         'rating' => floatval($m['rating'] ?? 0),
         'review_count' => intval($m['review_count'] ?? 0),
-        'delivery_info' => $m['delivery_info'] ?? '',
         'image_url' => $imageUrl,
         'logo_url' => $logoUrl,
         'is_open' => boolval($m['is_open'] ?? false),
-        'is_promoted' => boolval($m['is_promoted'] ?? false),
+        'is_featured' => boolval($m['is_featured'] ?? false),
         'address' => $m['address'] ?? '',
         'phone' => $m['phone'] ?? '',
         'email' => $m['email'] ?? '',
@@ -1313,8 +1289,11 @@ function formatMerchantDetailData($m, $baseUrl) {
         'delivery_fee' => floatval($m['delivery_fee'] ?? 0),
         'formatted_delivery_fee' => 'MK ' . number_format(floatval($m['delivery_fee'] ?? 0), 2),
         'min_order_amount' => floatval($m['min_order_amount'] ?? 0),
+        'free_delivery_threshold' => floatval($m['free_delivery_threshold'] ?? 0),
         'delivery_radius' => intval($m['delivery_radius'] ?? 5),
         'delivery_time' => $m['delivery_time'] ?? '',
+        'preparation_time' => $m['preparation_time'] ?? '15-20 min',
+        'distance' => floatval($m['distance'] ?? 0),
         'created_at' => $m['created_at'] ?? '',
         'updated_at' => $m['updated_at'] ?? ''
     ];
@@ -1356,10 +1335,7 @@ function formatMenuItemData($item, $baseUrl) {
         'unit_type' => 'piece',
         'unit_value' => 1,
         'preparation_time' => 15,
-        'options' => null,
-        'ingredients' => null,
-        'allergens' => null,
-        'nutrition_info' => null
+        'options' => null
     ], $item);
     
     $imageUrl = '';
@@ -1367,7 +1343,7 @@ function formatMenuItemData($item, $baseUrl) {
         if (strpos($item['image_url'], 'http') === 0) {
             $imageUrl = $item['image_url'];
         } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu-items/' . $item['image_url'];
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url'];
         }
     }
     
@@ -1383,42 +1359,6 @@ function formatMenuItemData($item, $baseUrl) {
         }
     }
 
-    $ingredients = [];
-    if (!empty($item['ingredients'])) {
-        try {
-            $ingredients = json_decode($item['ingredients'], true);
-            if (!is_array($ingredients)) {
-                $ingredients = explode(',', $item['ingredients']);
-            }
-        } catch (Exception $e) {
-            $ingredients = [];
-        }
-    }
-
-    $allergens = [];
-    if (!empty($item['allergens'])) {
-        try {
-            $allergens = json_decode($item['allergens'], true);
-            if (!is_array($allergens)) {
-                $allergens = explode(',', $item['allergens']);
-            }
-        } catch (Exception $e) {
-            $allergens = [];
-        }
-    }
-
-    $nutritionInfo = [];
-    if (!empty($item['nutrition_info'])) {
-        try {
-            $nutritionInfo = json_decode($item['nutrition_info'], true);
-            if (!is_array($nutritionInfo)) {
-                $nutritionInfo = [];
-            }
-        } catch (Exception $e) {
-            $nutritionInfo = [];
-        }
-    }
-
     $displayPrice = $item['price'];
     $displayUnit = $item['unit_type'];
     
@@ -1430,7 +1370,6 @@ function formatMenuItemData($item, $baseUrl) {
 
     return [
         'id' => $item['id'] ?? null,
-        'quick_order_item_id' => $item['quick_order_item_id'] ?? null,
         'name' => $item['name'] ?? '',
         'description' => $item['description'],
         'price' => floatval($item['price'] ?? 0),
@@ -1439,19 +1378,14 @@ function formatMenuItemData($item, $baseUrl) {
         'image_url' => $imageUrl,
         'category' => $item['category'],
         'item_type' => $item['item_type'],
-        'subcategory' => $item['subcategory'] ?? '',
         'unit_type' => $item['unit_type'],
         'unit_value' => floatval($item['unit_value']),
         'is_available' => boolval($item['is_available']),
         'is_popular' => boolval($item['is_popular']),
         'options' => $options,
-        'ingredients' => $ingredients,
-        'allergens' => $allergens,
-        'nutrition_info' => $nutritionInfo,
         'preparation_time' => intval($item['preparation_time']),
         'stock_quantity' => $item['stock_quantity'] !== null ? intval($item['stock_quantity']) : null,
         'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && $item['is_available'],
-        'source' => $item['source'] ?? 'menu',
         'created_at' => $item['created_at'] ?? '',
         'updated_at' => $item['updated_at'] ?? ''
     ];
@@ -1476,9 +1410,7 @@ function formatCategoryData($category, $baseUrl) {
         'item_count' => intval($category['item_count'] ?? 0),
         'item_types' => $category['item_types'] ?? [],
         'is_active' => boolval($category['is_active'] ?? true),
-        'is_quick_order' => boolval($category['is_quick_order'] ?? false),
-        'created_at' => $category['created_at'] ?? '',
-        'updated_at' => $category['updated_at'] ?? ''
+        'is_quick_order' => boolval($category['is_quick_order'] ?? false)
     ];
 }
 
