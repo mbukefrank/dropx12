@@ -122,7 +122,7 @@ try {
 }
 
 /*********************************
- * GET MERCHANTS LIST - FIXED RESPONSE STRUCTURE
+ * GET MERCHANTS LIST - FIXED COLUMN NAME
  *********************************/
 function getMerchantsList($conn, $baseUrl) {
     $page = max(1, intval($_GET['page'] ?? 1));
@@ -137,7 +137,7 @@ function getMerchantsList($conn, $baseUrl) {
     $isOpen = $_GET['is_open'] ?? null;
     $isPromoted = $_GET['is_promoted'] ?? null;
     $businessType = $_GET['business_type'] ?? '';
-    $itemType = $_GET['item_type'] ?? '';
+    $cuisineType = $_GET['cuisine_type'] ?? '';
     $deliveryFee = $_GET['delivery_fee'] ?? null;
 
     $whereConditions = ["m.is_active = 1"];
@@ -153,9 +153,9 @@ function getMerchantsList($conn, $baseUrl) {
         $params[':business_type'] = $businessType;
     }
 
-    if ($itemType) {
-        $whereConditions[] = "JSON_CONTAINS(m.item_types, :item_type)";
-        $params[':item_type'] = json_encode($itemType);
+    if ($cuisineType) {
+        $whereConditions[] = "JSON_CONTAINS(m.cuisine_type, :cuisine_type)";
+        $params[':cuisine_type'] = json_encode($cuisineType);
     }
 
     if ($search) {
@@ -197,12 +197,13 @@ function getMerchantsList($conn, $baseUrl) {
     $countStmt->execute($params);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
+    // FIXED: Changed m.item_types to m.cuisine_type
     $sql = "SELECT 
                 m.id,
                 m.name,
                 m.category,
                 m.business_type,
-                m.item_types,
+                m.cuisine_type,
                 m.rating,
                 m.review_count,
                 CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
@@ -299,7 +300,7 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
             m.description,
             m.category,
             m.business_type,
-            m.item_types,
+            m.cuisine_type,
             m.rating,
             m.review_count,
             CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
@@ -959,7 +960,7 @@ function getFavoriteMerchants($conn, $data, $baseUrl) {
                 m.name,
                 m.category,
                 m.business_type,
-                m.item_types,
+                m.cuisine_type,
                 m.rating,
                 m.review_count,
                 CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
@@ -1205,11 +1206,12 @@ function formatMerchantListData($m, $baseUrl) {
         }
     }
     
-    $itemTypes = [];
-    if (!empty($m['item_types'])) {
-        $itemTypes = json_decode($m['item_types'], true);
-        if (!is_array($itemTypes)) {
-            $itemTypes = [];
+    // FIXED: Changed from item_types to cuisine_type
+    $cuisineTypes = [];
+    if (!empty($m['cuisine_type'])) {
+        $cuisineTypes = json_decode($m['cuisine_type'], true);
+        if (!is_array($cuisineTypes)) {
+            $cuisineTypes = [];
         }
     }
     
@@ -1218,7 +1220,7 @@ function formatMerchantListData($m, $baseUrl) {
         'name' => $m['name'] ?? '',
         'category' => $m['category'] ?? '',
         'business_type' => $m['business_type'] ?? 'restaurant',
-        'item_types' => $itemTypes,
+        'cuisine_types' => $cuisineTypes,
         'rating' => floatval($m['rating'] ?? 0),
         'review_count' => intval($m['review_count'] ?? 0),
         'delivery_info' => $m['delivery_info'] ?? '',
@@ -1253,11 +1255,12 @@ function formatMerchantDetailData($m, $baseUrl) {
         }
     }
     
-    $itemTypes = [];
-    if (!empty($m['item_types'])) {
-        $itemTypes = json_decode($m['item_types'], true);
-        if (!is_array($itemTypes)) {
-            $itemTypes = [];
+    // FIXED: Changed from item_types to cuisine_type
+    $cuisineTypes = [];
+    if (!empty($m['cuisine_type'])) {
+        $cuisineTypes = json_decode($m['cuisine_type'], true);
+        if (!is_array($cuisineTypes)) {
+            $cuisineTypes = [];
         }
     }
 
@@ -1291,7 +1294,7 @@ function formatMerchantDetailData($m, $baseUrl) {
         'description' => $m['description'] ?? '',
         'category' => $m['category'] ?? '',
         'business_type' => $m['business_type'] ?? 'restaurant',
-        'item_types' => $itemTypes,
+        'cuisine_types' => $cuisineTypes,
         'rating' => floatval($m['rating'] ?? 0),
         'review_count' => intval($m['review_count'] ?? 0),
         'delivery_info' => $m['delivery_info'] ?? '',
@@ -1453,6 +1456,7 @@ function formatMenuItemData($item, $baseUrl) {
         'updated_at' => $item['updated_at'] ?? ''
     ];
 }
+
 function formatCategoryData($category, $baseUrl) {
     $imageUrl = '';
     if (!empty($category['image_url'])) {
