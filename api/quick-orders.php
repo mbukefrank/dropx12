@@ -250,6 +250,17 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
                 qo.seasonal_available,
                 qo.created_at,
                 qo.updated_at,
+                qo.has_variants,
+                qo.variant_type,
+                qo.preparation_time,
+                qo.merchant_id,
+                qo.merchant_name,
+                qo.merchant_address,
+                qo.merchant_distance,
+                qo.pickup_time,
+                qo.tags,
+                qo.average_rating,
+                qo.nutritional_info,
                 COALESCE(
                     (SELECT GROUP_CONCAT(DISTINCT qoi.unit_type) 
                      FROM quick_order_items qoi 
@@ -374,7 +385,19 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             qo.season_start_month,
             qo.season_end_month,
             qo.created_at,
-            qo.updated_at
+            qo.updated_at,
+            qo.has_variants,
+            qo.variant_type,
+            qo.preparation_time,
+            qo.merchant_id,
+            qo.merchant_name,
+            qo.merchant_address,
+            qo.merchant_distance,
+            qo.pickup_time,
+            qo.tags,
+            qo.average_rating,
+            qo.nutritional_info,
+            qo.is_available
         FROM quick_orders qo
         WHERE qo.id = :id"
     );
@@ -386,6 +409,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         ResponseHandler::error('Quick order not found', 404);
     }
 
+    // Get items with variants
     $itemsStmt = $conn->prepare(
         "SELECT 
             qoi.id,
@@ -399,6 +423,11 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             qoi.is_available,
             qoi.stock_quantity,
             qoi.reorder_level,
+            qoi.has_variants,
+            qoi.variant_type,
+            qoi.variants_json,
+            qoi.badge,
+            qoi.price_per_unit,
             qoi.created_at
         FROM quick_order_items qoi
         WHERE qoi.quick_order_id = :quick_order_id
@@ -408,6 +437,25 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $itemsStmt->execute([':quick_order_id' => $orderId]);
     $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Get add-ons
+    $addOnsStmt = $conn->prepare(
+        "SELECT 
+            id,
+            name,
+            price,
+            category,
+            description,
+            is_available
+        FROM quick_order_addons
+        WHERE quick_order_id = :quick_order_id
+        AND is_available = 1
+        ORDER BY category, price"
+    );
+    
+    $addOnsStmt->execute([':quick_order_id' => $orderId]);
+    $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Get merchants
     $merchantsStmt = $conn->prepare(
         "SELECT 
             m.id,
@@ -421,6 +469,8 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             m.delivery_fee,
             m.min_order_amount,
             m.delivery_radius,
+            m.address,
+            m.phone,
             qom.custom_price,
             qom.custom_delivery_time,
             qom.priority
@@ -440,10 +490,14 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $orderData['items'] = array_map(function($item) use ($baseUrl) {
         return formatQuickOrderItemData($item, $baseUrl);
     }, $items);
+    $orderData['add_ons'] = array_map(function($addOn) {
+        return formatAddOnData($addOn);
+    }, $addOns);
     $orderData['merchants'] = array_map(function($merchant) use ($baseUrl) {
         return formatQuickOrderMerchantData($merchant, $baseUrl);
     }, $merchants);
 
+    // Get similar items
     $similarItemsStmt = $conn->prepare(
         "SELECT 
             qo.id,
@@ -453,11 +507,18 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             qo.item_type,
             qo.image_url,
             qo.price,
-            qo.rating
+            qo.rating,
+            qo.order_count,
+            qo.has_variants,
+            qo.variant_type,
+            qo.preparation_time,
+            qo.merchant_name,
+            qo.tags
         FROM quick_orders qo
         WHERE qo.category = :category
         AND qo.id != :id
         AND qo.item_type = :item_type
+        AND qo.is_available = 1
         ORDER BY qo.order_count DESC
         LIMIT 5"
     );
@@ -573,8 +634,10 @@ function handlePostRequest() {
 function addQuickOrderToCart($conn, $data, $userId) {
     $quickOrderId = $data['quick_order_id'] ?? null;
     $itemId = $data['item_id'] ?? null;
+    $variantId = $data['variant_id'] ?? null;
     $quantity = intval($data['quantity'] ?? 1);
     $unitType = $data['unit_type'] ?? null;
+    $selectedOptions = $data['selected_options'] ?? null;
 
     if (!$quickOrderId || !$itemId) {
         ResponseHandler::error('Quick order ID and item ID are required', 400);
@@ -584,8 +647,10 @@ function addQuickOrderToCart($conn, $data, $userId) {
         ResponseHandler::error('Quantity must be at least 1', 400);
     }
 
+    // Get item details with variants
     $itemStmt = $conn->prepare(
-        "SELECT qoi.*, qo.item_type, qo.category 
+        "SELECT qoi.*, qo.item_type, qo.category, qo.title as quick_order_title,
+                qo.merchant_id, qo.merchant_name, qo.preparation_time
          FROM quick_order_items qoi
          JOIN quick_orders qo ON qoi.quick_order_id = qo.id
          WHERE qoi.id = :item_id 
@@ -602,10 +667,28 @@ function addQuickOrderToCart($conn, $data, $userId) {
         ResponseHandler::error('Item not available', 404);
     }
 
+    // Handle variant selection
+    $variantData = null;
+    if ($variantId) {
+        $variants = json_decode($item['variants_json'] ?? '[]', true);
+        foreach ($variants as $variant) {
+            if ($variant['id'] == $variantId) {
+                $variantData = $variant;
+                $item['price'] = $variant['price'];
+                $item['name'] = $item['name'] . ' (' . $variant['display_name'] . ')';
+                break;
+            }
+        }
+        if (!$variantData) {
+            ResponseHandler::error('Variant not found', 404);
+        }
+    }
+
     if ($item['stock_quantity'] > 0 && $quantity > $item['stock_quantity']) {
         ResponseHandler::error('Insufficient stock', 400);
     }
 
+    // Check if item already in cart
     $checkStmt = $conn->prepare(
         "SELECT id, quantity FROM cart_items 
          WHERE user_id = :user_id 
@@ -622,12 +705,18 @@ function addQuickOrderToCart($conn, $data, $userId) {
             "UPDATE cart_items 
              SET quantity = :quantity, 
                  unit_type = :unit_type,
+                 variant_id = :variant_id,
+                 variant_data = :variant_data,
+                 selected_options = :selected_options,
                  updated_at = NOW()
              WHERE id = :id"
         );
         $updateStmt->execute([
             ':quantity' => $newQuantity,
             ':unit_type' => $unitType ?? $item['unit_type'],
+            ':variant_id' => $variantId,
+            ':variant_data' => $variantData ? json_encode($variantData) : null,
+            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
             ':id' => $existing['id']
         ]);
     } else {
@@ -645,6 +734,13 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 unit_value,
                 item_type,
                 category,
+                merchant_id,
+                merchant_name,
+                preparation_time,
+                variant_id,
+                variant_data,
+                selected_options,
+                has_variants,
                 created_at
             ) VALUES (
                 :user_id, 
@@ -659,6 +755,13 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 :unit_value,
                 :item_type,
                 :category,
+                :merchant_id,
+                :merchant_name,
+                :preparation_time,
+                :variant_id,
+                :variant_data,
+                :selected_options,
+                :has_variants,
                 NOW()
             )"
         );
@@ -674,7 +777,14 @@ function addQuickOrderToCart($conn, $data, $userId) {
             ':unit_type' => $unitType ?? $item['unit_type'],
             ':unit_value' => $item['unit_value'],
             ':item_type' => $item['item_type'],
-            ':category' => $item['category']
+            ':category' => $item['category'],
+            ':merchant_id' => $item['merchant_id'],
+            ':merchant_name' => $item['merchant_name'],
+            ':preparation_time' => $item['preparation_time'],
+            ':variant_id' => $variantId,
+            ':variant_data' => $variantData ? json_encode($variantData) : null,
+            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
+            ':has_variants' => $item['has_variants'] ? 1 : 0
         ]);
     }
 
@@ -695,6 +805,7 @@ function bulkUpdateStock($conn, $data, $userId) {
     try {
         foreach ($updates as $update) {
             $itemId = $update['item_id'] ?? null;
+            $variantId = $update['variant_id'] ?? null;
             $stockQuantity = intval($update['stock_quantity'] ?? 0);
             $isAvailable = $update['is_available'] ?? null;
 
@@ -702,24 +813,54 @@ function bulkUpdateStock($conn, $data, $userId) {
                 throw new Exception('Item ID is required for each update');
             }
 
-            $updateFields = [];
-            $updateParams = [':id' => $itemId];
+            if ($variantId) {
+                // Update variant stock in JSON
+                $itemStmt = $conn->prepare("SELECT variants_json FROM quick_order_items WHERE id = :id");
+                $itemStmt->execute([':id' => $itemId]);
+                $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($item) {
+                    $variants = json_decode($item['variants_json'] ?? '[]', true);
+                    foreach ($variants as &$variant) {
+                        if ($variant['id'] == $variantId) {
+                            if ($stockQuantity !== null) {
+                                $variant['stock_quantity'] = $stockQuantity;
+                            }
+                            if ($isAvailable !== null) {
+                                $variant['is_available'] = $isAvailable;
+                            }
+                            break;
+                        }
+                    }
+                    
+                    $updateStmt = $conn->prepare(
+                        "UPDATE quick_order_items SET variants_json = :variants_json, updated_at = NOW() WHERE id = :id"
+                    );
+                    $updateStmt->execute([
+                        ':variants_json' => json_encode($variants),
+                        ':id' => $itemId
+                    ]);
+                }
+            } else {
+                $updateFields = [];
+                $updateParams = [':id' => $itemId];
 
-            if ($stockQuantity !== null) {
-                $updateFields[] = "stock_quantity = :stock_quantity";
-                $updateParams[':stock_quantity'] = $stockQuantity;
-            }
+                if ($stockQuantity !== null) {
+                    $updateFields[] = "stock_quantity = :stock_quantity";
+                    $updateParams[':stock_quantity'] = $stockQuantity;
+                }
 
-            if ($isAvailable !== null) {
-                $updateFields[] = "is_available = :is_available";
-                $updateParams[':is_available'] = $isAvailable ? 1 : 0;
-            }
+                if ($isAvailable !== null) {
+                    $updateFields[] = "is_available = :is_available";
+                    $updateParams[':is_available'] = $isAvailable ? 1 : 0;
+                }
 
-            if (!empty($updateFields)) {
-                $updateFields[] = "updated_at = NOW()";
-                $sql = "UPDATE quick_order_items SET " . implode(', ', $updateFields) . " WHERE id = :id";
-                $stmt = $conn->prepare($sql);
-                $stmt->execute($updateParams);
+                if (!empty($updateFields)) {
+                    $updateFields[] = "updated_at = NOW()";
+                    $sql = "UPDATE quick_order_items SET " . implode(', ', $updateFields) . " WHERE id = :id";
+                    $stmt = $conn->prepare($sql);
+                    $stmt->execute($updateParams);
+                }
             }
         }
 
@@ -734,10 +875,11 @@ function bulkUpdateStock($conn, $data, $userId) {
 function getQuickOrdersByCategories($conn, $data, $baseUrl, $userId = null) {
     $categories = $data['categories'] ?? [];
     $itemTypes = $data['item_types'] ?? [];
+    $variantTypes = $data['variant_types'] ?? [];
     $limit = min(20, max(1, intval($data['limit'] ?? 10)));
 
-    if (empty($categories) && empty($itemTypes)) {
-        ResponseHandler::error('At least one category or item type is required', 400);
+    if (empty($categories) && empty($itemTypes) && empty($variantTypes)) {
+        ResponseHandler::error('At least one filter is required', 400);
     }
 
     $whereConditions = [];
@@ -763,6 +905,16 @@ function getQuickOrdersByCategories($conn, $data, $baseUrl, $userId = null) {
         $whereConditions[] = "qo.item_type IN (" . implode(',', $typePlaceholders) . ")";
     }
 
+    if (!empty($variantTypes)) {
+        $variantPlaceholders = [];
+        foreach ($variantTypes as $index => $type) {
+            $param = ":variant_$index";
+            $variantPlaceholders[] = $param;
+            $params[$param] = $type;
+        }
+        $whereConditions[] = "qo.variant_type IN (" . implode(',', $variantPlaceholders) . ")";
+    }
+
     $whereClause = "WHERE " . implode(" AND ", $whereConditions);
 
     $sql = "SELECT 
@@ -778,7 +930,13 @@ function getQuickOrdersByCategories($conn, $data, $baseUrl, $userId = null) {
                 qo.price,
                 qo.rating,
                 qo.order_count,
-                qo.delivery_time
+                qo.delivery_time,
+                qo.has_variants,
+                qo.variant_type,
+                qo.preparation_time,
+                qo.merchant_name,
+                qo.tags,
+                qo.average_rating
             FROM quick_orders qo
             $whereClause
             ORDER BY qo.is_popular DESC, qo.order_count DESC
@@ -837,6 +995,7 @@ function createQuickOrder($conn, $data, $userId) {
     $specialInstructions = trim($data['special_instructions'] ?? '');
     $deliveryAddress = trim($data['delivery_address'] ?? '');
     $paymentMethod = $data['payment_method'] ?? 'cash';
+    $saveForLater = $data['save_for_later'] ?? false;
     
     if (!$quickOrderId) {
         ResponseHandler::error('Quick order ID is required', 400);
@@ -858,6 +1017,8 @@ function createQuickOrder($conn, $data, $userId) {
     $orderStmt = $conn->prepare(
         "SELECT 
             qo.title,
+            qo.has_variants,
+            qo.variant_type,
             COALESCE(
                 (SELECT qoi.price 
                  FROM quick_order_items qoi 
@@ -866,7 +1027,8 @@ function createQuickOrder($conn, $data, $userId) {
                  LIMIT 1),
                 0.00
             ) as price,
-            qo.delivery_time 
+            qo.delivery_time,
+            qo.preparation_time
         FROM quick_orders qo 
         WHERE qo.id = :id"
     );
@@ -879,7 +1041,7 @@ function createQuickOrder($conn, $data, $userId) {
 
     // Get merchant details
     $merchantStmt = $conn->prepare(
-        "SELECT name, delivery_fee FROM merchants WHERE id = :id AND is_active = 1"
+        "SELECT name, delivery_fee, address, phone FROM merchants WHERE id = :id AND is_active = 1"
     );
     $merchantStmt->execute([':id' => $merchantId]);
     $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
@@ -894,24 +1056,44 @@ function createQuickOrder($conn, $data, $userId) {
 
     foreach ($items as $item) {
         $itemId = $item['id'] ?? null;
+        $variantId = $item['variant_id'] ?? null;
         $quantity = intval($item['quantity'] ?? 1);
+        $selectedOptions = $item['selected_options'] ?? null;
 
         if ($itemId && $quantity > 0) {
             $itemStmt = $conn->prepare(
-                "SELECT name, price FROM quick_order_items WHERE id = :id"
+                "SELECT name, price, has_variants, variants_json 
+                 FROM quick_order_items WHERE id = :id"
             );
             $itemStmt->execute([':id' => $itemId]);
             $itemData = $itemStmt->fetch(PDO::FETCH_ASSOC);
 
             if ($itemData) {
-                $itemTotal = $itemData['price'] * $quantity;
+                $itemPrice = $itemData['price'];
+                $itemName = $itemData['name'];
+                
+                // Handle variant pricing
+                if ($variantId && $itemData['has_variants']) {
+                    $variants = json_decode($itemData['variants_json'] ?? '[]', true);
+                    foreach ($variants as $variant) {
+                        if ($variant['id'] == $variantId) {
+                            $itemPrice = $variant['price'];
+                            $itemName .= ' (' . $variant['display_name'] . ')';
+                            break;
+                        }
+                    }
+                }
+                
+                $itemTotal = $itemPrice * $quantity;
                 $subtotal += $itemTotal;
                 
                 $itemDetails[] = [
-                    'name' => $itemData['name'],
+                    'name' => $itemName,
                     'quantity' => $quantity,
-                    'price' => $itemData['price'],
-                    'total' => $itemTotal
+                    'price' => $itemPrice,
+                    'total' => $itemTotal,
+                    'variant_id' => $variantId,
+                    'selected_options' => $selectedOptions
                 ];
             }
         }
@@ -934,14 +1116,18 @@ function createQuickOrder($conn, $data, $userId) {
         // Create order record
         $orderSql = "
             INSERT INTO orders (
-                order_number, user_id, merchant_id, quick_order_id,
+                order_number, user_id, merchant_id, merchant_name, merchant_phone, merchant_address,
+                quick_order_id, quick_order_title,
                 subtotal, delivery_fee, total_amount, payment_method,
                 delivery_address, special_instructions, status,
+                preparation_time, estimated_delivery_time,
                 created_at
             ) VALUES (
-                :order_number, :user_id, :merchant_id, :quick_order_id,
+                :order_number, :user_id, :merchant_id, :merchant_name, :merchant_phone, :merchant_address,
+                :quick_order_id, :quick_order_title,
                 :subtotal, :delivery_fee, :total_amount, :payment_method,
                 :delivery_address, :special_instructions, 'pending',
+                :preparation_time, DATE_ADD(NOW(), INTERVAL 30 MINUTE),
                 NOW()
             )";
 
@@ -950,13 +1136,18 @@ function createQuickOrder($conn, $data, $userId) {
             ':order_number' => $orderNumber,
             ':user_id' => $userId,
             ':merchant_id' => $merchantId,
+            ':merchant_name' => $merchant['name'],
+            ':merchant_phone' => $merchant['phone'] ?? '',
+            ':merchant_address' => $merchant['address'] ?? '',
             ':quick_order_id' => $quickOrderId,
+            ':quick_order_title' => $quickOrder['title'],
             ':subtotal' => $subtotal,
             ':delivery_fee' => $deliveryFee,
             ':total_amount' => $totalAmount,
             ':payment_method' => $paymentMethod,
             ':delivery_address' => $deliveryAddress,
-            ':special_instructions' => $specialInstructions
+            ':special_instructions' => $specialInstructions,
+            ':preparation_time' => $quickOrder['preparation_time']
         ]);
 
         $orderId = $conn->lastInsertId();
@@ -965,9 +1156,11 @@ function createQuickOrder($conn, $data, $userId) {
         $itemSql = "
             INSERT INTO order_items (
                 order_id, item_name, quantity, price, total,
+                variant_id, selected_options,
                 created_at
             ) VALUES (
                 :order_id, :item_name, :quantity, :price, :total,
+                :variant_id, :selected_options,
                 NOW()
             )";
 
@@ -979,7 +1172,9 @@ function createQuickOrder($conn, $data, $userId) {
                 ':item_name' => $item['name'],
                 ':quantity' => $item['quantity'],
                 ':price' => $item['price'],
-                ':total' => $item['total']
+                ':total' => $item['total'],
+                ':variant_id' => $item['variant_id'],
+                ':selected_options' => $item['selected_options'] ? json_encode($item['selected_options']) : null
             ]);
         }
 
@@ -988,6 +1183,28 @@ function createQuickOrder($conn, $data, $userId) {
             "UPDATE quick_orders SET order_count = order_count + 1 WHERE id = :id"
         );
         $updateOrderStmt->execute([':id' => $quickOrderId]);
+
+        // Save for later if requested
+        if ($saveForLater) {
+            $favoriteStmt = $conn->prepare(
+                "INSERT IGNORE INTO user_favorites (user_id, quick_order_id, created_at)
+                 VALUES (:user_id, :quick_order_id, NOW())"
+            );
+            $favoriteStmt->execute([
+                ':user_id' => $userId,
+                ':quick_order_id' => $quickOrderId
+            ]);
+        }
+
+        // Clear cart items for this quick order
+        $clearCartStmt = $conn->prepare(
+            "DELETE FROM cart_items 
+             WHERE user_id = :user_id AND quick_order_id = :quick_order_id"
+        );
+        $clearCartStmt->execute([
+            ':user_id' => $userId,
+            ':quick_order_id' => $quickOrderId
+        ]);
 
         // Commit transaction
         $conn->commit();
@@ -998,7 +1215,8 @@ function createQuickOrder($conn, $data, $userId) {
         ResponseHandler::success([
             'order' => formatOrderData($orderDetails),
             'order_number' => $orderNumber,
-            'estimated_delivery' => date('Y-m-d H:i:s', strtotime('+30 minutes'))
+            'estimated_delivery' => date('Y-m-d H:i:s', strtotime('+30 minutes')),
+            'preparation_time' => $quickOrder['preparation_time']
         ], 'Quick order created successfully');
 
     } catch (Exception $e) {
@@ -1046,12 +1264,17 @@ function getQuickOrderHistory($conn, $data, $baseUrl, $userId) {
                 o.payment_method,
                 o.delivery_address,
                 o.special_instructions,
+                o.preparation_time,
+                o.estimated_delivery_time,
                 o.created_at,
                 o.updated_at,
                 qo.title as quick_order_title,
                 qo.image_url as quick_order_image,
+                qo.has_variants,
+                qo.variant_type,
                 m.name as merchant_name,
-                m.image_url as merchant_image
+                m.image_url as merchant_image,
+                m.rating as merchant_rating
             FROM orders o
             LEFT JOIN quick_orders qo ON o.quick_order_id = qo.id
             LEFT JOIN merchants m ON o.merchant_id = m.id
@@ -1073,6 +1296,16 @@ function getQuickOrderHistory($conn, $data, $baseUrl, $userId) {
     
     $stmt->execute();
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Get order items for each order
+    foreach ($orders as &$order) {
+        $itemsStmt = $conn->prepare(
+            "SELECT item_name, quantity, price, total, variant_id 
+             FROM order_items WHERE order_id = :order_id"
+        );
+        $itemsStmt->execute([':order_id' => $order['id']]);
+        $order['items'] = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+    }
 
     // Format orders
     $formattedOrders = array_map(function($order) use ($baseUrl) {
@@ -1103,7 +1336,7 @@ function cancelQuickOrder($conn, $data, $userId) {
 
     // Check if order exists and belongs to user
     $checkStmt = $conn->prepare(
-        "SELECT id, status FROM orders 
+        "SELECT id, status, quick_order_id FROM orders 
          WHERE id = :id AND user_id = :user_id AND quick_order_id IS NOT NULL"
     );
     $checkStmt->execute([
@@ -1147,6 +1380,7 @@ function rateQuickOrder($conn, $data, $userId) {
     $orderId = $data['order_id'] ?? null;
     $rating = intval($data['rating'] ?? 0);
     $comment = trim($data['comment'] ?? '');
+    $itemRatings = $data['item_ratings'] ?? null;
 
     if (!$orderId) {
         ResponseHandler::error('Order ID is required', 400);
@@ -1158,7 +1392,7 @@ function rateQuickOrder($conn, $data, $userId) {
 
     // Check if order exists and is delivered
     $checkStmt = $conn->prepare(
-        "SELECT o.id, o.quick_order_id 
+        "SELECT o.id, o.quick_order_id, o.merchant_id, o.quick_order_title
          FROM orders o
          WHERE o.id = :id 
          AND o.user_id = :user_id 
@@ -1190,29 +1424,61 @@ function rateQuickOrder($conn, $data, $userId) {
         ResponseHandler::error('You have already rated this order', 409);
     }
 
-    // Create review
-    $stmt = $conn->prepare(
-        "INSERT INTO user_reviews 
-            (user_id, order_id, quick_order_id, rating, comment, review_type, created_at)
-         VALUES (:user_id, :order_id, :quick_order_id, :rating, :comment, 'quick_order', NOW())"
-    );
-    
-    $stmt->execute([
-        ':user_id' => $userId,
-        ':order_id' => $orderId,
-        ':quick_order_id' => $order['quick_order_id'],
-        ':rating' => $rating,
-        ':comment' => $comment
-    ]);
+    // Start transaction
+    $conn->beginTransaction();
 
-    // Update quick order rating
-    updateQuickOrderRating($conn, $order['quick_order_id']);
+    try {
+        // Create main review
+        $stmt = $conn->prepare(
+            "INSERT INTO user_reviews 
+                (user_id, order_id, quick_order_id, merchant_id, item_name,
+                 rating, comment, review_type, created_at)
+             VALUES (:user_id, :order_id, :quick_order_id, :merchant_id, :item_name,
+                     :rating, :comment, 'quick_order', NOW())"
+        );
+        
+        $stmt->execute([
+            ':user_id' => $userId,
+            ':order_id' => $orderId,
+            ':quick_order_id' => $order['quick_order_id'],
+            ':merchant_id' => $order['merchant_id'],
+            ':item_name' => $order['quick_order_title'],
+            ':rating' => $rating,
+            ':comment' => $comment
+        ]);
 
-    ResponseHandler::success([], 'Thank you for your rating!');
+        // Add item-specific ratings if provided
+        if ($itemRatings && is_array($itemRatings)) {
+            $itemStmt = $conn->prepare(
+                "INSERT INTO order_item_reviews
+                    (order_id, item_name, rating, comment, created_at)
+                 VALUES (:order_id, :item_name, :rating, :comment, NOW())"
+            );
+            
+            foreach ($itemRatings as $itemRating) {
+                $itemStmt->execute([
+                    ':order_id' => $orderId,
+                    ':item_name' => $itemRating['name'] ?? '',
+                    ':rating' => $itemRating['rating'] ?? $rating,
+                    ':comment' => $itemRating['comment'] ?? ''
+                ]);
+            }
+        }
+
+        // Update quick order rating
+        updateQuickOrderRating($conn, $order['quick_order_id']);
+
+        $conn->commit();
+        ResponseHandler::success([], 'Thank you for your rating!');
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to submit rating: ' . $e->getMessage(), 500);
+    }
 }
 
 /*********************************
- * FORMATTING FUNCTIONS - SINGLE DEFINITIONS ONLY
+ * FORMATTING FUNCTIONS
  *********************************/
 function formatQuickOrderListData($q, $baseUrl) {
     $imageUrl = '';
@@ -1222,6 +1488,13 @@ function formatQuickOrderListData($q, $baseUrl) {
         } else {
             $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $q['image_url'];
         }
+    }
+    
+    // Parse tags if stored as JSON
+    $tags = [];
+    if (!empty($q['tags'])) {
+        $tagsData = json_decode($q['tags'], true);
+        $tags = is_array($tagsData) ? $tagsData : [];
     }
     
     return [
@@ -1240,10 +1513,17 @@ function formatQuickOrderListData($q, $baseUrl) {
         'formatted_price' => 'MK ' . number_format(floatval($q['price'] ?? 0), 2),
         'order_count' => intval($q['order_count'] ?? 0),
         'rating' => floatval($q['rating'] ?? 0),
+        'average_rating' => floatval($q['average_rating'] ?? $q['rating'] ?? 0),
         'min_order_amount' => floatval($q['min_order_amount'] ?? 0),
         'available_all_day' => boolval($q['available_all_day'] ?? true),
         'seasonal_available' => boolval($q['seasonal_available'] ?? false),
         'available_units' => !empty($q['available_units']) ? explode(',', $q['available_units']) : [],
+        'has_variants' => boolval($q['has_variants'] ?? false),
+        'variant_type' => $q['variant_type'] ?? null,
+        'preparation_time' => $q['preparation_time'] ?? '15-20 min',
+        'merchant_id' => $q['merchant_id'] ?? null,
+        'merchant_name' => $q['merchant_name'] ?? null,
+        'tags' => $tags,
         'created_at' => $q['created_at'] ?? '',
         'updated_at' => $q['updated_at'] ?? ''
     ];
@@ -1259,8 +1539,8 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         }
     }
     
-    $isAvailable = true;
-    if ($q['seasonal_available']) {
+    $isAvailable = boolval($q['is_available'] ?? true);
+    if ($isAvailable && ($q['seasonal_available'] ?? false)) {
         $currentMonth = date('n');
         $startMonth = $q['season_start_month'] ?? 1;
         $endMonth = $q['season_end_month'] ?? 12;
@@ -1269,6 +1549,29 @@ function formatQuickOrderDetailData($q, $baseUrl) {
             $isAvailable = ($currentMonth >= $startMonth && $currentMonth <= $endMonth);
         } else {
             $isAvailable = ($currentMonth >= $startMonth || $currentMonth <= $endMonth);
+        }
+    }
+    
+    // Parse tags if stored as JSON
+    $tags = [];
+    if (!empty($q['tags'])) {
+        $tagsData = json_decode($q['tags'], true);
+        $tags = is_array($tagsData) ? $tagsData : [];
+    }
+    
+    // Parse nutritional info if stored as JSON
+    $nutritionalInfo = null;
+    if (!empty($q['nutritional_info'])) {
+        $nutritionalData = json_decode($q['nutritional_info'], true);
+        if (is_array($nutritionalData)) {
+            $nutritionalInfo = [
+                'calories' => $nutritionalData['calories'] ?? null,
+                'protein' => $nutritionalData['protein'] ?? null,
+                'carbs' => $nutritionalData['carbs'] ?? null,
+                'fat' => $nutritionalData['fat'] ?? null,
+                'allergens' => $nutritionalData['allergens'] ?? [],
+                'additional' => $nutritionalData['additional'] ?? null
+            ];
         }
     }
     
@@ -1288,6 +1591,7 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         'formatted_price' => 'MK ' . number_format(floatval($q['price'] ?? 0), 2),
         'order_count' => intval($q['order_count'] ?? 0),
         'rating' => floatval($q['rating'] ?? 0),
+        'average_rating' => floatval($q['average_rating'] ?? $q['rating'] ?? 0),
         'min_order_amount' => floatval($q['min_order_amount'] ?? 0),
         'available_all_day' => boolval($q['available_all_day'] ?? true),
         'available_start_time' => $q['available_start_time'] ?? '',
@@ -1296,6 +1600,16 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         'season_start_month' => $q['season_start_month'] ?? null,
         'season_end_month' => $q['season_end_month'] ?? null,
         'is_available' => $isAvailable,
+        'has_variants' => boolval($q['has_variants'] ?? false),
+        'variant_type' => $q['variant_type'] ?? null,
+        'preparation_time' => $q['preparation_time'] ?? '15-20 min',
+        'merchant_id' => $q['merchant_id'] ?? null,
+        'merchant_name' => $q['merchant_name'] ?? null,
+        'merchant_address' => $q['merchant_address'] ?? null,
+        'merchant_distance' => $q['merchant_distance'] ? floatval($q['merchant_distance']) : null,
+        'pickup_time' => $q['pickup_time'] ?? null,
+        'tags' => $tags,
+        'nutritional_info' => $nutritionalInfo,
         'created_at' => $q['created_at'] ?? '',
         'updated_at' => $q['updated_at'] ?? ''
     ];
@@ -1313,11 +1627,18 @@ function formatQuickOrderItemData($item, $baseUrl) {
     
     $displayPrice = $item['price'];
     $displayUnit = $item['unit_type'];
+    $unitValue = floatval($item['unit_value'] ?? 1);
     
-    if ($item['unit_type'] === 'kg' && $item['unit_value'] != 1) {
-        $displayPrice = $item['price'] / $item['unit_value'];
-        $displayUnit = 'g';
+    if ($item['unit_type'] === 'kg' && $unitValue != 1) {
+        $displayPrice = $item['price'] / $unitValue;
         $displayPrice = round($displayPrice * 1000, 2);
+    }
+    
+    // Parse variants JSON
+    $variants = [];
+    if (!empty($item['variants_json'])) {
+        $variantsData = json_decode($item['variants_json'], true);
+        $variants = is_array($variantsData) ? $variantsData : [];
     }
     
     return [
@@ -1329,13 +1650,31 @@ function formatQuickOrderItemData($item, $baseUrl) {
         'formatted_price' => 'MK ' . number_format(floatval($displayPrice), 2) . ' / ' . $displayUnit,
         'image_url' => $imageUrl,
         'unit_type' => $item['unit_type'] ?? 'piece',
-        'unit_value' => floatval($item['unit_value'] ?? 1),
+        'unit_value' => $unitValue,
         'is_default' => boolval($item['is_default'] ?? false),
         'is_available' => boolval($item['is_available'] ?? true),
         'stock_quantity' => intval($item['stock_quantity'] ?? 0),
         'reorder_level' => intval($item['reorder_level'] ?? 10),
         'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && $item['is_available'],
+        'has_variants' => boolval($item['has_variants'] ?? false),
+        'variant_type' => $item['variant_type'] ?? null,
+        'variants' => $variants,
+        'badge' => $item['badge'] ?? null,
+        'price_per_unit' => $item['price_per_unit'] ? floatval($item['price_per_unit']) : null,
         'created_at' => $item['created_at'] ?? ''
+    ];
+}
+
+function formatAddOnData($addOn) {
+    return [
+        'id' => $addOn['id'] ?? null,
+        'name' => $addOn['name'] ?? '',
+        'price' => floatval($addOn['price'] ?? 0),
+        'formatted_price' => 'MK ' . number_format(floatval($addOn['price'] ?? 0), 2),
+        'category' => $addOn['category'] ?? null,
+        'description' => $addOn['description'] ?? '',
+        'is_available' => boolval($addOn['is_available'] ?? true),
+        'is_selected' => false // Default not selected
     ];
 }
 
@@ -1349,8 +1688,8 @@ function formatQuickOrderMerchantData($merchant, $baseUrl) {
         }
     }
     
-    $deliveryFee = $merchant['custom_price'] ?? $merchant['delivery_fee'];
-    $deliveryTime = $merchant['custom_delivery_time'] ?? $merchant['delivery_time'];
+    $deliveryFee = $merchant['custom_price'] ?? $merchant['delivery_fee'] ?? 0;
+    $deliveryTime = $merchant['custom_delivery_time'] ?? $merchant['delivery_time'] ?? '30-45 min';
     
     return [
         'id' => $merchant['id'] ?? null,
@@ -1365,6 +1704,8 @@ function formatQuickOrderMerchantData($merchant, $baseUrl) {
         'formatted_delivery_fee' => 'MK ' . number_format(floatval($deliveryFee), 2),
         'min_order_amount' => floatval($merchant['min_order_amount'] ?? 0),
         'delivery_radius' => intval($merchant['delivery_radius'] ?? 5),
+        'address' => $merchant['address'] ?? '',
+        'phone' => $merchant['phone'] ?? '',
         'priority' => intval($merchant['priority'] ?? 0),
         'has_custom_price' => isset($merchant['custom_price']),
         'has_custom_delivery_time' => isset($merchant['custom_delivery_time'])
@@ -1382,10 +1723,11 @@ function toggleQuickOrderFavorite($conn, $data, $userId) {
     }
 
     // Check if quick order exists
-    $checkStmt = $conn->prepare("SELECT id FROM quick_orders WHERE id = :id");
+    $checkStmt = $conn->prepare("SELECT id, title, merchant_name FROM quick_orders WHERE id = :id");
     $checkStmt->execute([':id' => $quickOrderId]);
+    $quickOrder = $checkStmt->fetch(PDO::FETCH_ASSOC);
     
-    if (!$checkStmt->fetch()) {
+    if (!$quickOrder) {
         ResponseHandler::error('Quick order not found', 404);
     }
 
@@ -1415,12 +1757,14 @@ function toggleQuickOrderFavorite($conn, $data, $userId) {
     } else {
         // Add to favorites
         $insertStmt = $conn->prepare(
-            "INSERT INTO user_favorites (user_id, quick_order_id, created_at)
-             VALUES (:user_id, :quick_order_id, NOW())"
+            "INSERT INTO user_favorites (user_id, quick_order_id, item_name, merchant_name, created_at)
+             VALUES (:user_id, :quick_order_id, :item_name, :merchant_name, NOW())"
         );
         $insertStmt->execute([
             ':user_id' => $userId,
-            ':quick_order_id' => $quickOrderId
+            ':quick_order_id' => $quickOrderId,
+            ':item_name' => $quickOrder['title'],
+            ':merchant_name' => $quickOrder['merchant_name']
         ]);
         
         $isFavorited = true;
@@ -1443,13 +1787,21 @@ function getOrderDetails($conn, $orderId) {
                 o.payment_method,
                 o.delivery_address,
                 o.special_instructions,
+                o.preparation_time,
+                o.estimated_delivery_time,
                 o.created_at,
                 o.updated_at,
+                qo.id as quick_order_id,
                 qo.title as quick_order_title,
                 qo.image_url as quick_order_image,
+                qo.has_variants,
+                qo.variant_type,
+                m.id as merchant_id,
                 m.name as merchant_name,
                 m.phone as merchant_phone,
-                m.address as merchant_address
+                m.address as merchant_address,
+                m.image_url as merchant_image,
+                m.rating as merchant_rating
             FROM orders o
             LEFT JOIN quick_orders qo ON o.quick_order_id = qo.id
             LEFT JOIN merchants m ON o.merchant_id = m.id
@@ -1457,8 +1809,19 @@ function getOrderDetails($conn, $orderId) {
 
     $stmt = $conn->prepare($sql);
     $stmt->execute([':id' => $orderId]);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
     
-    return $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($order) {
+        // Get order items
+        $itemsStmt = $conn->prepare(
+            "SELECT item_name, quantity, price, total, variant_id 
+             FROM order_items WHERE order_id = :order_id"
+        );
+        $itemsStmt->execute([':order_id' => $orderId]);
+        $order['items'] = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+    
+    return $order;
 }
 
 function updateQuickOrderRating($conn, $quickOrderId) {
@@ -1475,7 +1838,7 @@ function updateQuickOrderRating($conn, $quickOrderId) {
 
     $updateStmt = $conn->prepare(
         "UPDATE quick_orders 
-         SET rating = :rating, 
+         SET average_rating = :rating, 
              updated_at = NOW()
          WHERE id = :id"
     );
@@ -1503,7 +1866,7 @@ function formatOrderData($order) {
         if (strpos($order['merchant_image'], 'http') === 0) {
             $merchantImage = $order['merchant_image'];
         } else {
-            $merchantImage = rtrim($baseUrl, '/') . '/uploads/' . $order['merchant_image'];
+            $merchantImage = rtrim($baseUrl, '/') . '/uploads/merchants/' . $order['merchant_image'];
         }
     }
     
@@ -1517,12 +1880,28 @@ function formatOrderData($order) {
         'payment_method' => $order['payment_method'] ?? '',
         'delivery_address' => $order['delivery_address'] ?? '',
         'special_instructions' => $order['special_instructions'] ?? '',
+        'preparation_time' => $order['preparation_time'] ?? '',
+        'estimated_delivery_time' => $order['estimated_delivery_time'] ?? '',
+        'quick_order_id' => $order['quick_order_id'] ?? null,
         'quick_order_title' => $order['quick_order_title'] ?? '',
         'quick_order_image' => $quickOrderImage,
+        'has_variants' => boolval($order['has_variants'] ?? false),
+        'variant_type' => $order['variant_type'] ?? null,
+        'merchant_id' => $order['merchant_id'] ?? null,
         'merchant_name' => $order['merchant_name'] ?? '',
         'merchant_phone' => $order['merchant_phone'] ?? '',
         'merchant_address' => $order['merchant_address'] ?? '',
         'merchant_image' => $merchantImage,
+        'merchant_rating' => floatval($order['merchant_rating'] ?? 0),
+        'items' => array_map(function($item) {
+            return [
+                'name' => $item['item_name'],
+                'quantity' => intval($item['quantity']),
+                'price' => floatval($item['price']),
+                'total' => floatval($item['total']),
+                'variant_id' => $item['variant_id'] ?? null
+            ];
+        }, $order['items'] ?? []),
         'created_at' => $order['created_at'] ?? '',
         'updated_at' => $order['updated_at'] ?? ''
     ];
@@ -1543,7 +1922,7 @@ function formatOrderHistoryData($order, $baseUrl) {
         if (strpos($order['merchant_image'], 'http') === 0) {
             $merchantImage = $order['merchant_image'];
         } else {
-            $merchantImage = rtrim($baseUrl, '/') . '/uploads/' . $order['merchant_image'];
+            $merchantImage = rtrim($baseUrl, '/') . '/uploads/merchants/' . $order['merchant_image'];
         }
     }
     
@@ -1557,10 +1936,24 @@ function formatOrderHistoryData($order, $baseUrl) {
         'payment_method' => $order['payment_method'] ?? '',
         'delivery_address' => $order['delivery_address'] ?? '',
         'special_instructions' => $order['special_instructions'] ?? '',
+        'preparation_time' => $order['preparation_time'] ?? '',
+        'estimated_delivery_time' => $order['estimated_delivery_time'] ?? '',
         'quick_order_title' => $order['quick_order_title'] ?? '',
         'quick_order_image' => $quickOrderImage,
+        'has_variants' => boolval($order['has_variants'] ?? false),
+        'variant_type' => $order['variant_type'] ?? null,
         'merchant_name' => $order['merchant_name'] ?? '',
         'merchant_image' => $merchantImage,
+        'merchant_rating' => floatval($order['merchant_rating'] ?? 0),
+        'items' => array_map(function($item) {
+            return [
+                'name' => $item['item_name'],
+                'quantity' => intval($item['quantity']),
+                'price' => floatval($item['price']),
+                'total' => floatval($item['total']),
+                'variant_id' => $item['variant_id'] ?? null
+            ];
+        }, $order['items'] ?? []),
         'created_at' => $order['created_at'] ?? '',
         'updated_at' => $order['updated_at'] ?? ''
     ];
