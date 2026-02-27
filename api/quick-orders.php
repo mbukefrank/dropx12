@@ -559,7 +559,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         'image_url' => $quickOrder['image_url'] ? 
             (strpos($quickOrder['image_url'], 'http') === 0 ? 
                 $quickOrder['image_url'] : 
-                rtrim($baseUrl, '/') . '/uploads/quick_orders/' . $quickOrder['image_url']) 
+                rtrim($baseUrl, '/') . '/uploads/menu_items/' . $quickOrder['image_url']) 
             : '',
         'color' => $quickOrder['color'] ?? '#3A86FF',
         'is_popular' => (bool)$quickOrder['is_popular'],
@@ -2559,7 +2559,7 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         if (strpos($q['image_url'], 'http') === 0) {
             $imageUrl = $q['image_url'];
         } else {
-            $imageUrl = rtrim($baseUrl, '/') . '//uploads/menu_items/' . $q['image_url'];
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $q['image_url'];
         }
     }
     
