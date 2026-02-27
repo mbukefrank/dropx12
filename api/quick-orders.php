@@ -594,7 +594,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
                 'image_url' => $item['image_url'] ? 
                     (strpos($item['image_url'], 'http') === 0 ? 
                         $item['image_url'] : 
-                        rtrim($baseUrl, '/') . '/uploads/quick_order_items/' . $item['image_url']) 
+                        rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url']) 
                     : '',
                 'measurement_type' => $item['measurement_type'],
                 'unit' => $item['unit'],
@@ -2509,7 +2509,7 @@ function formatQuickOrderListData($q, $baseUrl) {
         if (strpos($q['image_url'], 'http') === 0) {
             $imageUrl = $q['image_url'];
         } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick_orders/' . $q['image_url'];
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $q['image_url'];
         }
     }
     
@@ -2559,7 +2559,7 @@ function formatQuickOrderDetailData($q, $baseUrl) {
         if (strpos($q['image_url'], 'http') === 0) {
             $imageUrl = $q['image_url'];
         } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick_orders/' . $q['image_url'];
+            $imageUrl = rtrim($baseUrl, '/') . '//uploads/menu_items/' . $q['image_url'];
         }
     }
     
@@ -2645,7 +2645,7 @@ function formatQuickOrderItemData($item, $baseUrl) {
         if (strpos($item['image_url'], 'http') === 0) {
             $imageUrl = $item['image_url'];
         } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick_order_items/' . $item['image_url'];
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url'];
         }
     }
     
@@ -2779,7 +2779,7 @@ function formatOrderHistoryData($order, $baseUrl) {
         if (strpos($order['quick_order_image'], 'http') === 0) {
             $quickOrderImage = $order['quick_order_image'];
         } else {
-            $quickOrderImage = rtrim($baseUrl, '/') . '/uploads/quick_orders/' . $order['quick_order_image'];
+            $quickOrderImage = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $order['quick_order_image'];
         }
     }
     
