@@ -352,7 +352,7 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
 }
 
 /*********************************
- * GET QUICK ORDER DETAILS - FIXED VERSION
+ * GET QUICK ORDER DETAILS - FIXED FOR FLUTTER
  *********************************/
 function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     // Get main quick order details
@@ -436,20 +436,23 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
 
     // ============================================
     // STEP 2: EXTRACT ALL VARIANTS INTO A FLAT ARRAY
-    // THIS IS CRITICAL - THIS CREATES THE 'variants' ARRAY
+    // AND FORMAT ITEMS WITH THEIR VARIANTS
     // ============================================
     
     $allVariants = [];
     $defaultVariantId = null;
     $fixedPrice = null;
+    $formattedItems = [];
     
     foreach ($items as $item) {
+        $itemVariants = [];
+        
         // If item has variants in variants_json, extract them
         if ($item['has_variants'] && !empty($item['variants_json'])) {
-            $itemVariants = json_decode($item['variants_json'], true);
+            $variantsData = json_decode($item['variants_json'], true);
             
-            if (is_array($itemVariants)) {
-                foreach ($itemVariants as $variant) {
+            if (is_array($variantsData)) {
+                foreach ($variantsData as $variant) {
                     // Format each variant properly for Flutter
                     $formattedVariant = [
                         'id' => intval($variant['id'] ?? 0),
@@ -457,6 +460,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
                         'display_name' => $variant['display_name'] ?? 
                                          ($variant['name'] ?? $item['name']),
                         'price' => floatval($variant['price'] ?? $item['price']),
+                        'formatted_price' => 'MK ' . number_format(floatval($variant['price'] ?? $item['price']), 2),
                         'is_default' => isset($variant['is_default']) ? 
                                         (bool)$variant['is_default'] : false,
                         'is_available' => isset($variant['is_available']) ? 
@@ -474,9 +478,12 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
                         'max_quantity' => intval($variant['max_quantity'] ?? 
                                                 $item['max_quantity'] ?? 99),
                         'stock_quantity' => isset($variant['stock_quantity']) ? 
-                                           intval($variant['stock_quantity']) : null
+                                           intval($variant['stock_quantity']) : null,
+                        'in_stock' => (!isset($variant['stock_quantity']) || $variant['stock_quantity'] > 0) && 
+                                     (!isset($variant['is_available']) || $variant['is_available'])
                     ];
                     
+                    $itemVariants[] = $formattedVariant;
                     $allVariants[] = $formattedVariant;
                     
                     if ($formattedVariant['is_default']) {
@@ -484,40 +491,45 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
                     }
                 }
             }
-        } 
-        // If no variants, treat the item itself as a single variant
-        else {
-            $formattedVariant = [
-                'id' => intval($item['id']),
-                'name' => $item['name'],
-                'display_name' => $item['custom_unit'] ?? 
-                                 ($item['unit'] ?? $item['name']),
-                'price' => floatval($item['price']),
-                'is_default' => (bool)($item['is_default'] ?? true),
-                'is_available' => (bool)($item['is_available'] ?? true),
-                'description' => $item['description'],
-                'badge' => $item['badge'] ?? null,
-                'measurement_type' => $item['measurement_type'] ?? 'custom',
-                'unit' => $item['unit'] ?? null,
-                'quantity' => isset($item['quantity']) ? floatval($item['quantity']) : null,
-                'custom_unit' => $item['custom_unit'] ?? null,
-                'price_per_unit' => isset($item['price_per_unit']) ? 
-                                   floatval($item['price_per_unit']) : null,
-                'max_quantity' => intval($item['max_quantity'] ?? 99),
-                'stock_quantity' => isset($item['stock_quantity']) ? 
-                                   intval($item['stock_quantity']) : null
-            ];
-            
-            $allVariants[] = $formattedVariant;
-            
-            if ($formattedVariant['is_default']) {
-                $defaultVariantId = $formattedVariant['id'];
+        }
+        
+        // Format the item itself
+        $imageUrl = '';
+        if (!empty($item['image_url'])) {
+            if (strpos($item['image_url'], 'http') === 0) {
+                $imageUrl = $item['image_url'];
+            } else {
+                $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url'];
             }
-            
-            // Set fixed price if no variants
-            if (!$quickOrder['has_variants'] && $fixedPrice === null) {
-                $fixedPrice = floatval($item['price']);
-            }
+        }
+        
+        $formattedItem = [
+            'id' => intval($item['id']),
+            'name' => $item['name'],
+            'description' => $item['description'],
+            'price' => floatval($item['price']),
+            'formatted_price' => 'MK ' . number_format(floatval($item['price']), 2),
+            'image_url' => $imageUrl,
+            'measurement_type' => $item['measurement_type'] ?? 'custom',
+            'unit' => $item['unit'] ?? null,
+            'quantity' => $item['quantity'] ? floatval($item['quantity']) : null,
+            'custom_unit' => $item['custom_unit'] ?? null,
+            'is_default' => (bool)($item['is_default'] ?? false),
+            'is_available' => (bool)($item['is_available'] ?? true),
+            'stock_quantity' => intval($item['stock_quantity'] ?? 0),
+            'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && ($item['is_available'] ?? true),
+            'has_variants' => (bool)($item['has_variants'] ?? false),
+            'variants' => $itemVariants,  // Include variants within the item
+            'badge' => $item['badge'] ?? null,
+            'price_per_unit' => $item['price_per_unit'] ? floatval($item['price_per_unit']) : null,
+            'max_quantity' => intval($item['max_quantity'] ?? 99)
+        ];
+        
+        $formattedItems[] = $formattedItem;
+        
+        // If no variants and this is the only/default item, track price
+        if (!$item['has_variants'] && $fixedPrice === null) {
+            $fixedPrice = floatval($item['price']);
         }
     }
 
@@ -548,82 +560,101 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $addOnsStmt->execute([':quick_order_id' => $orderId]);
     $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Format the main order data
-    $orderData = [
+    $formattedAddOns = array_map(function($addOn) {
+        $compatibleWith = [];
+        if (!empty($addOn['compatible_with'])) {
+            $compatibleData = json_decode($addOn['compatible_with'], true);
+            $compatibleWith = is_array($compatibleData) ? $compatibleData : [];
+        }
+        
+        return [
+            'id' => intval($addOn['id']),
+            'name' => $addOn['name'],
+            'price' => floatval($addOn['price']),
+            'formatted_price' => 'MK ' . number_format(floatval($addOn['price']), 2),
+            'category' => $addOn['category'],
+            'description' => $addOn['description'],
+            'is_per_item' => (bool)($addOn['is_per_item'] ?? true),
+            'max_quantity' => intval($addOn['max_quantity'] ?? 1),
+            'is_required' => (bool)($addOn['is_required'] ?? false),
+            'compatible_with' => $compatibleWith,
+            'is_available' => (bool)($addOn['is_available'] ?? true)
+        ];
+    }, $addOns);
+
+    // Format the main image URL
+    $mainImageUrl = '';
+    if (!empty($quickOrder['image_url'])) {
+        if (strpos($quickOrder['image_url'], 'http') === 0) {
+            $mainImageUrl = $quickOrder['image_url'];
+        } else {
+            $mainImageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $quickOrder['image_url'];
+        }
+    }
+
+    // Parse tags
+    $tags = [];
+    if (!empty($quickOrder['tags'])) {
+        $tagsData = json_decode($quickOrder['tags'], true);
+        $tags = is_array($tagsData) ? $tagsData : [];
+    }
+
+    // Format the main quick order data
+    $quickOrderData = [
         'id' => intval($quickOrder['id']),
         'title' => $quickOrder['title'],
         'description' => $quickOrder['description'],
         'category' => $quickOrder['category'],
         'subcategory' => $quickOrder['subcategory'],
         'item_type' => $quickOrder['item_type'],
-        'image_url' => $quickOrder['image_url'] ? 
-            (strpos($quickOrder['image_url'], 'http') === 0 ? 
-                $quickOrder['image_url'] : 
-                rtrim($baseUrl, '/') . '/uploads/menu_items/' . $quickOrder['image_url']) 
-            : '',
+        'image_url' => $mainImageUrl,
         'color' => $quickOrder['color'] ?? '#3A86FF',
-        'is_popular' => (bool)$quickOrder['is_popular'],
-        'delivery_time' => $quickOrder['delivery_time'],
-        'price' => floatval($quickOrder['price']),
-        'order_count' => intval($quickOrder['order_count']),
-        'rating' => floatval($quickOrder['rating']),
-        'average_rating' => floatval($quickOrder['average_rating'] ?? $quickOrder['rating']),
-        'min_order_amount' => floatval($quickOrder['min_order_amount']),
-        'available_all_day' => (bool)$quickOrder['available_all_day'],
+        'info' => $quickOrder['info'] ?? '',
+        'is_popular' => (bool)($quickOrder['is_popular'] ?? false),
+        'delivery_time' => $quickOrder['delivery_time'] ?? '',
+        'price' => floatval($quickOrder['price'] ?? 0),
+        'formatted_price' => 'MK ' . number_format(floatval($quickOrder['price'] ?? 0), 2),
+        'order_count' => intval($quickOrder['order_count'] ?? 0),
+        'rating' => floatval($quickOrder['rating'] ?? 0),
+        'average_rating' => floatval($quickOrder['average_rating'] ?? $quickOrder['rating'] ?? 0),
+        'min_order_amount' => floatval($quickOrder['min_order_amount'] ?? 0),
+        'available_all_day' => (bool)($quickOrder['available_all_day'] ?? true),
+        'available_start_time' => $quickOrder['available_start_time'] ?? '',
+        'available_end_time' => $quickOrder['available_end_time'] ?? '',
+        'seasonal_available' => (bool)($quickOrder['seasonal_available'] ?? false),
+        'season_start_month' => $quickOrder['season_start_month'] ? intval($quickOrder['season_start_month']) : null,
+        'season_end_month' => $quickOrder['season_end_month'] ? intval($quickOrder['season_end_month']) : null,
+        'is_available' => (bool)($quickOrder['is_available'] ?? true),
+        'has_variants' => (bool)($quickOrder['has_variants'] ?? false),
+        'variant_type' => $quickOrder['variant_type'] ?? null,
         'preparation_time' => $quickOrder['preparation_time'] ?? '15-20 min',
         'merchant_id' => $quickOrder['merchant_id'] ? intval($quickOrder['merchant_id']) : null,
-        'merchant_name' => $quickOrder['merchant_name'],
-        'is_available' => (bool)$quickOrder['is_available'],
+        'merchant_name' => $quickOrder['merchant_name'] ?? null,
+        'merchant_address' => $quickOrder['merchant_address'] ?? null,
+        'merchant_distance' => $quickOrder['merchant_distance'] ? floatval($quickOrder['merchant_distance']) : null,
+        'pickup_time' => $quickOrder['pickup_time'] ?? null,
+        'tags' => $tags,
+        'created_at' => $quickOrder['created_at'] ?? '',
+        'updated_at' => $quickOrder['updated_at'] ?? '',
         
-        // ============================================
-        // CRITICAL: ADD THE VARIANTS ARRAY HERE
-        // THIS IS WHAT YOUR FLUTTER APP NEEDS
-        // ============================================
-        'has_variants' => !empty($allVariants),
-        'variants' => $allVariants,  // THIS LINE IS THE KEY!
+        // CRITICAL: Add items with their variants
+        'items' => $formattedItems,
+        
+        // Add add-ons
+        'add_ons' => $formattedAddOns,
+        
+        // Also include variants at the quick order level for convenience
+        'variants' => $allVariants,
         'fixed_price' => $fixedPrice,
-        'default_variant_id' => $defaultVariantId,
-        
-        // Also include items and add-ons
-        'items' => array_map(function($item) use ($baseUrl) {
-            return [
-                'id' => intval($item['id']),
-                'name' => $item['name'],
-                'description' => $item['description'],
-                'price' => floatval($item['price']),
-                'image_url' => $item['image_url'] ? 
-                    (strpos($item['image_url'], 'http') === 0 ? 
-                        $item['image_url'] : 
-                        rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url']) 
-                    : '',
-                'measurement_type' => $item['measurement_type'],
-                'unit' => $item['unit'],
-                'quantity' => $item['quantity'] ? floatval($item['quantity']) : null,
-                'is_available' => (bool)$item['is_available'],
-                'has_variants' => (bool)$item['has_variants'],
-                'badge' => $item['badge']
-            ];
-        }, $items),
-        
-        'add_ons' => array_map(function($addOn) {
-            return [
-                'id' => intval($addOn['id']),
-                'name' => $addOn['name'],
-                'price' => floatval($addOn['price']),
-                'category' => $addOn['category'],
-                'description' => $addOn['description'],
-                'is_per_item' => (bool)$addOn['is_per_item'],
-                'max_quantity' => intval($addOn['max_quantity']),
-                'is_required' => (bool)$addOn['is_required'],
-                'is_available' => (bool)$addOn['is_available']
-            ];
-        }, $addOns)
+        'default_variant_id' => $defaultVariantId
     ];
 
-    
-     $response = [
-    'quick_order' => $orderData,  // This already contains the variants array
+    // Build the response exactly as Flutter expects it
+    $response = [
+        'quick_order' => $quickOrderData
     ];
+
+    // Add user info if authenticated
     if ($userId) {
         $response['user_authenticated'] = true;
         $response['user_id'] = $userId;
@@ -643,6 +674,15 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         $response['user_authenticated'] = false;
         $response['quick_order']['is_favorited'] = false;
     }
+
+    // Log for debugging
+    error_log("Quick Order Details Response: " . json_encode([
+        'quick_order_id' => $quickOrderData['id'],
+        'has_variants' => $quickOrderData['has_variants'],
+        'items_count' => count($formattedItems),
+        'variants_count' => count($allVariants),
+        'add_ons_count' => count($formattedAddOns)
+    ]));
 
     ResponseHandler::success($response);
 }
