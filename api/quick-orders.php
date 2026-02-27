@@ -435,17 +435,24 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
     // ============================================
-    // STEP 2: EXTRACT ALL VARIANTS INTO A FLAT ARRAY
-    // AND FORMAT ITEMS WITH THEIR VARIANTS
+    // STEP 2: FORMAT ITEMS WITH THEIR VARIANTS
     // ============================================
     
     $allVariants = [];
-    $defaultVariantId = null;
-    $fixedPrice = null;
     $formattedItems = [];
     
     foreach ($items as $item) {
         $itemVariants = [];
+        
+        // Format the item image
+        $itemImageUrl = '';
+        if (!empty($item['image_url'])) {
+            if (strpos($item['image_url'], 'http') === 0) {
+                $itemImageUrl = $item['image_url'];
+            } else {
+                $itemImageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url'];
+            }
+        }
         
         // If item has variants in variants_json, extract them
         if ($item['has_variants'] && !empty($item['variants_json'])) {
@@ -460,16 +467,14 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
                         'display_name' => $variant['display_name'] ?? 
                                          ($variant['name'] ?? $item['name']),
                         'price' => floatval($variant['price'] ?? $item['price']),
-                        'formatted_price' => 'MK ' . number_format(floatval($variant['price'] ?? $item['price']), 2),
                         'is_default' => isset($variant['is_default']) ? 
                                         (bool)$variant['is_default'] : false,
                         'is_available' => isset($variant['is_available']) ? 
                                          (bool)$variant['is_available'] : true,
                         'description' => $variant['description'] ?? $item['description'],
                         'badge' => $variant['badge'] ?? null,
-                        'measurement_type' => $variant['measurement_type'] ?? 
-                                             $item['measurement_type'] ?? 'custom',
-                        'unit' => $variant['unit'] ?? $item['unit'] ?? null,
+                        'measurement_type' => $this->mapMeasurementType($variant['measurement_type'] ?? $item['measurement_type']),
+                        'unit' => $this->mapUnit($variant['unit'] ?? $item['unit']),
                         'quantity' => isset($variant['quantity']) ? 
                                      floatval($variant['quantity']) : null,
                         'custom_unit' => $variant['custom_unit'] ?? $item['custom_unit'] ?? null,
@@ -479,58 +484,38 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
                                                 $item['max_quantity'] ?? 99),
                         'stock_quantity' => isset($variant['stock_quantity']) ? 
                                            intval($variant['stock_quantity']) : null,
-                        'in_stock' => (!isset($variant['stock_quantity']) || $variant['stock_quantity'] > 0) && 
-                                     (!isset($variant['is_available']) || $variant['is_available'])
+                        'metadata' => $variant['metadata'] ?? null
                     ];
                     
                     $itemVariants[] = $formattedVariant;
                     $allVariants[] = $formattedVariant;
-                    
-                    if ($formattedVariant['is_default']) {
-                        $defaultVariantId = $formattedVariant['id'];
-                    }
                 }
             }
         }
         
         // Format the item itself
-        $imageUrl = '';
-        if (!empty($item['image_url'])) {
-            if (strpos($item['image_url'], 'http') === 0) {
-                $imageUrl = $item['image_url'];
-            } else {
-                $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . $item['image_url'];
-            }
-        }
-        
         $formattedItem = [
             'id' => intval($item['id']),
             'name' => $item['name'],
             'description' => $item['description'],
             'price' => floatval($item['price']),
-            'formatted_price' => 'MK ' . number_format(floatval($item['price']), 2),
-            'image_url' => $imageUrl,
-            'measurement_type' => $item['measurement_type'] ?? 'custom',
-            'unit' => $item['unit'] ?? null,
+            'image_url' => $itemImageUrl,
+            'measurement_type' => $this->mapMeasurementType($item['measurement_type']),
+            'unit' => $this->mapUnit($item['unit']),
             'quantity' => $item['quantity'] ? floatval($item['quantity']) : null,
-            'custom_unit' => $item['custom_unit'] ?? null,
+            'custom_unit' => $item['custom_unit'],
             'is_default' => (bool)($item['is_default'] ?? false),
             'is_available' => (bool)($item['is_available'] ?? true),
             'stock_quantity' => intval($item['stock_quantity'] ?? 0),
-            'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && ($item['is_available'] ?? true),
             'has_variants' => (bool)($item['has_variants'] ?? false),
             'variants' => $itemVariants,  // Include variants within the item
             'badge' => $item['badge'] ?? null,
             'price_per_unit' => $item['price_per_unit'] ? floatval($item['price_per_unit']) : null,
-            'max_quantity' => intval($item['max_quantity'] ?? 99)
+            'max_quantity' => intval($item['max_quantity'] ?? 99),
+            'metadata' => null
         ];
         
         $formattedItems[] = $formattedItem;
-        
-        // If no variants and this is the only/default item, track price
-        if (!$item['has_variants'] && $fixedPrice === null) {
-            $fixedPrice = floatval($item['price']);
-        }
     }
 
     // Sort variants by price (lowest first)
@@ -571,14 +556,14 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             'id' => intval($addOn['id']),
             'name' => $addOn['name'],
             'price' => floatval($addOn['price']),
-            'formatted_price' => 'MK ' . number_format(floatval($addOn['price']), 2),
             'category' => $addOn['category'],
             'description' => $addOn['description'],
             'is_per_item' => (bool)($addOn['is_per_item'] ?? true),
             'max_quantity' => intval($addOn['max_quantity'] ?? 1),
             'is_required' => (bool)($addOn['is_required'] ?? false),
             'compatible_with' => $compatibleWith,
-            'is_available' => (bool)($addOn['is_available'] ?? true)
+            'is_available' => (bool)($addOn['is_available'] ?? true),
+            'is_selected' => false
         ];
     }, $addOns);
 
@@ -599,13 +584,32 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         $tags = is_array($tagsData) ? $tagsData : [];
     }
 
+    // Parse nutritional info
+    $nutritionalInfo = null;
+    if (!empty($quickOrder['nutritional_info'])) {
+        $nutritionalData = json_decode($quickOrder['nutritional_info'], true);
+        if (is_array($nutritionalData)) {
+            $nutritionalInfo = [
+                'calories' => $nutritionalData['calories'] ?? null,
+                'protein' => $nutritionalData['protein'] ?? null,
+                'carbs' => $nutritionalData['carbs'] ?? null,
+                'fat' => $nutritionalData['fat'] ?? null,
+                'fiber' => $nutritionalData['fiber'] ?? null,
+                'sugar' => $nutritionalData['sugar'] ?? null,
+                'sodium' => $nutritionalData['sodium'] ?? null,
+                'allergens' => $nutritionalData['allergens'] ?? [],
+                'vitamins' => $nutritionalData['vitamins'] ?? null
+            ];
+        }
+    }
+
     // Format the main quick order data
     $quickOrderData = [
         'id' => intval($quickOrder['id']),
         'title' => $quickOrder['title'],
         'description' => $quickOrder['description'],
         'category' => $quickOrder['category'],
-        'subcategory' => $quickOrder['subcategory'],
+        'sub_category' => $quickOrder['subcategory'],
         'item_type' => $quickOrder['item_type'],
         'image_url' => $mainImageUrl,
         'color' => $quickOrder['color'] ?? '#3A86FF',
@@ -613,7 +617,6 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         'is_popular' => (bool)($quickOrder['is_popular'] ?? false),
         'delivery_time' => $quickOrder['delivery_time'] ?? '',
         'price' => floatval($quickOrder['price'] ?? 0),
-        'formatted_price' => 'MK ' . number_format(floatval($quickOrder['price'] ?? 0), 2),
         'order_count' => intval($quickOrder['order_count'] ?? 0),
         'rating' => floatval($quickOrder['rating'] ?? 0),
         'average_rating' => floatval($quickOrder['average_rating'] ?? $quickOrder['rating'] ?? 0),
@@ -628,12 +631,14 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         'has_variants' => (bool)($quickOrder['has_variants'] ?? false),
         'variant_type' => $quickOrder['variant_type'] ?? null,
         'preparation_time' => $quickOrder['preparation_time'] ?? '15-20 min',
+        'prep_time' => $quickOrder['preparation_time'] ?? '15-20 min', // Alias for Flutter
         'merchant_id' => $quickOrder['merchant_id'] ? intval($quickOrder['merchant_id']) : null,
         'merchant_name' => $quickOrder['merchant_name'] ?? null,
         'merchant_address' => $quickOrder['merchant_address'] ?? null,
         'merchant_distance' => $quickOrder['merchant_distance'] ? floatval($quickOrder['merchant_distance']) : null,
         'pickup_time' => $quickOrder['pickup_time'] ?? null,
         'tags' => $tags,
+        'nutritional_info' => $nutritionalInfo,
         'created_at' => $quickOrder['created_at'] ?? '',
         'updated_at' => $quickOrder['updated_at'] ?? '',
         
@@ -645,19 +650,20 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         
         // Also include variants at the quick order level for convenience
         'variants' => $allVariants,
-        'fixed_price' => $fixedPrice,
-        'default_variant_id' => $defaultVariantId
+        'fixed_price' => floatval($quickOrder['price'] ?? 0),
     ];
 
-    // Build the response exactly as Flutter expects it
+    // Build the response in the EXACT format Flutter expects
     $response = [
-        'quick_order' => $quickOrderData
+        'data' => [  // Flutter looks for response['data']
+            'quick_order' => $quickOrderData  // Flutter looks for data['quick_order']
+        ]
     ];
 
     // Add user info if authenticated
     if ($userId) {
-        $response['user_authenticated'] = true;
-        $response['user_id'] = $userId;
+        $response['data']['user_authenticated'] = true;
+        $response['data']['user_id'] = $userId;
         
         // Check if favorited
         $favoriteStmt = $conn->prepare(
@@ -669,14 +675,22 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             ':quick_order_id' => $orderId
         ]);
         
-        $response['quick_order']['is_favorited'] = $favoriteStmt->rowCount() > 0;
+        $response['data']['quick_order']['is_favorited'] = $favoriteStmt->rowCount() > 0;
     } else {
-        $response['user_authenticated'] = false;
-        $response['quick_order']['is_favorited'] = false;
+        $response['data']['user_authenticated'] = false;
+        $response['data']['quick_order']['is_favorited'] = false;
     }
 
+    // Add success flag as Flutter expects
+    $finalResponse = [
+        'success' => true,
+        'data' => $response['data']
+    ];
+
     // Log for debugging
-    error_log("Quick Order Details Response: " . json_encode([
+    error_log("Quick Order Details Response Structure: " . json_encode([
+        'has_data' => isset($finalResponse['data']),
+        'has_quick_order' => isset($finalResponse['data']['quick_order']),
         'quick_order_id' => $quickOrderData['id'],
         'has_variants' => $quickOrderData['has_variants'],
         'items_count' => count($formattedItems),
@@ -684,7 +698,59 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         'add_ons_count' => count($formattedAddOns)
     ]));
 
-    ResponseHandler::success($response);
+    ResponseHandler::success($finalResponse['data']); // ResponseHandler will wrap with success
+}
+
+/*********************************
+ * HELPER FUNCTIONS FOR MAPPING
+ *********************************/
+function mapMeasurementType($type) {
+    $type = strtolower($type ?? '');
+    
+    $map = [
+        'weight' => 'weight',
+        'volume' => 'volume',
+        'count' => 'count',
+        'size' => 'size',
+        'serving' => 'serving',
+        'combo' => 'combo',
+        'add_on' => 'addOn',
+        'addon' => 'addOn',
+        'custom' => 'custom'
+    ];
+    
+    return $map[$type] ?? 'custom';
+}
+
+function mapUnit($unit) {
+    $unit = strtolower($unit ?? '');
+    
+    $map = [
+        'kg' => 'kilogram',
+        'kilogram' => 'kilogram',
+        'g' => 'gram',
+        'gram' => 'gram',
+        'l' => 'litre',
+        'litre' => 'litre',
+        'liter' => 'litre',
+        'ml' => 'millilitre',
+        'millilitre' => 'millilitre',
+        'milliliter' => 'millilitre',
+        'pc' => 'piece',
+        'piece' => 'piece',
+        'dozen' => 'dozen',
+        'pack' => 'pack',
+        'small' => 'small',
+        'medium' => 'medium',
+        'large' => 'large',
+        'xl' => 'extraLarge',
+        'extra_large' => 'extraLarge',
+        'cup' => 'cup',
+        'cone' => 'cone',
+        'bowl' => 'bowl'
+    ];
+    
+    return $map[$unit] ?? 'none';
 }
 
 /*********************************
