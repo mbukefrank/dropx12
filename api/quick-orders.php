@@ -621,13 +621,8 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     ];
 
     
-     // To this:
-    $response = [
-        'quick_order' => $orderData,
-        'variants' => $allVariants,  // Add variants at top level
-        'has_variants' => !empty($allVariants),
-        'fixed_price' => $fixedPrice,
-        'default_variant_id' => $defaultVariantId
+     $response = [
+    'quick_order' => $orderData,  // This already contains the variants array
     ];
     if ($userId) {
         $response['user_authenticated'] = true;
