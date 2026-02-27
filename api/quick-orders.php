@@ -620,10 +620,15 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         }, $addOns)
     ];
 
+    
+     // To this:
     $response = [
-        'quick_order' => $orderData
+        'quick_order' => $orderData,
+        'variants' => $allVariants,  // Add variants at top level
+        'has_variants' => !empty($allVariants),
+        'fixed_price' => $fixedPrice,
+        'default_variant_id' => $defaultVariantId
     ];
-
     if ($userId) {
         $response['user_authenticated'] = true;
         $response['user_id'] = $userId;
