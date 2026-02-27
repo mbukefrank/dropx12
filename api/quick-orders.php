@@ -352,7 +352,7 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
 }
 
 /*********************************
- * GET QUICK ORDER DETAILS - UPDATED TO INCLUDE VARIANTS
+ * GET QUICK ORDER DETAILS - FIXED VERSION
  *********************************/
 function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     // Get main quick order details
@@ -405,8 +405,8 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     }
 
     // ============================================
-    // IMPORTANT: GET VARIANTS FROM QUICK ORDER ITEMS
-    // This is what shows the "Options" in your Flutter app
+    // CRITICAL: GET VARIANTS FROM QUICK ORDER ITEMS
+    // AND FLATTEN THEM INTO THE MAIN RESPONSE
     // ============================================
     
     // Get all items and their variants
@@ -428,8 +428,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             qoi.variants_json,
             qoi.badge,
             qoi.price_per_unit,
-            qoi.max_quantity,
-            qoi.metadata
+            qoi.max_quantity
         FROM quick_order_items qoi
         WHERE qoi.quick_order_id = :quick_order_id
         ORDER BY qoi.is_default DESC, qoi.price ASC"
@@ -439,91 +438,85 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
     // ============================================
-    // FLATTEN VARIANTS INTO THE MAIN QUICK ORDER
-    // This makes it easy for Flutter to display options
+    // CRITICAL: EXTRACT ALL VARIANTS INTO A FLAT ARRAY
+    // This is what your Flutter app needs for options
     // ============================================
     
     $allVariants = [];
-    $fixedPrice = null;
     $defaultVariantId = null;
+    $fixedPrice = null;
     
     foreach ($items as $item) {
-        // If this item has variants, parse and add them
-        if ($item['has_variants'] && $item['variants_json']) {
+        // If this item has variants in variants_json, parse them
+        if ($item['has_variants'] && !empty($item['variants_json'])) {
             $itemVariants = json_decode($item['variants_json'], true);
             
-            // Add item context to each variant
-            foreach ($itemVariants as &$variant) {
-                $variant['item_id'] = $item['id'];
-                $variant['item_name'] = $item['name'];
-                $variant['measurement_type'] = $item['measurement_type'];
-                
-                // Ensure display_name is set
-                if (!isset($variant['display_name'])) {
-                    if (isset($variant['quantity']) && isset($variant['unit'])) {
-                        $qty = $variant['quantity'];
-                        $unit = $variant['unit'];
-                        $unitDisplay = $unit;
-                        
-                        // Convert unit enum to display name
-                        switch($unit) {
-                            case 'kilogram': $unitDisplay = 'kg'; break;
-                            case 'gram': $unitDisplay = 'g'; break;
-                            case 'litre': $unitDisplay = 'L'; break;
-                            case 'millilitre': $unitDisplay = 'ml'; break;
-                            case 'piece': $unitDisplay = 'pc'; break;
-                            default: break;
-                        }
-                        
-                        $qtyStr = $qty % 1 == 0 ? intval($qty) : number_format($qty, 1);
-                        $variant['display_name'] = $qtyStr . $unitDisplay;
-                    } elseif (isset($variant['unit'])) {
-                        $variant['display_name'] = $variant['unit'];
-                    } else {
-                        $variant['display_name'] = $variant['name'];
+            // Make sure it's an array
+            if (is_array($itemVariants)) {
+                foreach ($itemVariants as $variant) {
+                    // Ensure each variant has all required fields
+                    $variantData = [
+                        'id' => intval($variant['id'] ?? 0),
+                        'name' => $variant['name'] ?? $item['name'],
+                        'display_name' => $variant['display_name'] ?? $variant['name'] ?? $item['name'],
+                        'price' => floatval($variant['price'] ?? $item['price']),
+                        'is_default' => isset($variant['is_default']) ? (bool)$variant['is_default'] : false,
+                        'is_available' => isset($variant['is_available']) ? (bool)$variant['is_available'] : true,
+                        'description' => $variant['description'] ?? $item['description'],
+                        'badge' => $variant['badge'] ?? null,
+                        'measurement_type' => $variant['measurement_type'] ?? $item['measurement_type'] ?? 'custom',
+                        'unit' => $variant['unit'] ?? $item['unit'] ?? null,
+                        'quantity' => isset($variant['quantity']) ? floatval($variant['quantity']) : null,
+                        'custom_unit' => $variant['custom_unit'] ?? $item['custom_unit'] ?? null,
+                        'price_per_unit' => isset($variant['price_per_unit']) ? floatval($variant['price_per_unit']) : null,
+                        'max_quantity' => intval($variant['max_quantity'] ?? $item['max_quantity'] ?? 99),
+                        'stock_quantity' => isset($variant['stock_quantity']) ? intval($variant['stock_quantity']) : null,
+                        'item_id' => intval($item['id'])
+                    ];
+                    
+                    $allVariants[] = $variantData;
+                    
+                    if ($variantData['is_default']) {
+                        $defaultVariantId = $variantData['id'];
                     }
                 }
-                
-                if ($variant['is_default'] ?? false) {
-                    $defaultVariantId = $variant['id'];
-                }
             }
-            
-            $allVariants = array_merge($allVariants, $itemVariants);
         } 
-        // If no variants, use the item itself as a variant
+        // If no variants but item has measurement info, treat as a single variant
         else {
-            $variant = [
-                'id' => $item['id'],
+            $variantData = [
+                'id' => intval($item['id']),
                 'name' => $item['name'],
                 'display_name' => $item['custom_unit'] ?? $item['unit'] ?? $item['name'],
                 'price' => floatval($item['price']),
-                'is_default' => (bool)$item['is_default'],
-                'is_available' => (bool)$item['is_available'],
-                'badge' => $item['badge'],
-                'measurement_type' => $item['measurement_type'],
-                'unit' => $item['unit'],
-                'quantity' => $item['quantity'] ? floatval($item['quantity']) : null,
-                'custom_unit' => $item['custom_unit'],
-                'price_per_unit' => $item['price_per_unit'] ? floatval($item['price_per_unit']) : null,
-                'max_quantity' => $item['max_quantity'] ?? 99,
-                'stock_quantity' => $item['stock_quantity'],
-                'item_id' => $item['id']
+                'is_default' => (bool)($item['is_default'] ?? true),
+                'is_available' => (bool)($item['is_available'] ?? true),
+                'description' => $item['description'],
+                'badge' => $item['badge'] ?? null,
+                'measurement_type' => $item['measurement_type'] ?? 'custom',
+                'unit' => $item['unit'] ?? null,
+                'quantity' => isset($item['quantity']) ? floatval($item['quantity']) : null,
+                'custom_unit' => $item['custom_unit'] ?? null,
+                'price_per_unit' => isset($item['price_per_unit']) ? floatval($item['price_per_unit']) : null,
+                'max_quantity' => intval($item['max_quantity'] ?? 99),
+                'stock_quantity' => isset($item['stock_quantity']) ? intval($item['stock_quantity']) : null,
+                'item_id' => intval($item['id'])
             ];
-            $allVariants[] = $variant;
             
-            if ($item['is_default']) {
-                $defaultVariantId = $item['id'];
+            $allVariants[] = $variantData;
+            
+            if ($variantData['is_default']) {
+                $defaultVariantId = $variantData['id'];
             }
             
-            // If this is the first/default item, use its price as fixedPrice
-            if ($fixedPrice === null && !$quickOrder['has_variants']) {
+            // Set fixed price if no variants
+            if (!$quickOrder['has_variants'] && $fixedPrice === null) {
                 $fixedPrice = floatval($item['price']);
             }
         }
     }
 
-    // Sort variants by price
+    // Sort variants by price (lowest first)
     usort($allVariants, function($a, $b) {
         return $a['price'] <=> $b['price'];
     });
@@ -550,92 +543,25 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
     $addOnsStmt->execute([':quick_order_id' => $orderId]);
     $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Get merchants
-    $merchantsStmt = $conn->prepare(
-        "SELECT 
-            m.id,
-            m.name,
-            m.category,
-            m.business_type,
-            m.rating,
-            m.image_url,
-            m.is_open,
-            m.delivery_time,
-            m.delivery_fee,
-            m.min_order_amount,
-            m.delivery_radius,
-            m.address,
-            m.phone,
-            qom.custom_price,
-            qom.custom_delivery_time,
-            qom.priority
-        FROM merchants m
-        INNER JOIN quick_order_merchants qom ON m.id = qom.merchant_id
-        WHERE qom.quick_order_id = :quick_order_id
-        AND m.is_active = 1
-        AND qom.is_active = 1
-        ORDER BY qom.priority DESC, m.rating DESC
-        LIMIT 10"
-    );
-    
-    $merchantsStmt->execute([':quick_order_id' => $orderId]);
-    $merchants = $merchantsStmt->fetchAll(PDO::FETCH_ASSOC);
-
     // Format the main order data
     $orderData = formatQuickOrderDetailData($quickOrder, $baseUrl);
     
     // ============================================
-    // CRITICAL: ADD VARIANTS TO THE RESPONSE
-    // This is what your Flutter app uses for options
+    // CRITICAL: ADD VARIANTS DIRECTLY TO THE RESPONSE
+    // This is what your Flutter app's QuickOrderItem expects
     // ============================================
     $orderData['has_variants'] = !empty($allVariants);
-    $orderData['variants'] = $allVariants;
+    $orderData['variants'] = $allVariants;  // THIS IS THE KEY LINE!
     $orderData['fixed_price'] = $fixedPrice;
     $orderData['default_variant_id'] = $defaultVariantId;
+    
+    // Also include items and add-ons for reference
     $orderData['items'] = array_map(function($item) use ($baseUrl) {
         return formatQuickOrderItemData($item, $baseUrl);
     }, $items);
     $orderData['add_ons'] = array_map(function($addOn) {
         return formatAddOnData($addOn);
     }, $addOns);
-    $orderData['merchants'] = array_map(function($merchant) use ($baseUrl) {
-        return formatQuickOrderMerchantData($merchant, $baseUrl);
-    }, $merchants);
-
-    // Get similar items
-    $similarItemsStmt = $conn->prepare(
-        "SELECT 
-            qo.id,
-            qo.title,
-            qo.description,
-            qo.category,
-            qo.item_type,
-            qo.image_url,
-            qo.price,
-            qo.rating,
-            qo.order_count,
-            qo.has_variants,
-            qo.variant_type,
-            qo.preparation_time,
-            qo.merchant_name,
-            qo.tags
-        FROM quick_orders qo
-        WHERE qo.category = :category
-        AND qo.id != :id
-        AND qo.is_available = 1
-        ORDER BY qo.order_count DESC
-        LIMIT 5"
-    );
-    
-    $similarItemsStmt->execute([
-        ':category' => $quickOrder['category'],
-        ':id' => $orderId
-    ]);
-    $similarItems = $similarItemsStmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    $orderData['similar_items'] = array_map(function($item) use ($baseUrl) {
-        return formatQuickOrderListData($item, $baseUrl);
-    }, $similarItems);
 
     $response = [
         'quick_order' => $orderData
@@ -655,23 +581,9 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         ]);
         
         $response['quick_order']['is_favorited'] = $favoriteStmt->rowCount() > 0;
-        
-        $cartStmt = $conn->prepare(
-            "SELECT quantity FROM cart_items 
-             WHERE user_id = :user_id AND quick_order_item_id IN (
-                 SELECT id FROM quick_order_items WHERE quick_order_id = :quick_order_id
-             )"
-        );
-        $cartStmt->execute([
-            ':user_id' => $userId,
-            ':quick_order_id' => $orderId
-        ]);
-        $cartItem = $cartStmt->fetch(PDO::FETCH_ASSOC);
-        $response['quick_order']['in_cart'] = $cartItem ? intval($cartItem['quantity']) : 0;
     } else {
         $response['user_authenticated'] = false;
         $response['quick_order']['is_favorited'] = false;
-        $response['quick_order']['in_cart'] = 0;
     }
 
     ResponseHandler::success($response);
