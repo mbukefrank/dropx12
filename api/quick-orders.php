@@ -175,7 +175,7 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
     $isPopular = $_GET['is_popular'] ?? null;
     $itemType = $_GET['item_type'] ?? '';
     $inStock = $_GET['in_stock'] ?? null;
-    $unitType = $_GET['unit_type'] ?? '';
+    $measurementType = $_GET['measurement_type'] ?? '';
 
     $whereConditions = [];
     $params = [];
@@ -209,19 +209,19 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
         )";
     }
 
-    if ($unitType) {
+    if ($measurementType) {
         $whereConditions[] = "EXISTS (
             SELECT 1 FROM quick_order_items qoi 
             WHERE qoi.quick_order_id = qo.id 
-            AND qoi.unit_type = :unit_type
+            AND qoi.measurement_type = :measurement_type
             AND qoi.is_available = 1
         )";
-        $params[':unit_type'] = $unitType;
+        $params[':measurement_type'] = $measurementType;
     }
 
     $whereClause = empty($whereConditions) ? "" : "WHERE " . implode(" AND ", $whereConditions);
 
-    $allowedSortColumns = ['order_count', 'title', 'created_at', 'rating'];
+    $allowedSortColumns = ['order_count', 'title', 'created_at', 'rating', 'price'];
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'order_count';
     $sortOrder = $sortOrder === 'ASC' ? 'ASC' : 'DESC';
 
@@ -262,12 +262,12 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
                 qo.average_rating,
                 qo.nutritional_info,
                 COALESCE(
-                    (SELECT GROUP_CONCAT(DISTINCT qoi.unit_type) 
+                    (SELECT GROUP_CONCAT(DISTINCT qoi.measurement_type) 
                      FROM quick_order_items qoi 
                      WHERE qoi.quick_order_id = qo.id 
                      AND qoi.is_available = 1),
                     ''
-                ) as available_units
+                ) as available_measurements
             FROM quick_orders qo
             $whereClause
             ORDER BY qo.is_popular DESC, qo.$sortBy $sortOrder
@@ -300,11 +300,11 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
     $itemTypeStmt->execute();
     $availableItemTypes = $itemTypeStmt->fetchAll(PDO::FETCH_COLUMN);
 
-    $unitTypeStmt = $conn->prepare(
-        "SELECT DISTINCT unit_type FROM quick_order_items WHERE unit_type IS NOT NULL ORDER BY unit_type"
+    $measurementTypeStmt = $conn->prepare(
+        "SELECT DISTINCT measurement_type FROM quick_order_items WHERE measurement_type IS NOT NULL ORDER BY measurement_type"
     );
-    $unitTypeStmt->execute();
-    $availableUnitTypes = $unitTypeStmt->fetchAll(PDO::FETCH_COLUMN);
+    $measurementTypeStmt->execute();
+    $availableMeasurementTypes = $measurementTypeStmt->fetchAll(PDO::FETCH_COLUMN);
 
     $formattedOrders = array_map(function($q) use ($baseUrl) {
         return formatQuickOrderListData($q, $baseUrl);
@@ -321,7 +321,7 @@ function getQuickOrdersList($conn, $baseUrl, $userId = null) {
         'filters' => [
             'available_categories' => $availableCategories,
             'available_item_types' => $availableItemTypes,
-            'available_unit_types' => $availableUnitTypes,
+            'available_measurement_types' => $availableMeasurementTypes,
             'item_type_counts' => getItemTypeCounts($conn)
         ]
     ];
@@ -409,7 +409,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
         ResponseHandler::error('Quick order not found', 404);
     }
 
-    // Get items with variants
+    // Get items with flexible variants
     $itemsStmt = $conn->prepare(
         "SELECT 
             qoi.id,
@@ -417,27 +417,29 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             qoi.description,
             qoi.price,
             qoi.image_url,
-            qoi.unit_type,
-            qoi.unit_value,
+            qoi.measurement_type,
+            qoi.unit,
+            qoi.quantity,
+            qoi.custom_unit,
             qoi.is_default,
             qoi.is_available,
             qoi.stock_quantity,
-            qoi.reorder_level,
             qoi.has_variants,
-            qoi.variant_type,
             qoi.variants_json,
             qoi.badge,
             qoi.price_per_unit,
+            qoi.max_quantity,
+            qoi.metadata,
             qoi.created_at
         FROM quick_order_items qoi
         WHERE qoi.quick_order_id = :quick_order_id
-        ORDER BY qoi.is_default DESC, qoi.name"
+        ORDER BY qoi.is_default DESC, qoi.price ASC"
     );
     
     $itemsStmt->execute([':quick_order_id' => $orderId]);
     $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Get add-ons
+    // Get add-ons with enhanced fields
     $addOnsStmt = $conn->prepare(
         "SELECT 
             id,
@@ -445,6 +447,10 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
             price,
             category,
             description,
+            is_per_item,
+            max_quantity,
+            is_required,
+            compatible_with,
             is_available
         FROM quick_order_addons
         WHERE quick_order_id = :quick_order_id
@@ -631,12 +637,14 @@ function handlePostRequest() {
     }
 }
 
+/*********************************
+ * ADD TO CART - UPDATED FOR FLEXIBLE VARIANTS
+ *********************************/
 function addQuickOrderToCart($conn, $data, $userId) {
     $quickOrderId = $data['quick_order_id'] ?? null;
     $itemId = $data['item_id'] ?? null;
     $variantId = $data['variant_id'] ?? null;
     $quantity = intval($data['quantity'] ?? 1);
-    $unitType = $data['unit_type'] ?? null;
     $selectedOptions = $data['selected_options'] ?? null;
 
     if (!$quickOrderId || !$itemId) {
@@ -669,13 +677,16 @@ function addQuickOrderToCart($conn, $data, $userId) {
 
     // Handle variant selection
     $variantData = null;
+    $selectedVariantName = '';
+    $selectedVariantPrice = $item['price'];
+    
     if ($variantId) {
         $variants = json_decode($item['variants_json'] ?? '[]', true);
         foreach ($variants as $variant) {
             if ($variant['id'] == $variantId) {
                 $variantData = $variant;
-                $item['price'] = $variant['price'];
-                $item['name'] = $item['name'] . ' (' . $variant['display_name'] . ')';
+                $selectedVariantName = ' (' . $variant['effectiveDisplayName'] . ')';
+                $selectedVariantPrice = $variant['price'];
                 break;
             }
         }
@@ -692,11 +703,13 @@ function addQuickOrderToCart($conn, $data, $userId) {
     $checkStmt = $conn->prepare(
         "SELECT id, quantity FROM cart_items 
          WHERE user_id = :user_id 
-         AND quick_order_item_id = :item_id"
+         AND quick_order_item_id = :item_id
+         AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))"
     );
     $checkStmt->execute([
         ':user_id' => $userId,
-        ':item_id' => $itemId
+        ':item_id' => $itemId,
+        ':variant_id' => $variantId
     ]);
     
     if ($existing = $checkStmt->fetch(PDO::FETCH_ASSOC)) {
@@ -704,18 +717,12 @@ function addQuickOrderToCart($conn, $data, $userId) {
         $updateStmt = $conn->prepare(
             "UPDATE cart_items 
              SET quantity = :quantity, 
-                 unit_type = :unit_type,
-                 variant_id = :variant_id,
-                 variant_data = :variant_data,
                  selected_options = :selected_options,
                  updated_at = NOW()
              WHERE id = :id"
         );
         $updateStmt->execute([
             ':quantity' => $newQuantity,
-            ':unit_type' => $unitType ?? $item['unit_type'],
-            ':variant_id' => $variantId,
-            ':variant_data' => $variantData ? json_encode($variantData) : null,
             ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
             ':id' => $existing['id']
         ]);
@@ -730,8 +737,10 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 price,
                 image_url,
                 quantity,
-                unit_type,
-                unit_value,
+                measurement_type,
+                unit,
+                quantity_value,
+                custom_unit,
                 item_type,
                 category,
                 merchant_id,
@@ -739,6 +748,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 preparation_time,
                 variant_id,
                 variant_data,
+                variant_name,
                 selected_options,
                 has_variants,
                 created_at
@@ -751,8 +761,10 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 :price,
                 :image_url,
                 :quantity,
-                :unit_type,
-                :unit_value,
+                :measurement_type,
+                :unit,
+                :quantity_value,
+                :custom_unit,
                 :item_type,
                 :category,
                 :merchant_id,
@@ -760,22 +772,28 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 :preparation_time,
                 :variant_id,
                 :variant_data,
+                :variant_name,
                 :selected_options,
                 :has_variants,
                 NOW()
             )"
         );
+        
+        $itemName = $item['name'] . $selectedVariantName;
+        
         $insertStmt->execute([
             ':user_id' => $userId,
             ':quick_order_item_id' => $itemId,
             ':quick_order_id' => $quickOrderId,
-            ':name' => $item['name'],
+            ':name' => $itemName,
             ':description' => $item['description'],
-            ':price' => $item['price'],
+            ':price' => $selectedVariantPrice,
             ':image_url' => $item['image_url'],
             ':quantity' => $quantity,
-            ':unit_type' => $unitType ?? $item['unit_type'],
-            ':unit_value' => $item['unit_value'],
+            ':measurement_type' => $item['measurement_type'],
+            ':unit' => $item['unit'],
+            ':quantity_value' => $item['quantity'],
+            ':custom_unit' => $item['custom_unit'],
             ':item_type' => $item['item_type'],
             ':category' => $item['category'],
             ':merchant_id' => $item['merchant_id'],
@@ -783,12 +801,25 @@ function addQuickOrderToCart($conn, $data, $userId) {
             ':preparation_time' => $item['preparation_time'],
             ':variant_id' => $variantId,
             ':variant_data' => $variantData ? json_encode($variantData) : null,
+            ':variant_name' => $selectedVariantName,
             ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
             ':has_variants' => $item['has_variants'] ? 1 : 0
         ]);
     }
 
-    ResponseHandler::success(['message' => 'Added to cart'], 'Item added to cart successfully');
+    // Get updated cart count
+    $countStmt = $conn->prepare(
+        "SELECT COUNT(*) as count, SUM(quantity) as total_items 
+         FROM cart_items WHERE user_id = :user_id"
+    );
+    $countStmt->execute([':user_id' => $userId]);
+    $cartCount = $countStmt->fetch(PDO::FETCH_ASSOC);
+
+    ResponseHandler::success([
+        'cart_item_count' => intval($cartCount['total_items'] ?? 0),
+        'cart_items_count' => intval($cartCount['count'] ?? 0),
+        'message' => 'Item added to cart successfully'
+    ]);
 }
 
 function bulkUpdateStock($conn, $data, $userId) {
@@ -875,10 +906,10 @@ function bulkUpdateStock($conn, $data, $userId) {
 function getQuickOrdersByCategories($conn, $data, $baseUrl, $userId = null) {
     $categories = $data['categories'] ?? [];
     $itemTypes = $data['item_types'] ?? [];
-    $variantTypes = $data['variant_types'] ?? [];
+    $measurementTypes = $data['measurement_types'] ?? [];
     $limit = min(20, max(1, intval($data['limit'] ?? 10)));
 
-    if (empty($categories) && empty($itemTypes) && empty($variantTypes)) {
+    if (empty($categories) && empty($itemTypes) && empty($measurementTypes)) {
         ResponseHandler::error('At least one filter is required', 400);
     }
 
@@ -905,14 +936,18 @@ function getQuickOrdersByCategories($conn, $data, $baseUrl, $userId = null) {
         $whereConditions[] = "qo.item_type IN (" . implode(',', $typePlaceholders) . ")";
     }
 
-    if (!empty($variantTypes)) {
-        $variantPlaceholders = [];
-        foreach ($variantTypes as $index => $type) {
-            $param = ":variant_$index";
-            $variantPlaceholders[] = $param;
+    if (!empty($measurementTypes)) {
+        $measurementPlaceholders = [];
+        foreach ($measurementTypes as $index => $type) {
+            $param = ":measurement_$index";
+            $measurementPlaceholders[] = $param;
             $params[$param] = $type;
         }
-        $whereConditions[] = "qo.variant_type IN (" . implode(',', $variantPlaceholders) . ")";
+        $whereConditions[] = "EXISTS (
+            SELECT 1 FROM quick_order_items qoi 
+            WHERE qoi.quick_order_id = qo.id 
+            AND qoi.measurement_type IN (" . implode(',', $measurementPlaceholders) . ")
+        )";
     }
 
     $whereClause = "WHERE " . implode(" AND ", $whereConditions);
@@ -1062,7 +1097,7 @@ function createQuickOrder($conn, $data, $userId) {
 
         if ($itemId && $quantity > 0) {
             $itemStmt = $conn->prepare(
-                "SELECT name, price, has_variants, variants_json 
+                "SELECT name, price, has_variants, variants_json, measurement_type, unit, quantity 
                  FROM quick_order_items WHERE id = :id"
             );
             $itemStmt->execute([':id' => $itemId]);
@@ -1071,6 +1106,7 @@ function createQuickOrder($conn, $data, $userId) {
             if ($itemData) {
                 $itemPrice = $itemData['price'];
                 $itemName = $itemData['name'];
+                $measurementInfo = '';
                 
                 // Handle variant pricing
                 if ($variantId && $itemData['has_variants']) {
@@ -1078,9 +1114,19 @@ function createQuickOrder($conn, $data, $userId) {
                     foreach ($variants as $variant) {
                         if ($variant['id'] == $variantId) {
                             $itemPrice = $variant['price'];
-                            $itemName .= ' (' . $variant['display_name'] . ')';
+                            $measurementInfo = ' (' . $variant['effectiveDisplayName'] . ')';
                             break;
                         }
+                    }
+                } elseif ($itemData['quantity'] && $itemData['unit']) {
+                    $qty = $itemData['quantity'];
+                    $unit = $itemData['unit'];
+                    if ($qty == 1) {
+                        $unitDisplay = $unit == 'kilogram' ? 'kg' : ($unit == 'litre' ? 'L' : $unit);
+                        $measurementInfo = " ($qty$unitDisplay)";
+                    } else {
+                        $unitDisplay = $unit == 'kilogram' ? 'kg' : ($unit == 'litre' ? 'L' : $unit);
+                        $measurementInfo = " ($qty$unitDisplay)";
                     }
                 }
                 
@@ -1088,7 +1134,7 @@ function createQuickOrder($conn, $data, $userId) {
                 $subtotal += $itemTotal;
                 
                 $itemDetails[] = [
-                    'name' => $itemName,
+                    'name' => $itemName . $measurementInfo,
                     'quantity' => $quantity,
                     'price' => $itemPrice,
                     'total' => $itemTotal,
@@ -1517,7 +1563,7 @@ function formatQuickOrderListData($q, $baseUrl) {
         'min_order_amount' => floatval($q['min_order_amount'] ?? 0),
         'available_all_day' => boolval($q['available_all_day'] ?? true),
         'seasonal_available' => boolval($q['seasonal_available'] ?? false),
-        'available_units' => !empty($q['available_units']) ? explode(',', $q['available_units']) : [],
+        'available_measurements' => !empty($q['available_measurements']) ? explode(',', $q['available_measurements']) : [],
         'has_variants' => boolval($q['has_variants'] ?? false),
         'variant_type' => $q['variant_type'] ?? null,
         'preparation_time' => $q['preparation_time'] ?? '15-20 min',
@@ -1615,6 +1661,9 @@ function formatQuickOrderDetailData($q, $baseUrl) {
     ];
 }
 
+/*********************************
+ * UPDATED ITEM FORMATTING FOR FLEXIBLE VARIANTS
+ *********************************/
 function formatQuickOrderItemData($item, $baseUrl) {
     $imageUrl = '';
     if (!empty($item['image_url'])) {
@@ -1625,47 +1674,79 @@ function formatQuickOrderItemData($item, $baseUrl) {
         }
     }
     
-    $displayPrice = $item['price'];
-    $displayUnit = $item['unit_type'];
-    $unitValue = floatval($item['unit_value'] ?? 1);
-    
-    if ($item['unit_type'] === 'kg' && $unitValue != 1) {
-        $displayPrice = $item['price'] / $unitValue;
-        $displayPrice = round($displayPrice * 1000, 2);
-    }
-    
     // Parse variants JSON
     $variants = [];
     if (!empty($item['variants_json'])) {
         $variantsData = json_decode($item['variants_json'], true);
         $variants = is_array($variantsData) ? $variantsData : [];
+        
+        // Format variants with proper display names
+        foreach ($variants as &$variant) {
+            if (!isset($variant['effectiveDisplayName'])) {
+                if (isset($variant['quantity']) && isset($variant['unit'])) {
+                    $qty = $variant['quantity'];
+                    $unit = $variant['unit'];
+                    $unitDisplay = $unit;
+                    
+                    // Convert unit enum to display name
+                    switch($unit) {
+                        case 'kilogram': $unitDisplay = 'kg'; break;
+                        case 'gram': $unitDisplay = 'g'; break;
+                        case 'litre': $unitDisplay = 'L'; break;
+                        case 'millilitre': $unitDisplay = 'ml'; break;
+                        case 'piece': $unitDisplay = 'pc'; break;
+                        default: break;
+                    }
+                    
+                    $qtyStr = $qty % 1 == 0 ? intval($qty) : number_format($qty, 1);
+                    $variant['effectiveDisplayName'] = $qtyStr . $unitDisplay;
+                } elseif (isset($variant['unit'])) {
+                    $variant['effectiveDisplayName'] = $variant['unit'];
+                } else {
+                    $variant['effectiveDisplayName'] = $variant['name'];
+                }
+            }
+        }
     }
+    
+    // Determine measurement type display name
+    $measurementTypeDisplay = $item['measurement_type'] ?? 'custom';
     
     return [
         'id' => $item['id'] ?? null,
         'name' => $item['name'] ?? '',
         'description' => $item['description'] ?? '',
         'price' => floatval($item['price'] ?? 0),
-        'display_price' => floatval($displayPrice),
-        'formatted_price' => 'MK ' . number_format(floatval($displayPrice), 2) . ' / ' . $displayUnit,
+        'formatted_price' => 'MK ' . number_format(floatval($item['price'] ?? 0), 2),
         'image_url' => $imageUrl,
-        'unit_type' => $item['unit_type'] ?? 'piece',
-        'unit_value' => $unitValue,
+        'measurement_type' => $item['measurement_type'] ?? 'custom',
+        'measurement_type_display' => $measurementTypeDisplay,
+        'unit' => $item['unit'] ?? null,
+        'quantity' => $item['quantity'] ? floatval($item['quantity']) : null,
+        'custom_unit' => $item['custom_unit'] ?? null,
+        'display_unit' => $item['custom_unit'] ?? ($item['unit'] ?? ''),
         'is_default' => boolval($item['is_default'] ?? false),
         'is_available' => boolval($item['is_available'] ?? true),
         'stock_quantity' => intval($item['stock_quantity'] ?? 0),
-        'reorder_level' => intval($item['reorder_level'] ?? 10),
         'in_stock' => ($item['stock_quantity'] === null || $item['stock_quantity'] > 0) && $item['is_available'],
         'has_variants' => boolval($item['has_variants'] ?? false),
-        'variant_type' => $item['variant_type'] ?? null,
         'variants' => $variants,
         'badge' => $item['badge'] ?? null,
         'price_per_unit' => $item['price_per_unit'] ? floatval($item['price_per_unit']) : null,
+        'max_quantity' => intval($item['max_quantity'] ?? 99),
+        'metadata' => $item['metadata'] ? json_decode($item['metadata'], true) : null,
         'created_at' => $item['created_at'] ?? ''
     ];
 }
 
 function formatAddOnData($addOn) {
+    // Parse compatible_with if stored as JSON
+    $compatibleWith = [];
+    if (!empty($addOn['compatible_with'])) {
+        $compatibleData = json_decode($addOn['compatible_with'], true);
+        $compatibleWith = is_array($compatibleData) ? $compatibleData : [];
+    }
+    
     return [
         'id' => $addOn['id'] ?? null,
         'name' => $addOn['name'] ?? '',
@@ -1673,6 +1754,10 @@ function formatAddOnData($addOn) {
         'formatted_price' => 'MK ' . number_format(floatval($addOn['price'] ?? 0), 2),
         'category' => $addOn['category'] ?? null,
         'description' => $addOn['description'] ?? '',
+        'is_per_item' => boolval($addOn['is_per_item'] ?? true),
+        'max_quantity' => intval($addOn['max_quantity'] ?? 1),
+        'is_required' => boolval($addOn['is_required'] ?? false),
+        'compatible_with' => $compatibleWith,
         'is_available' => boolval($addOn['is_available'] ?? true),
         'is_selected' => false // Default not selected
     ];
