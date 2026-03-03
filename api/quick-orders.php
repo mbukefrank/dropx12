@@ -198,6 +198,12 @@ function handleGetRequest($orderId = null) {
         getQuickOrderRecommendations($conn, $baseUrl, $userId);
     } elseif ($endpoint === 'search') {
         searchQuickOrders($conn, $baseUrl, $userId);
+    } elseif ($endpoint === 'cart') {
+        // Get user's cart
+        if (!$userId) {
+            ResponseHandler::error('Authentication required', 401);
+        }
+        ResponseHandler::success(['cart' => getCart($conn, $userId)]);
     } else {
         getQuickOrdersList($conn, $baseUrl, $userId);
     }
@@ -249,6 +255,18 @@ function handlePostRequest() {
             break;
         case 'add_to_cart':
             addQuickOrderToCart($conn, $input, $userId);
+            break;
+        case 'get_cart':
+            ResponseHandler::success(['cart' => getCart($conn, $userId)]);
+            break;
+        case 'update_cart_item':
+            updateCartItemQuantity($conn, $input, $userId);
+            break;
+        case 'remove_cart_item':
+            removeCartItem($conn, $input, $userId);
+            break;
+        case 'clear_cart':
+            clearCart($conn, $userId);
             break;
         case 'bulk_update_stock':
             bulkUpdateStock($conn, $input, $userId);
@@ -849,14 +867,15 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
 }
 
 /*********************************
- * ADD TO CART
+ * ADD TO CART - UPDATED WITH PROPER CART MANAGEMENT
  *********************************/
 function addQuickOrderToCart($conn, $data, $userId) {
     $quickOrderId = $data['quick_order_id'] ?? null;
     $itemId = $data['item_id'] ?? null;
     $variantId = $data['variant_id'] ?? null;
     $quantity = intval($data['quantity'] ?? 1);
-    $selectedOptions = $data['selected_options'] ?? null;
+    $selectedAddOns = $data['selected_add_ons'] ?? [];
+    $specialInstructions = $data['special_instructions'] ?? '';
 
     if (!$quickOrderId || !$itemId) {
         ResponseHandler::error('Quick order ID and item ID are required', 400);
@@ -866,180 +885,735 @@ function addQuickOrderToCart($conn, $data, $userId) {
         ResponseHandler::error('Quantity must be at least 1', 400);
     }
 
-    // Get item details with variants
-    $itemStmt = $conn->prepare(
-        "SELECT qoi.*, qo.item_type, qo.category, qo.title as quick_order_title,
-                qo.merchant_id, qo.merchant_name, qo.preparation_time
-         FROM quick_order_items qoi
-         JOIN quick_orders qo ON qoi.quick_order_id = qo.id
-         WHERE qoi.id = :item_id 
-         AND qoi.quick_order_id = :quick_order_id
-         AND qoi.is_available = 1"
-    );
-    $itemStmt->execute([
-        ':item_id' => $itemId,
-        ':quick_order_id' => $quickOrderId
-    ]);
-    $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
+    // Start transaction
+    $conn->beginTransaction();
 
-    if (!$item) {
-        ResponseHandler::error('Item not available', 404);
-    }
+    try {
+        // 1. VALIDATE ITEM EXISTS AND IS AVAILABLE
+        $itemStmt = $conn->prepare(
+            "SELECT qoi.*, qo.title as quick_order_title, qo.category, qo.item_type,
+                    qo.merchant_id, qo.merchant_name, qo.preparation_time,
+                    qo.delivery_time, qo.has_variants
+             FROM quick_order_items qoi
+             JOIN quick_orders qo ON qoi.quick_order_id = qo.id
+             WHERE qoi.id = :item_id 
+             AND qoi.quick_order_id = :quick_order_id
+             AND qoi.is_available = 1"
+        );
+        $itemStmt->execute([
+            ':item_id' => $itemId,
+            ':quick_order_id' => $quickOrderId
+        ]);
+        $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
 
-    // Handle variant selection
-    $variantData = null;
-    $selectedVariantName = '';
-    $selectedVariantPrice = $item['price'];
-    
-    if ($variantId) {
-        $variants = json_decode($item['variants_json'] ?? '[]', true);
-        foreach ($variants as $variant) {
-            if ($variant['id'] == $variantId) {
-                $variantData = $variant;
-                $selectedVariantName = ' (' . ($variant['display_name'] ?? $variant['name']) . ')';
-                $selectedVariantPrice = $variant['price'];
-                break;
+        if (!$item) {
+            throw new Exception('Item not available');
+        }
+
+        // 2. HANDLE VARIANT SELECTION
+        $variantData = null;
+        $selectedVariantName = '';
+        $selectedVariantPrice = $item['price'];
+        $variantPrice = 0;
+        
+        if ($variantId) {
+            $variants = json_decode($item['variants_json'] ?? '[]', true);
+            $variantFound = false;
+            
+            foreach ($variants as $variant) {
+                if ($variant['id'] == $variantId) {
+                    $variantFound = true;
+                    $variantData = $variant;
+                    $selectedVariantName = ' (' . ($variant['display_name'] ?? $variant['name']) . ')';
+                    $selectedVariantPrice = $variant['price'];
+                    $variantPrice = $variant['price'] - $item['price']; // Additional cost
+                    
+                    // Check variant availability
+                    if (isset($variant['is_available']) && !$variant['is_available']) {
+                        throw new Exception('Variant not available');
+                    }
+                    
+                    // Check variant stock
+                    if (isset($variant['stock_quantity']) && $variant['stock_quantity'] > 0 && $quantity > $variant['stock_quantity']) {
+                        throw new Exception('Insufficient stock for selected variant');
+                    }
+                    break;
+                }
+            }
+            
+            if (!$variantFound) {
+                throw new Exception('Variant not found');
             }
         }
-        if (!$variantData) {
-            ResponseHandler::error('Variant not found', 404);
+
+        // 3. CHECK STOCK FOR NON-VARIANT ITEM
+        if (!$variantId && $item['stock_quantity'] > 0 && $quantity > $item['stock_quantity']) {
+            throw new Exception('Insufficient stock');
         }
-    }
 
-    // Check stock
-    if ($variantData && isset($variantData['stock_quantity']) && $variantData['stock_quantity'] > 0 && $quantity > $variantData['stock_quantity']) {
-        ResponseHandler::error('Insufficient stock', 400);
-    } elseif ($item['stock_quantity'] > 0 && $quantity > $item['stock_quantity']) {
-        ResponseHandler::error('Insufficient stock', 400);
-    }
+        // 4. CHECK MAX QUANTITY
+        $maxQty = $variantData['max_quantity'] ?? $item['max_quantity'] ?? 99;
+        if ($quantity > $maxQty) {
+            throw new Exception("Maximum quantity is $maxQty");
+        }
 
-    // Check max quantity
-    $maxQty = $variantData['max_quantity'] ?? $item['max_quantity'] ?? 99;
-    if ($quantity > $maxQty) {
-        ResponseHandler::error("Maximum quantity is $maxQty", 400);
-    }
+        // 5. PROCESS ADD-ONS
+        $addOnsTotal = 0;
+        $processedAddOns = [];
+        
+        if (!empty($selectedAddOns)) {
+            $addOnsStmt = $conn->prepare(
+                "SELECT * FROM quick_order_addons 
+                 WHERE id IN (" . implode(',', array_fill(0, count($selectedAddOns), '?')) . ")
+                 AND quick_order_id = ? AND is_available = 1"
+            );
+            
+            $params = array_merge($selectedAddOns, [$quickOrderId]);
+            $addOnsStmt->execute($params);
+            $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            foreach ($addOns as $addOn) {
+                $addOnTotal = $addOn['price'] * $quantity;
+                $addOnsTotal += $addOnTotal;
+                
+                $processedAddOns[] = [
+                    'id' => $addOn['id'],
+                    'name' => $addOn['name'],
+                    'price' => $addOn['price'],
+                    'category' => $addOn['category'],
+                    'quantity' => $quantity,
+                    'total' => $addOnTotal
+                ];
+            }
+        }
 
-    // Check if item already in cart
-    $checkStmt = $conn->prepare(
-        "SELECT id, quantity FROM cart_items 
-         WHERE user_id = :user_id 
-         AND quick_order_item_id = :item_id
-         AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))"
+        // 6. CALCULATE PRICES
+        $unitPrice = $selectedVariantPrice;
+        $subtotal = $unitPrice * $quantity;
+        $addOnsTotal = $addOnsTotal;
+        $totalPrice = $subtotal + $addOnsTotal;
+
+        // 7. GET OR CREATE USER'S ACTIVE CART
+        $cartStmt = $conn->prepare(
+            "SELECT id FROM carts 
+             WHERE user_id = :user_id AND status = 'active'
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        $cartStmt->execute([':user_id' => $userId]);
+        $cart = $cartStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($cart) {
+            $cartId = $cart['id'];
+        } else {
+            // Create new cart
+            $createCartStmt = $conn->prepare(
+                "INSERT INTO carts (user_id, status, created_at, updated_at)
+                 VALUES (:user_id, 'active', NOW(), NOW())"
+            );
+            $createCartStmt->execute([':user_id' => $userId]);
+            $cartId = $conn->lastInsertId();
+        }
+
+        // 8. CHECK IF SAME ITEM ALREADY IN CART (WITH SAME VARIANT AND ADD-ONS)
+        $addOnsJson = !empty($processedAddOns) ? json_encode($processedAddOns) : null;
+        
+        $checkStmt = $conn->prepare(
+            "SELECT id, quantity FROM cart_items 
+             WHERE cart_id = :cart_id
+             AND quick_order_item_id = :item_id
+             AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))
+             AND (add_ons_json = :add_ons_json OR (add_ons_json IS NULL AND :add_ons_json IS NULL))
+             AND special_instructions = :special_instructions"
+        );
+        $checkStmt->execute([
+            ':cart_id' => $cartId,
+            ':item_id' => $itemId,
+            ':variant_id' => $variantId,
+            ':add_ons_json' => $addOnsJson,
+            ':special_instructions' => $specialInstructions
+        ]);
+        
+        if ($existing = $checkStmt->fetch(PDO::FETCH_ASSOC)) {
+            // Update existing item quantity
+            $newQuantity = $existing['quantity'] + $quantity;
+            $newSubtotal = $unitPrice * $newQuantity;
+            $newAddOnsTotal = $addOnsTotal; // Recalculate based on new quantity
+            $newTotal = $newSubtotal + $newAddOnsTotal;
+            
+            $updateStmt = $conn->prepare(
+                "UPDATE cart_items 
+                 SET quantity = :quantity,
+                     subtotal = :subtotal,
+                     add_ons_total = :add_ons_total,
+                     total_price = :total_price,
+                     updated_at = NOW()
+                 WHERE id = :id"
+            );
+            $updateStmt->execute([
+                ':quantity' => $newQuantity,
+                ':subtotal' => $newSubtotal,
+                ':add_ons_total' => $newAddOnsTotal,
+                ':total_price' => $newTotal,
+                ':id' => $existing['id']
+            ]);
+        } else {
+            // Add new item to cart
+            $itemName = $item['name'] . $selectedVariantName;
+            
+            $insertStmt = $conn->prepare(
+                "INSERT INTO cart_items (
+                    cart_id,
+                    user_id,
+                    quick_order_id,
+                    quick_order_item_id,
+                    name,
+                    description,
+                    unit_price,
+                    variant_price,
+                    add_ons_total,
+                    subtotal,
+                    total_price,
+                    quantity,
+                    image_url,
+                    measurement_type,
+                    unit,
+                    quantity_value,
+                    custom_unit,
+                    item_type,
+                    category,
+                    merchant_id,
+                    merchant_name,
+                    preparation_time,
+                    variant_id,
+                    variant_data,
+                    variant_name,
+                    add_ons_json,
+                    special_instructions,
+                    has_variants,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    :cart_id,
+                    :user_id,
+                    :quick_order_id,
+                    :quick_order_item_id,
+                    :name,
+                    :description,
+                    :unit_price,
+                    :variant_price,
+                    :add_ons_total,
+                    :subtotal,
+                    :total_price,
+                    :quantity,
+                    :image_url,
+                    :measurement_type,
+                    :unit,
+                    :quantity_value,
+                    :custom_unit,
+                    :item_type,
+                    :category,
+                    :merchant_id,
+                    :merchant_name,
+                    :preparation_time,
+                    :variant_id,
+                    :variant_data,
+                    :variant_name,
+                    :add_ons_json,
+                    :special_instructions,
+                    :has_variants,
+                    NOW(),
+                    NOW()
+                )"
+            );
+            
+            $insertStmt->execute([
+                ':cart_id' => $cartId,
+                ':user_id' => $userId,
+                ':quick_order_id' => $quickOrderId,
+                ':quick_order_item_id' => $itemId,
+                ':name' => $itemName,
+                ':description' => $item['description'],
+                ':unit_price' => $unitPrice,
+                ':variant_price' => $variantPrice,
+                ':add_ons_total' => $addOnsTotal,
+                ':subtotal' => $subtotal,
+                ':total_price' => $totalPrice,
+                ':quantity' => $quantity,
+                ':image_url' => $item['image_url'],
+                ':measurement_type' => $item['measurement_type'],
+                ':unit' => $item['unit'],
+                ':quantity_value' => $item['quantity'],
+                ':custom_unit' => $item['custom_unit'],
+                ':item_type' => $item['item_type'],
+                ':category' => $item['category'],
+                ':merchant_id' => $item['merchant_id'],
+                ':merchant_name' => $item['merchant_name'],
+                ':preparation_time' => $item['preparation_time'],
+                ':variant_id' => $variantId,
+                ':variant_data' => $variantData ? json_encode($variantData) : null,
+                ':variant_name' => $selectedVariantName,
+                ':add_ons_json' => $addOnsJson,
+                ':special_instructions' => $specialInstructions,
+                ':has_variants' => $item['has_variants'] ? 1 : 0
+            ]);
+        }
+
+        // 9. UPDATE CART TOTALS
+        updateCartTotals($conn, $cartId);
+
+        // 10. UPDATE STOCK (optional - decrease available stock)
+        if ($variantId && isset($variantData['stock_quantity']) && $variantData['stock_quantity'] > 0) {
+            updateVariantStock($conn, $itemId, $variantId, $quantity, 'decrease');
+        } elseif (!$variantId && $item['stock_quantity'] > 0) {
+            updateItemStock($conn, $itemId, $quantity, 'decrease');
+        }
+
+        // 11. GET COMPLETE CART DETAILS FOR RESPONSE
+        $cartDetails = getCartDetails($conn, $cartId, $userId);
+
+        $conn->commit();
+
+        ResponseHandler::success([
+            'cart' => $cartDetails,
+            'message' => 'Item added to cart successfully'
+        ]);
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to add item to cart: ' . $e->getMessage(), 400);
+    }
+}
+
+/*********************************
+ * HELPER: UPDATE CART TOTALS
+ *********************************/
+function updateCartTotals($conn, $cartId) {
+    // Calculate cart totals
+    $calcStmt = $conn->prepare(
+        "SELECT 
+            COUNT(*) as items_count,
+            SUM(quantity) as total_items,
+            SUM(subtotal) as subtotal,
+            SUM(add_ons_total) as add_ons_total,
+            SUM(total_price) as total
+         FROM cart_items 
+         WHERE cart_id = :cart_id"
     );
-    $checkStmt->execute([
-        ':user_id' => $userId,
-        ':item_id' => $itemId,
-        ':variant_id' => $variantId
-    ]);
+    $calcStmt->execute([':cart_id' => $cartId]);
+    $totals = $calcStmt->fetch(PDO::FETCH_ASSOC);
+
+    // Update cart
+    $updateStmt = $conn->prepare(
+        "UPDATE carts 
+         SET items_count = :items_count,
+             total_items = :total_items,
+             subtotal = :subtotal,
+             add_ons_total = :add_ons_total,
+             total = :total,
+             updated_at = NOW()
+         WHERE id = :id"
+    );
     
-    if ($existing = $checkStmt->fetch(PDO::FETCH_ASSOC)) {
-        $newQuantity = $existing['quantity'] + $quantity;
-        $updateStmt = $conn->prepare(
-            "UPDATE cart_items 
-             SET quantity = :quantity, 
-                 selected_options = :selected_options,
-                 updated_at = NOW()
+    $updateStmt->execute([
+        ':items_count' => $totals['items_count'] ?? 0,
+        ':total_items' => $totals['total_items'] ?? 0,
+        ':subtotal' => $totals['subtotal'] ?? 0,
+        ':add_ons_total' => $totals['add_ons_total'] ?? 0,
+        ':total' => $totals['total'] ?? 0,
+        ':id' => $cartId
+    ]);
+}
+
+/*********************************
+ * HELPER: GET CART DETAILS
+ *********************************/
+function getCartDetails($conn, $cartId, $userId) {
+    // Get cart info
+    $cartStmt = $conn->prepare(
+        "SELECT * FROM carts WHERE id = :id AND user_id = :user_id"
+    );
+    $cartStmt->execute([
+        ':id' => $cartId,
+        ':user_id' => $userId
+    ]);
+    $cart = $cartStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$cart) {
+        return null;
+    }
+
+    // Get cart items with details
+    $itemsStmt = $conn->prepare(
+        "SELECT ci.*, 
+                qoi.stock_quantity as available_stock,
+                qoi.max_quantity as item_max_qty
+         FROM cart_items ci
+         LEFT JOIN quick_order_items qoi ON ci.quick_order_item_id = qoi.id
+         WHERE ci.cart_id = :cart_id
+         ORDER BY ci.created_at DESC"
+    );
+    $itemsStmt->execute([':cart_id' => $cartId]);
+    $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Format items
+    $formattedItems = [];
+    foreach ($items as $item) {
+        $formattedItems[] = [
+            'id' => $item['id'],
+            'name' => $item['name'],
+            'description' => $item['description'],
+            'quantity' => intval($item['quantity']),
+            'unit_price' => floatval($item['unit_price']),
+            'variant_price' => floatval($item['variant_price']),
+            'add_ons_total' => floatval($item['add_ons_total']),
+            'subtotal' => floatval($item['subtotal']),
+            'total_price' => floatval($item['total_price']),
+            'image_url' => $item['image_url'],
+            'measurement_type' => $item['measurement_type'],
+            'unit' => $item['unit'],
+            'quantity_value' => $item['quantity_value'] ? floatval($item['quantity_value']) : null,
+            'custom_unit' => $item['custom_unit'],
+            'variant_id' => $item['variant_id'],
+            'variant_name' => $item['variant_name'],
+            'variant_data' => $item['variant_data'] ? json_decode($item['variant_data'], true) : null,
+            'add_ons' => $item['add_ons_json'] ? json_decode($item['add_ons_json'], true) : [],
+            'special_instructions' => $item['special_instructions'],
+            'merchant_name' => $item['merchant_name'],
+            'preparation_time' => $item['preparation_time'],
+            'max_quantity' => min($item['item_max_qty'] ?? 99, $item['available_stock'] ?? 99),
+            'created_at' => $item['created_at']
+        ];
+    }
+
+    // Group items by merchant
+    $merchantGroups = [];
+    foreach ($formattedItems as $item) {
+        $merchantName = $item['merchant_name'] ?? 'Unknown';
+        if (!isset($merchantGroups[$merchantName])) {
+            $merchantGroups[$merchantName] = [
+                'merchant_name' => $merchantName,
+                'items' => [],
+                'subtotal' => 0,
+                'add_ons_total' => 0,
+                'total' => 0
+            ];
+        }
+        $merchantGroups[$merchantName]['items'][] = $item;
+        $merchantGroups[$merchantName]['subtotal'] += $item['subtotal'];
+        $merchantGroups[$merchantName]['add_ons_total'] += $item['add_ons_total'];
+        $merchantGroups[$merchantName]['total'] += $item['total_price'];
+    }
+
+    return [
+        'cart_id' => intval($cart['id']),
+        'items_count' => intval($cart['items_count']),
+        'total_items' => intval($cart['total_items']),
+        'subtotal' => floatval($cart['subtotal']),
+        'add_ons_total' => floatval($cart['add_ons_total']),
+        'delivery_fee' => floatval($cart['delivery_fee'] ?? 0),
+        'tax' => floatval($cart['tax'] ?? 0),
+        'discount' => floatval($cart['discount'] ?? 0),
+        'total' => floatval($cart['total']),
+        'items' => $formattedItems,
+        'grouped_by_merchant' => array_values($merchantGroups),
+        'created_at' => $cart['created_at'],
+        'updated_at' => $cart['updated_at']
+    ];
+}
+
+/*********************************
+ * HELPER: UPDATE ITEM STOCK
+ *********************************/
+function updateItemStock($conn, $itemId, $quantity, $operation = 'decrease') {
+    if ($operation === 'decrease') {
+        $stmt = $conn->prepare(
+            "UPDATE quick_order_items 
+             SET stock_quantity = stock_quantity - :quantity 
+             WHERE id = :id AND stock_quantity >= :quantity"
+        );
+    } else {
+        $stmt = $conn->prepare(
+            "UPDATE quick_order_items 
+             SET stock_quantity = stock_quantity + :quantity 
              WHERE id = :id"
         );
-        $updateStmt->execute([
-            ':quantity' => $newQuantity,
-            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
-            ':id' => $existing['id']
-        ]);
-    } else {
-        $insertStmt = $conn->prepare(
-            "INSERT INTO cart_items (
-                user_id, 
-                quick_order_item_id,
-                quick_order_id,
-                name,
-                description,
-                price,
-                image_url,
-                quantity,
-                measurement_type,
-                unit,
-                quantity_value,
-                custom_unit,
-                item_type,
-                category,
-                merchant_id,
-                merchant_name,
-                preparation_time,
-                variant_id,
-                variant_data,
-                variant_name,
-                selected_options,
-                has_variants,
-                created_at
-            ) VALUES (
-                :user_id, 
-                :quick_order_item_id,
-                :quick_order_id,
-                :name,
-                :description,
-                :price,
-                :image_url,
-                :quantity,
-                :measurement_type,
-                :unit,
-                :quantity_value,
-                :custom_unit,
-                :item_type,
-                :category,
-                :merchant_id,
-                :merchant_name,
-                :preparation_time,
-                :variant_id,
-                :variant_data,
-                :variant_name,
-                :selected_options,
-                :has_variants,
-                NOW()
-            )"
+    }
+    
+    $stmt->execute([
+        ':quantity' => $quantity,
+        ':id' => $itemId
+    ]);
+    
+    return $stmt->rowCount() > 0;
+}
+
+/*********************************
+ * HELPER: UPDATE VARIANT STOCK
+ *********************************/
+function updateVariantStock($conn, $itemId, $variantId, $quantity, $operation = 'decrease') {
+    // Get current variants
+    $stmt = $conn->prepare("SELECT variants_json FROM quick_order_items WHERE id = :id");
+    $stmt->execute([':id' => $itemId]);
+    $item = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$item) {
+        return false;
+    }
+    
+    $variants = json_decode($item['variants_json'] ?? '[]', true);
+    $updated = false;
+    
+    foreach ($variants as &$variant) {
+        if ($variant['id'] == $variantId) {
+            if (isset($variant['stock_quantity'])) {
+                if ($operation === 'decrease') {
+                    $variant['stock_quantity'] -= $quantity;
+                } else {
+                    $variant['stock_quantity'] += $quantity;
+                }
+                $updated = true;
+            }
+            break;
+        }
+    }
+    
+    if ($updated) {
+        $updateStmt = $conn->prepare(
+            "UPDATE quick_order_items SET variants_json = :variants_json WHERE id = :id"
         );
-        
-        $itemName = $item['name'] . $selectedVariantName;
-        
-        $insertStmt->execute([
-            ':user_id' => $userId,
-            ':quick_order_item_id' => $itemId,
-            ':quick_order_id' => $quickOrderId,
-            ':name' => $itemName,
-            ':description' => $item['description'],
-            ':price' => $selectedVariantPrice,
-            ':image_url' => $item['image_url'],
-            ':quantity' => $quantity,
-            ':measurement_type' => $item['measurement_type'],
-            ':unit' => $item['unit'],
-            ':quantity_value' => $item['quantity'],
-            ':custom_unit' => $item['custom_unit'],
-            ':item_type' => $item['item_type'],
-            ':category' => $item['category'],
-            ':merchant_id' => $item['merchant_id'],
-            ':merchant_name' => $item['merchant_name'],
-            ':preparation_time' => $item['preparation_time'],
-            ':variant_id' => $variantId,
-            ':variant_data' => $variantData ? json_encode($variantData) : null,
-            ':variant_name' => $selectedVariantName,
-            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
-            ':has_variants' => $item['has_variants'] ? 1 : 0
+        $updateStmt->execute([
+            ':variants_json' => json_encode($variants),
+            ':id' => $itemId
         ]);
+        return true;
+    }
+    
+    return false;
+}
+
+/*********************************
+ * GET CART
+ *********************************/
+function getCart($conn, $userId) {
+    // Get active cart
+    $cartStmt = $conn->prepare(
+        "SELECT id FROM carts 
+         WHERE user_id = :user_id AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    $cartStmt->execute([':user_id' => $userId]);
+    $cart = $cartStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$cart) {
+        // Return empty cart structure
+        return [
+            'cart_id' => null,
+            'items_count' => 0,
+            'total_items' => 0,
+            'subtotal' => 0,
+            'add_ons_total' => 0,
+            'delivery_fee' => 0,
+            'tax' => 0,
+            'discount' => 0,
+            'total' => 0,
+            'items' => [],
+            'grouped_by_merchant' => []
+        ];
     }
 
-    // Get updated cart count
-    $countStmt = $conn->prepare(
-        "SELECT COUNT(*) as count, SUM(quantity) as total_items 
-         FROM cart_items WHERE user_id = :user_id"
-    );
-    $countStmt->execute([':user_id' => $userId]);
-    $cartCount = $countStmt->fetch(PDO::FETCH_ASSOC);
+    return getCartDetails($conn, $cart['id'], $userId);
+}
 
-    ResponseHandler::success([
-        'cart_item_count' => intval($cartCount['total_items'] ?? 0),
-        'cart_items_count' => intval($cartCount['count'] ?? 0),
-        'message' => 'Item added to cart successfully'
-    ]);
+/*********************************
+ * UPDATE CART ITEM QUANTITY
+ *********************************/
+function updateCartItemQuantity($conn, $data, $userId) {
+    $cartItemId = $data['cart_item_id'] ?? null;
+    $quantity = intval($data['quantity'] ?? 0);
+
+    if (!$cartItemId) {
+        ResponseHandler::error('Cart item ID is required', 400);
+    }
+
+    if ($quantity < 0) {
+        ResponseHandler::error('Quantity cannot be negative', 400);
+    }
+
+    $conn->beginTransaction();
+
+    try {
+        // Get cart item
+        $itemStmt = $conn->prepare(
+            "SELECT ci.*, qoi.stock_quantity, qoi.max_quantity 
+             FROM cart_items ci
+             LEFT JOIN quick_order_items qoi ON ci.quick_order_item_id = qoi.id
+             WHERE ci.id = :id AND ci.user_id = :user_id"
+        );
+        $itemStmt->execute([
+            ':id' => $cartItemId,
+            ':user_id' => $userId
+        ]);
+        $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$item) {
+            throw new Exception('Cart item not found');
+        }
+
+        if ($quantity === 0) {
+            // Remove item
+            $deleteStmt = $conn->prepare("DELETE FROM cart_items WHERE id = :id");
+            $deleteStmt->execute([':id' => $cartItemId]);
+        } else {
+            // Check max quantity
+            $maxQty = min($item['max_quantity'] ?? 99, $item['stock_quantity'] ?? 99);
+            if ($quantity > $maxQty) {
+                throw new Exception("Maximum quantity is $maxQty");
+            }
+
+            // Update quantity and recalculate prices
+            $newSubtotal = $item['unit_price'] * $quantity;
+            
+            // Recalculate add-ons total (add-ons are per item)
+            $addOns = json_decode($item['add_ons_json'] ?? '[]', true);
+            $newAddOnsTotal = 0;
+            foreach ($addOns as $addOn) {
+                $newAddOnsTotal += $addOn['price'] * $quantity;
+            }
+            
+            $newTotal = $newSubtotal + $newAddOnsTotal;
+
+            $updateStmt = $conn->prepare(
+                "UPDATE cart_items 
+                 SET quantity = :quantity,
+                     subtotal = :subtotal,
+                     add_ons_total = :add_ons_total,
+                     total_price = :total_price,
+                     updated_at = NOW()
+                 WHERE id = :id"
+            );
+            $updateStmt->execute([
+                ':quantity' => $quantity,
+                ':subtotal' => $newSubtotal,
+                ':add_ons_total' => $newAddOnsTotal,
+                ':total_price' => $newTotal,
+                ':id' => $cartItemId
+            ]);
+        }
+
+        // Update cart totals
+        updateCartTotals($conn, $item['cart_id']);
+
+        // Get updated cart
+        $cartDetails = getCartDetails($conn, $item['cart_id'], $userId);
+
+        $conn->commit();
+
+        ResponseHandler::success([
+            'cart' => $cartDetails,
+            'message' => $quantity === 0 ? 'Item removed from cart' : 'Cart updated successfully'
+        ]);
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to update cart: ' . $e->getMessage(), 400);
+    }
+}
+
+/*********************************
+ * REMOVE CART ITEM
+ *********************************/
+function removeCartItem($conn, $data, $userId) {
+    $cartItemId = $data['cart_item_id'] ?? null;
+
+    if (!$cartItemId) {
+        ResponseHandler::error('Cart item ID is required', 400);
+    }
+
+    $conn->beginTransaction();
+
+    try {
+        // Get cart item to get cart_id
+        $itemStmt = $conn->prepare(
+            "SELECT cart_id FROM cart_items WHERE id = :id AND user_id = :user_id"
+        );
+        $itemStmt->execute([
+            ':id' => $cartItemId,
+            ':user_id' => $userId
+        ]);
+        $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$item) {
+            throw new Exception('Cart item not found');
+        }
+
+        // Delete the item
+        $deleteStmt = $conn->prepare("DELETE FROM cart_items WHERE id = :id");
+        $deleteStmt->execute([':id' => $cartItemId]);
+
+        // Update cart totals
+        updateCartTotals($conn, $item['cart_id']);
+
+        // Get updated cart
+        $cartDetails = getCartDetails($conn, $item['cart_id'], $userId);
+
+        $conn->commit();
+
+        ResponseHandler::success([
+            'cart' => $cartDetails,
+            'message' => 'Item removed from cart'
+        ]);
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to remove item: ' . $e->getMessage(), 400);
+    }
+}
+
+/*********************************
+ * CLEAR CART
+ *********************************/
+function clearCart($conn, $userId) {
+    $conn->beginTransaction();
+
+    try {
+        // Get active cart
+        $cartStmt = $conn->prepare(
+            "SELECT id FROM carts 
+             WHERE user_id = :user_id AND status = 'active'"
+        );
+        $cartStmt->execute([':user_id' => $userId]);
+        $cart = $cartStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($cart) {
+            // Delete all items
+            $deleteStmt = $conn->prepare("DELETE FROM cart_items WHERE cart_id = :cart_id");
+            $deleteStmt->execute([':cart_id' => $cart['id']]);
+
+            // Reset cart totals
+            $resetStmt = $conn->prepare(
+                "UPDATE carts 
+                 SET items_count = 0,
+                     total_items = 0,
+                     subtotal = 0,
+                     add_ons_total = 0,
+                     total = 0,
+                     updated_at = NOW()
+                 WHERE id = :id"
+            );
+            $resetStmt->execute([':id' => $cart['id']]);
+        }
+
+        $conn->commit();
+
+        ResponseHandler::success([
+            'message' => 'Cart cleared successfully',
+            'cart' => getCart($conn, $userId)
+        ]);
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to clear cart: ' . $e->getMessage(), 500);
+    }
 }
 
 /*********************************
@@ -1540,6 +2114,7 @@ function getSeasonalQuickOrders($conn, $baseUrl, $userId = null) {
     $currentMonth = date('n');
     
     $whereConditions = ["seasonal_available = 1"];
+    $params = [];
     
     if ($season) {
         $seasonMonths = [
@@ -1573,10 +2148,8 @@ function getSeasonalQuickOrders($conn, $baseUrl, $userId = null) {
             LIMIT :limit OFFSET :offset";
 
     $stmt = $conn->prepare($sql);
-    if (isset($params)) {
-        foreach ($params as $key => $value) {
-            $stmt->bindValue($key, $value);
-        }
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
     }
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
@@ -2286,6 +2859,164 @@ function validateQuickOrder($conn, $data, $userId = null) {
     }
 
     ResponseHandler::success($validation);
+}
+
+/*********************************
+ * CREATE QUICK ORDER (PLACE ORDER FROM CART)
+ *********************************/
+function createQuickOrder($conn, $data, $userId) {
+    $cartId = $data['cart_id'] ?? null;
+    $deliveryAddress = $data['delivery_address'] ?? '';
+    $paymentMethod = $data['payment_method'] ?? '';
+    $specialInstructions = $data['special_instructions'] ?? '';
+
+    if (!$cartId) {
+        ResponseHandler::error('Cart ID is required', 400);
+    }
+
+    if (!$deliveryAddress) {
+        ResponseHandler::error('Delivery address is required', 400);
+    }
+
+    if (!$paymentMethod) {
+        ResponseHandler::error('Payment method is required', 400);
+    }
+
+    $conn->beginTransaction();
+
+    try {
+        // Get cart with items
+        $cart = getCartDetails($conn, $cartId, $userId);
+        
+        if (!$cart || empty($cart['items'])) {
+            throw new Exception('Cart is empty');
+        }
+
+        // Validate all items are still available
+        foreach ($cart['items'] as $item) {
+            $itemStmt = $conn->prepare(
+                "SELECT is_available, stock_quantity FROM quick_order_items WHERE id = :id"
+            );
+            $itemStmt->execute([':id' => $item['quick_order_item_id']]);
+            $dbItem = $itemStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$dbItem || !$dbItem['is_available']) {
+                throw new Exception("{$item['name']} is no longer available");
+            }
+
+            if ($dbItem['stock_quantity'] > 0 && $item['quantity'] > $dbItem['stock_quantity']) {
+                throw new Exception("Insufficient stock for {$item['name']}");
+            }
+        }
+
+        // Create order
+        $orderNumber = 'ORD-' . date('Ymd') . '-' . strtoupper(uniqid());
+        
+        $orderStmt = $conn->prepare(
+            "INSERT INTO orders (
+                user_id, order_number, cart_id, status,
+                subtotal, add_ons_total, delivery_fee, tax, discount, total_amount,
+                delivery_address, payment_method, special_instructions,
+                created_at, updated_at
+            ) VALUES (
+                :user_id, :order_number, :cart_id, 'pending',
+                :subtotal, :add_ons_total, :delivery_fee, :tax, :discount, :total,
+                :delivery_address, :payment_method, :special_instructions,
+                NOW(), NOW()
+            )"
+        );
+
+        $orderStmt->execute([
+            ':user_id' => $userId,
+            ':order_number' => $orderNumber,
+            ':cart_id' => $cartId,
+            ':subtotal' => $cart['subtotal'],
+            ':add_ons_total' => $cart['add_ons_total'],
+            ':delivery_fee' => $cart['delivery_fee'],
+            ':tax' => $cart['tax'],
+            ':discount' => $cart['discount'],
+            ':total' => $cart['total'],
+            ':delivery_address' => $deliveryAddress,
+            ':payment_method' => $paymentMethod,
+            ':special_instructions' => $specialInstructions
+        ]);
+
+        $orderId = $conn->lastInsertId();
+
+        // Create order items
+        $itemStmt = $conn->prepare(
+            "INSERT INTO order_items (
+                order_id, quick_order_item_id, variant_id,
+                item_name, description, unit_price, variant_price, add_ons_total,
+                quantity, subtotal, total_price,
+                image_url, measurement_type, unit, quantity_value, custom_unit,
+                item_type, category, merchant_id, merchant_name,
+                variant_data, add_ons_json, special_instructions,
+                created_at
+            ) VALUES (
+                :order_id, :quick_order_item_id, :variant_id,
+                :item_name, :description, :unit_price, :variant_price, :add_ons_total,
+                :quantity, :subtotal, :total_price,
+                :image_url, :measurement_type, :unit, :quantity_value, :custom_unit,
+                :item_type, :category, :merchant_id, :merchant_name,
+                :variant_data, :add_ons_json, :special_instructions,
+                NOW()
+            )"
+        );
+
+        foreach ($cart['items'] as $item) {
+            $itemStmt->execute([
+                ':order_id' => $orderId,
+                ':quick_order_item_id' => $item['quick_order_item_id'],
+                ':variant_id' => $item['variant_id'],
+                ':item_name' => $item['name'],
+                ':description' => $item['description'],
+                ':unit_price' => $item['unit_price'],
+                ':variant_price' => $item['variant_price'],
+                ':add_ons_total' => $item['add_ons_total'],
+                ':quantity' => $item['quantity'],
+                ':subtotal' => $item['subtotal'],
+                ':total_price' => $item['total_price'],
+                ':image_url' => $item['image_url'],
+                ':measurement_type' => $item['measurement_type'],
+                ':unit' => $item['unit'],
+                ':quantity_value' => $item['quantity_value'],
+                ':custom_unit' => $item['custom_unit'],
+                ':item_type' => $item['item_type'],
+                ':category' => $item['category'],
+                ':merchant_id' => $item['merchant_id'],
+                ':merchant_name' => $item['merchant_name'],
+                ':variant_data' => $item['variant_data'] ? json_encode($item['variant_data']) : null,
+                ':add_ons_json' => $item['add_ons'] ? json_encode($item['add_ons']) : null,
+                ':special_instructions' => $item['special_instructions']
+            ]);
+
+            // Update stock
+            if ($item['variant_id']) {
+                updateVariantStock($conn, $item['quick_order_item_id'], $item['variant_id'], $item['quantity'], 'decrease');
+            } else {
+                updateItemStock($conn, $item['quick_order_item_id'], $item['quantity'], 'decrease');
+            }
+        }
+
+        // Update cart status to checked_out
+        $updateCartStmt = $conn->prepare(
+            "UPDATE carts SET status = 'checked_out', updated_at = NOW() WHERE id = :id"
+        );
+        $updateCartStmt->execute([':id' => $cartId]);
+
+        $conn->commit();
+
+        ResponseHandler::success([
+            'order_id' => $orderId,
+            'order_number' => $orderNumber,
+            'message' => 'Order placed successfully'
+        ]);
+
+    } catch (Exception $e) {
+        $conn->rollBack();
+        ResponseHandler::error('Failed to place order: ' . $e->getMessage(), 400);
+    }
 }
 
 /*********************************
