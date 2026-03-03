@@ -90,19 +90,13 @@ try {
     if ($method === 'GET' && preg_match('#/merchants\.php/(\d+)/menu$#', $path, $matches)) {
         error_log("Matched menu endpoint for merchant ID: " . $matches[1]);
         $merchantId = intval($matches[1]);
-        $includeQuickOrders = isset($queryParams['include_quick_orders']) 
-            ? filter_var($queryParams['include_quick_orders'], FILTER_VALIDATE_BOOLEAN)
-            : true;
         $includeVariants = isset($queryParams['include_variants'])
             ? filter_var($queryParams['include_variants'], FILTER_VALIDATE_BOOLEAN)
             : true;
         $includeAddOns = isset($queryParams['include_add_ons'])
             ? filter_var($queryParams['include_add_ons'], FILTER_VALIDATE_BOOLEAN)
             : true;
-        $includeNutritionalInfo = isset($queryParams['include_nutritional_info'])
-            ? filter_var($queryParams['include_nutritional_info'], FILTER_VALIDATE_BOOLEAN)
-            : true;
-        getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders, $includeVariants, $includeAddOns, $includeNutritionalInfo);
+        getMerchantMenu($conn, $merchantId, $baseUrl, $includeVariants, $includeAddOns);
         exit();
     }
     
@@ -111,14 +105,6 @@ try {
         error_log("Matched categories endpoint for merchant ID: " . $matches[1]);
         $merchantId = intval($matches[1]);
         getMerchantCategories($conn, $merchantId, $baseUrl);
-        exit();
-    }
-    
-    // Handle /merchants.php/3/quick-orders
-    if ($method === 'GET' && preg_match('#/merchants\.php/(\d+)/quick-orders$#', $path, $matches)) {
-        error_log("Matched quick orders endpoint for merchant ID: " . $matches[1]);
-        $merchantId = intval($matches[1]);
-        getMerchantQuickOrders($conn, $merchantId, $baseUrl);
         exit();
     }
     
@@ -862,7 +848,6 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
             mi.variant_type,
             mi.variants_json,
             mi.add_ons_json,
-            mi.nutritional_info,
             mi.preparation_time,
             mi.max_quantity,
             mi.stock_quantity
@@ -876,38 +861,6 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
     
     $popularItemsStmt->execute([':merchant_id' => $merchantId]);
     $popularMenuItems = $popularItemsStmt->fetchAll(PDO::FETCH_ASSOC);
-
-    // Get quick orders for this merchant with variants and add-ons
-    $quickOrdersStmt = $conn->prepare(
-        "SELECT 
-            qo.id,
-            qo.title,
-            qo.description,
-            qo.category,
-            qo.item_type,
-            qo.image_url,
-            qo.price,
-            qo.rating,
-            qo.order_count,
-            qo.has_variants,
-            qo.variant_type,
-            qo.variants,
-            qo.add_ons,
-            qo.nutritional_info,
-            qo.preparation_time,
-            qom.priority,
-            qom.custom_price,
-            qom.custom_delivery_time
-        FROM quick_orders qo
-        INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-        WHERE qom.merchant_id = :merchant_id
-        AND qom.is_active = 1
-        ORDER BY qom.priority DESC, qo.order_count DESC
-        LIMIT 6"
-    );
-    
-    $quickOrdersStmt->execute([':merchant_id' => $merchantId]);
-    $quickOrders = $quickOrdersStmt->fetchAll(PDO::FETCH_ASSOC);
 
     // Get promotions
     $promotionsStmt = $conn->prepare(
@@ -968,9 +921,6 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
         'popular_items' => array_map(function($item) use ($baseUrl) {
             return formatMenuItemData($item, $baseUrl);
         }, $popularMenuItems),
-        'quick_orders' => array_map(function($order) use ($baseUrl) {
-            return formatQuickOrderForMerchant($order, $baseUrl);
-        }, $quickOrders),
         'has_menu' => !empty($categories) || !empty($popularMenuItems)
     ];
 
@@ -980,9 +930,9 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
 }
 
 /*********************************
- * GET MERCHANT MENU - ENHANCED
+ * GET MERCHANT MENU - CLEANED (NO QUICK ORDERS)
  *********************************/
-function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = true, $includeVariants = true, $includeAddOns = true, $includeNutritionalInfo = true) {
+function getMerchantMenu($conn, $merchantId, $baseUrl, $includeVariants = true, $includeAddOns = true) {
     error_log("=== MENU DEBUG START ===");
     error_log("Getting menu for merchant ID: " . $merchantId);
     
@@ -1001,7 +951,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     
     error_log("Merchant found: " . $merchant['name']);
 
-    // Get menu items with enhanced fields
+    // Get menu items
     $selectFields = "SELECT 
             mi.id,
             mi.name,
@@ -1025,10 +975,6 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
     
     if ($includeAddOns) {
         $selectFields .= ", mi.add_ons_json";
-    }
-    
-    if ($includeNutritionalInfo) {
-        $selectFields .= ", mi.nutritional_info";
     }
 
     $menuStmt = $conn->prepare(
@@ -1055,8 +1001,7 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
             $categories[$categoryName] = [
                 'category_name' => $categoryName,
                 'category_info' => [
-                    'name' => $categoryName,
-                    'is_quick_order' => false
+                    'name' => $categoryName
                 ],
                 'items' => []
             ];
@@ -1064,62 +1009,6 @@ function getMerchantMenu($conn, $merchantId, $baseUrl, $includeQuickOrders = tru
         
         $categories[$categoryName]['items'][] = formatMenuItemData($item, $baseUrl);
         $totalItems++;
-    }
-    
-    // Add quick orders if requested
-    if ($includeQuickOrders) {
-        $quickOrderStmt = $conn->prepare(
-            "SELECT 
-                qo.id,
-                qo.title as name,
-                qo.description,
-                qo.price,
-                qo.image_url,
-                COALESCE(NULLIF(qo.category, ''), 'Quick Orders') as category,
-                qo.item_type,
-                qo.is_available,
-                qo.is_popular,
-                qo.preparation_time,
-                qo.has_variants,
-                qo.variant_type,
-                qo.variants,
-                qo.add_ons,
-                qo.nutritional_info,
-                qo.order_count,
-                qo.rating,
-                qom.priority,
-                qom.custom_price,
-                qom.custom_delivery_time,
-                'quick_order' as source,
-                qo.id as quick_order_id,
-                NULL as quick_order_item_id
-            FROM quick_orders qo
-            INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-            WHERE qom.merchant_id = :merchant_id
-            AND qom.is_active = 1
-            ORDER BY qom.priority DESC, qo.order_count DESC"
-        );
-        
-        $quickOrderStmt->execute([':merchant_id' => $merchantId]);
-        $quickOrders = $quickOrderStmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach ($quickOrders as $quickOrder) {
-            $categoryName = $quickOrder['category'] ?: 'Quick Orders';
-            
-            if (!isset($categories[$categoryName])) {
-                $categories[$categoryName] = [
-                    'category_name' => $categoryName,
-                    'category_info' => [
-                        'name' => $categoryName,
-                        'is_quick_order' => true
-                    ],
-                    'items' => []
-                ];
-            }
-            
-            $categories[$categoryName]['items'][] = formatQuickOrderForMenu($quickOrder, $baseUrl);
-            $totalItems++;
-        }
     }
     
     // Convert to indexed array
@@ -1660,9 +1549,6 @@ function handlePostRequest($conn, $baseUrl) {
         case 'report_merchant':
             reportMerchant($conn, $input);
             break;
-        case 'search_menu':
-            searchMenuItems($conn, $input, $baseUrl);
-            break;
         default:
             ResponseHandler::error('Invalid action', 400);
     }
@@ -1931,137 +1817,6 @@ function checkDeliveryAvailability($conn, $data) {
         'min_order_amount' => floatval($merchant['min_order_amount']),
         'free_delivery_threshold' => floatval($merchant['free_delivery_threshold']),
         'delivery_radius' => intval($merchant['delivery_radius'])
-    ]);
-}
-
-/*********************************
- * SEARCH MENU ITEMS - ENHANCED
- *********************************/
-function searchMenuItems($conn, $data, $baseUrl) {
-    $merchantId = $data['merchant_id'] ?? null;
-    $query = trim($data['query'] ?? '');
-    $category = trim($data['category'] ?? '');
-    $itemType = trim($data['item_type'] ?? '');
-    $sortBy = $data['sort_by'] ?? 'name';
-    $sortOrder = strtoupper($data['sort_order'] ?? 'ASC');
-    $page = max(1, intval($data['page'] ?? 1));
-    $limit = min(50, max(1, intval($data['limit'] ?? 20)));
-    $offset = ($page - 1) * $limit;
-    $includeVariants = isset($data['include_variants']) ? filter_var($data['include_variants'], FILTER_VALIDATE_BOOLEAN) : true;
-    $includeAddOns = isset($data['include_add_ons']) ? filter_var($data['include_add_ons'], FILTER_VALIDATE_BOOLEAN) : true;
-
-    if (!$merchantId) {
-        ResponseHandler::error('Merchant ID is required', 400);
-    }
-
-    $checkStmt = $conn->prepare(
-        "SELECT id, name FROM merchants 
-         WHERE id = :id AND is_active = 1"
-    );
-    $checkStmt->execute([':id' => $merchantId]);
-    $merchant = $checkStmt->fetch(PDO::FETCH_ASSOC);
-
-    if (!$merchant) {
-        ResponseHandler::error('Merchant not found or inactive', 404);
-    }
-
-    $whereConditions = ["mi.merchant_id = :merchant_id", "mi.is_available = 1"];
-    $params = [':merchant_id' => $merchantId];
-
-    if ($query) {
-        $whereConditions[] = "(mi.name LIKE :query OR mi.description LIKE :query)";
-        $params[':query'] = "%$query%";
-    }
-
-    if ($category) {
-        $whereConditions[] = "COALESCE(NULLIF(mi.category, ''), 'Uncategorized') = :category";
-        $params[':category'] = $category;
-    }
-
-    if ($itemType) {
-        $whereConditions[] = "mi.item_type = :item_type";
-        $params[':item_type'] = $itemType;
-    }
-
-    $whereClause = "WHERE " . implode(" AND ", $whereConditions);
-
-    $allowedSortColumns = ['name', 'price', 'is_popular', 'created_at'];
-    $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'name';
-    $sortOrder = $sortOrder === 'DESC' ? 'DESC' : 'ASC';
-
-    $countSql = "SELECT COUNT(*) as total FROM menu_items mi $whereClause";
-    $countStmt = $conn->prepare($countSql);
-    $countStmt->execute($params);
-    $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
-
-    $selectFields = "SELECT 
-                mi.id,
-                mi.name,
-                mi.description,
-                mi.price,
-                mi.image_url,
-                COALESCE(NULLIF(mi.category, ''), 'Uncategorized') as category,
-                mi.item_type,
-                mi.unit_type,
-                mi.unit_value,
-                mi.is_available,
-                mi.is_popular,
-                mi.preparation_time,
-                mi.max_quantity,
-                mi.stock_quantity,
-                mi.created_at,
-                mi.updated_at";
-
-    if ($includeVariants) {
-        $selectFields .= ", mi.has_variants, mi.variant_type, mi.variants_json";
-    }
-    
-    if ($includeAddOns) {
-        $selectFields .= ", mi.add_ons_json";
-    }
-
-    $sql = "$selectFields
-            FROM menu_items mi
-            $whereClause
-            ORDER BY mi.$sortBy $sortOrder
-            LIMIT :limit OFFSET :offset";
-
-    $params[':limit'] = $limit;
-    $params[':offset'] = $offset;
-    
-    $stmt = $conn->prepare($sql);
-    foreach ($params as $key => $value) {
-        if ($key === ':limit' || $key === ':offset') {
-            $stmt->bindValue($key, $value, PDO::PARAM_INT);
-        } else {
-            $stmt->bindValue($key, $value);
-        }
-    }
-    
-    $stmt->execute();
-    $menuItems = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    $formattedMenuItems = array_map(function($item) use ($baseUrl) {
-        return formatMenuItemData($item, $baseUrl);
-    }, $menuItems);
-
-    ResponseHandler::success([
-        'merchant_id' => $merchantId,
-        'merchant_name' => $merchant['name'],
-        'menu_items' => $formattedMenuItems,
-        'pagination' => [
-            'current_page' => $page,
-            'per_page' => $limit,
-            'total_items' => $totalCount,
-            'total_pages' => ceil($totalCount / $limit)
-        ],
-        'search_params' => [
-            'query' => $query,
-            'category' => $category,
-            'item_type' => $itemType,
-            'sort_by' => $sortBy,
-            'sort_order' => $sortOrder
-        ]
     ]);
 }
 
@@ -2347,7 +2102,6 @@ function formatMenuItemData($item, $baseUrl) {
         'variant_type' => null,
         'variants_json' => null,
         'add_ons_json' => null,
-        'nutritional_info' => null,
         'image_url' => '',
         'description' => '',
         'category' => 'Uncategorized',
@@ -2386,15 +2140,6 @@ function formatMenuItemData($item, $baseUrl) {
         }
     }
 
-    // Parse nutritional info
-    $nutritionalInfo = null;
-    if (!empty($item['nutritional_info'])) {
-        $nutritionalInfo = json_decode($item['nutritional_info'], true);
-        if (!is_array($nutritionalInfo)) {
-            $nutritionalInfo = null;
-        }
-    }
-
     $displayPrice = $item['price'];
     $displayUnit = $item['unit_type'];
     
@@ -2422,7 +2167,6 @@ function formatMenuItemData($item, $baseUrl) {
         'variant_type' => $item['variant_type'],
         'variants' => $variants,
         'add_ons' => $addOns,
-        'nutritional_info' => $nutritionalInfo,
         'preparation_time' => intval($item['preparation_time']),
         'max_quantity' => intval($item['max_quantity']),
         'stock_quantity' => $item['stock_quantity'] !== null ? intval($item['stock_quantity']) : null,
@@ -2451,94 +2195,8 @@ function formatCategoryData($category, $baseUrl) {
         'display_order' => intval($category['display_order'] ?? 0),
         'item_count' => intval($category['item_count'] ?? 0),
         'item_types' => isset($category['item_types']) && is_array($category['item_types']) ? $category['item_types'] : [],
-        'is_active' => boolval($category['is_active'] ?? true),
-        'is_quick_order' => boolval($category['is_quick_order'] ?? false)
+        'is_active' => boolval($category['is_active'] ?? true)
     ];
-}
-
-function formatQuickOrderForMerchant($order, $baseUrl) {
-    $imageUrl = '';
-    if (!empty($order['image_url'])) {
-        if (strpos($order['image_url'], 'http') === 0) {
-            $imageUrl = $order['image_url'];
-        } else {
-            $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick-orders/' . ltrim($order['image_url'], '/');
-        }
-    }
-    
-    $price = isset($order['custom_price']) ? $order['custom_price'] : $order['price'];
-    
-    // Parse variants
-    $variants = [];
-    if (!empty($order['variants'])) {
-        if (is_string($order['variants'])) {
-            $variants = json_decode($order['variants'], true);
-        } else {
-            $variants = $order['variants'];
-        }
-        if (!is_array($variants)) {
-            $variants = [];
-        }
-    }
-
-    // Parse add-ons
-    $addOns = [];
-    if (!empty($order['add_ons'])) {
-        if (is_string($order['add_ons'])) {
-            $addOns = json_decode($order['add_ons'], true);
-        } else {
-            $addOns = $order['add_ons'];
-        }
-        if (!is_array($addOns)) {
-            $addOns = [];
-        }
-    }
-
-    // Parse nutritional info
-    $nutritionalInfo = null;
-    if (!empty($order['nutritional_info'])) {
-        if (is_string($order['nutritional_info'])) {
-            $nutritionalInfo = json_decode($order['nutritional_info'], true);
-        } else {
-            $nutritionalInfo = $order['nutritional_info'];
-        }
-        if (!is_array($nutritionalInfo)) {
-            $nutritionalInfo = null;
-        }
-    }
-    
-    return [
-        'id' => $order['id'] ?? null,
-        'title' => $order['title'] ?? '',
-        'name' => $order['title'] ?? '',
-        'description' => $order['description'] ?? '',
-        'category' => $order['category'] ?? '',
-        'item_type' => $order['item_type'] ?? 'food',
-        'image_url' => $imageUrl,
-        'price' => floatval($price),
-        'formatted_price' => 'MK ' . number_format(floatval($price), 2),
-        'rating' => floatval($order['rating'] ?? 0),
-        'order_count' => intval($order['order_count'] ?? 0),
-        'has_variants' => boolval($order['has_variants'] ?? false),
-        'variant_type' => $order['variant_type'] ?? null,
-        'variants' => $variants,
-        'add_ons' => $addOns,
-        'nutritional_info' => $nutritionalInfo,
-        'preparation_time' => $order['preparation_time'] ?? '15-20 min',
-        'source' => 'quick_order',
-        'quick_order_id' => $order['id'],
-        'priority' => intval($order['priority'] ?? 0),
-        'has_custom_price' => isset($order['custom_price']),
-        'has_custom_delivery_time' => isset($order['custom_delivery_time'])
-    ];
-}
-
-function formatQuickOrderForMenu($order, $baseUrl) {
-    $data = formatQuickOrderForMerchant($order, $baseUrl);
-    $data['source'] = 'quick_order';
-    $data['quick_order_id'] = $order['id'];
-    $data['quick_order_item_id'] = $order['id']; // For backward compatibility
-    return $data;
 }
 
 function formatMenuItemImage($imagePath, $baseUrl) {
