@@ -189,9 +189,6 @@ function handlePostActions($action, $input, $userId) {
             case 'reorder':
                 reorder($conn, $input, $userId);
                 break;
-            case 'rate_order':
-                rateOrder($conn, $input, $userId);
-                break;
             case 'quick_order':
                 createQuickOrderFromItems($conn, $input, $userId);
                 break;
@@ -705,7 +702,7 @@ function createOrderFromCart($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items with enhanced add-ons (removed image_url)
+        // Create order items with enhanced add-ons
         $itemSql = "INSERT INTO order_items (
             order_id, quick_order_id, quick_order_item_id,
             item_name, description, quantity, price, total,
@@ -1045,7 +1042,7 @@ function createQuickOrderFromItems($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items with enhanced add-ons (removed image_url)
+        // Create order items with enhanced add-ons
         $itemSql = "INSERT INTO order_items (
             order_id, quick_order_id, quick_order_item_id,
             item_name, description, quantity, price, total,
@@ -1285,7 +1282,7 @@ function createOrder($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items (removed image_url)
+        // Create order items
         $itemSql = "INSERT INTO order_items (
             order_id, item_name, quantity, price, total,
             add_ons_json, special_instructions, created_at
@@ -1574,119 +1571,6 @@ function reorder($conn, $data, $userId) {
 }
 
 /*********************************
- * RATE ORDER
- *********************************/
-function rateOrder($conn, $data, $userId) {
-    try {
-        $orderId = $data['order_id'] ?? null;
-        $rating = intval($data['rating'] ?? 0);
-        $review = trim($data['review'] ?? '');
-        $itemRatings = $data['item_ratings'] ?? [];
-
-        if (!$orderId) {
-            ob_clean();
-            ResponseHandler::error('Order ID is required', 400);
-        }
-
-        if ($rating < 1 || $rating > 5) {
-            ob_clean();
-            ResponseHandler::error('Rating must be between 1 and 5', 400);
-        }
-
-        // Check if order exists and is delivered
-        $checkStmt = $conn->prepare(
-            "SELECT o.id, o.merchant_id, o.quick_order_id,
-                    m.name as merchant_name
-             FROM orders o
-             LEFT JOIN merchants m ON o.merchant_id = m.id
-             WHERE o.id = :order_id 
-             AND o.user_id = :user_id 
-             AND o.status = 'delivered'"
-        );
-        $checkStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
-        
-        $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$order) {
-            ob_clean();
-            ResponseHandler::error('Order not found or cannot be rated', 404);
-        }
-
-        // Check if already rated
-        $existingStmt = $conn->prepare(
-            "SELECT id FROM order_ratings WHERE order_id = :order_id AND user_id = :user_id"
-        );
-        $existingStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
-        
-        if ($existingStmt->fetch()) {
-            ob_clean();
-            ResponseHandler::error('You have already rated this order', 409);
-        }
-
-        $conn->beginTransaction();
-
-        // Insert rating
-        $ratingStmt = $conn->prepare(
-            "INSERT INTO order_ratings 
-                (order_id, user_id, merchant_id, rating, review, created_at)
-             VALUES (:order_id, :user_id, :merchant_id, :rating, :review, NOW())"
-        );
-        
-        $ratingStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId,
-            ':merchant_id' => $order['merchant_id'],
-            ':rating' => $rating,
-            ':review' => $review
-        ]);
-
-        // Insert item ratings if provided
-        if (!empty($itemRatings)) {
-            $itemRatingStmt = $conn->prepare(
-                "INSERT INTO order_item_ratings
-                    (order_id, order_item_id, rating, review, created_at)
-                 VALUES (:order_id, :order_item_id, :rating, :review, NOW())"
-            );
-            
-            foreach ($itemRatings as $itemRating) {
-                $itemRatingStmt->execute([
-                    ':order_id' => $orderId,
-                    ':order_item_id' => $itemRating['order_item_id'],
-                    ':rating' => $itemRating['rating'],
-                    ':review' => $itemRating['review'] ?? ''
-                ]);
-            }
-        }
-
-        // Update merchant rating
-        updateMerchantRating($conn, $order['merchant_id']);
-
-        // Update quick order rating if applicable
-        if ($order['quick_order_id']) {
-            updateQuickOrderRating($conn, $order['quick_order_id']);
-        }
-
-        $conn->commit();
-
-        ob_clean();
-        ResponseHandler::success([], 'Thank you for your rating!');
-
-    } catch (Exception $e) {
-        if ($conn->inTransaction()) {
-            $conn->rollBack();
-        }
-        ob_clean();
-        ResponseHandler::error('Failed to submit rating: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
  * TRACK ORDER (Enhanced with Add-ons)
  *********************************/
 function trackOrder($conn, $orderId, $userId) {
@@ -1753,7 +1637,7 @@ function trackOrder($conn, $orderId, $userId) {
         $historyStmt->execute([':order_id' => $orderId]);
         $history = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Get items with add-ons (removed image_url)
+        // Get items with add-ons
         $itemsStmt = $conn->prepare(
             "SELECT 
                 id,
@@ -2159,7 +2043,7 @@ function updateDeliveryAddress($conn, $data, $userId) {
 }
 
 /*********************************
- * GET ORDER DETAILS (FIXED - Removed image_url)
+ * GET ORDER DETAILS (FIXED - Removed ratings)
  *********************************/
 function getOrderDetails($conn, $orderId, $userId) {
     global $baseUrl;
@@ -2298,18 +2182,6 @@ function getOrderDetails($conn, $orderId, $userId) {
         $trackingStmt->execute([':order_id' => $orderId]);
         $tracking = $trackingStmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Get rating if exists
-        $ratingStmt = $conn->prepare(
-            "SELECT rating, review, created_at 
-             FROM order_ratings 
-             WHERE order_id = :order_id AND user_id = :user_id"
-        );
-        $ratingStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
-        $userRating = $ratingStmt->fetch(PDO::FETCH_ASSOC);
-
         $statusProgress = [
             'pending' => 20,
             'confirmed' => 40,
@@ -2359,10 +2231,8 @@ function getOrderDetails($conn, $orderId, $userId) {
             'cancellation_reason' => $order['cancellation_reason'] ?? '',
             'status_history' => $statusHistory,
             'tracking' => $tracking,
-            'user_rating' => $userRating,
             'can_cancel' => in_array($order['status'], ['pending', 'confirmed']),
-            'can_reorder' => true,
-            'can_rate' => $order['status'] === 'delivered' && !$userRating
+            'can_reorder' => true
         ];
 
         ob_clean();
@@ -2536,59 +2406,5 @@ function formatImageUrl($path, $type = '') {
     }
     
     return rtrim($baseUrl, '/') . '/' . $folder . '/' . ltrim($path, '/');
-}
-
-function updateMerchantRating($conn, $merchantId) {
-    $stmt = $conn->prepare(
-        "SELECT 
-            COUNT(*) as total_reviews,
-            AVG(rating) as avg_rating
-         FROM order_ratings
-         WHERE merchant_id = :merchant_id"
-    );
-    $stmt->execute([':merchant_id' => $merchantId]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    $updateStmt = $conn->prepare(
-        "UPDATE merchants 
-         SET rating = :rating, 
-             review_count = :review_count,
-             updated_at = NOW()
-         WHERE id = :id"
-    );
-    
-    $updateStmt->execute([
-        ':rating' => $result['avg_rating'] ?? 0,
-        ':review_count' => $result['total_reviews'] ?? 0,
-        ':id' => $merchantId
-    ]);
-}
-
-function updateQuickOrderRating($conn, $quickOrderId) {
-    $stmt = $conn->prepare(
-        "SELECT 
-            COUNT(*) as total_reviews,
-            AVG(rating) as avg_rating
-         FROM order_ratings
-         WHERE quick_order_id = :quick_order_id"
-    );
-    $stmt->execute([':quick_order_id' => $quickOrderId]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    if ($result['total_reviews'] > 0) {
-        $updateStmt = $conn->prepare(
-            "UPDATE quick_orders 
-             SET average_rating = :rating, 
-                 rating_count = :review_count,
-                 updated_at = NOW()
-             WHERE id = :id"
-        );
-        
-        $updateStmt->execute([
-            ':rating' => $result['avg_rating'] ?? 0,
-            ':review_count' => $result['total_reviews'] ?? 0,
-            ':id' => $quickOrderId
-        ]);
-    }
 }
 ?>
