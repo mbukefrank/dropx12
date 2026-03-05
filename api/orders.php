@@ -2202,7 +2202,7 @@ function getOrderDetails($conn, $orderId, $userId) {
                     m.address as merchant_address,
                     m.phone as merchant_phone,
                     m.email as merchant_email,
-                    m.image_url as merchant_image,
+                    
                     m.latitude as merchant_lat,
                     m.longitude as merchant_lng,
                     (
@@ -2216,7 +2216,7 @@ function getOrderDetails($conn, $orderId, $userId) {
                                 COALESCE(oi.variant_id, 0), '||',
                                 COALESCE(oi.add_ons_json, ''), '||',
                                 COALESCE(oi.variant_data, ''), '||',
-                                COALESCE(oi.image_url, ''), '||',
+                               
                                 COALESCE(oi.special_instructions, '')
                             )
                             ORDER BY oi.id SEPARATOR ';;'
