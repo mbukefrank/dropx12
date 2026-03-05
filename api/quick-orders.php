@@ -867,8 +867,7 @@ function getQuickOrderDetails($conn, $orderId, $baseUrl, $userId = null) {
 }
 
 /*********************************
- * ADD TO CART - UPDATED WITH PROPER CART MANAGEMENT
- * MATCHING CART.PHP LOGIC
+ * ADD TO CART - UPDATED WITH CORRECT TABLE STRUCTURE
  *********************************/
 function addQuickOrderToCart($conn, $data, $userId) {
     $quickOrderId = $data['quick_order_id'] ?? null;
@@ -894,7 +893,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
         $itemStmt = $conn->prepare(
             "SELECT qoi.*, qo.title as quick_order_title, qo.category, qo.item_type,
                     qo.merchant_id, qo.merchant_name, qo.preparation_time,
-                    qo.delivery_time, qo.has_variants
+                    qo.delivery_time, qo.has_variants, qo.price as quick_order_price
              FROM quick_order_items qoi
              JOIN quick_orders qo ON qoi.quick_order_id = qo.id
              WHERE qoi.id = :item_id 
@@ -914,7 +913,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
         // 2. HANDLE VARIANT SELECTION
         $variantData = null;
         $selectedVariantName = '';
-        $selectedVariantPrice = $item['price'];
+        $finalPrice = $item['price']; // Start with base item price
         $variantPrice = 0;
         
         if ($variantId) {
@@ -926,7 +925,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
                     $variantFound = true;
                     $variantData = $variant;
                     $selectedVariantName = ' (' . ($variant['display_name'] ?? $variant['name']) . ')';
-                    $selectedVariantPrice = $variant['price'];
+                    $finalPrice = $variant['price']; // Use variant price
                     $variantPrice = $variant['price'] - $item['price']; // Additional cost
                     
                     // Check variant availability
@@ -959,7 +958,6 @@ function addQuickOrderToCart($conn, $data, $userId) {
         }
 
         // 5. PROCESS ADD-ONS
-        $addOnsTotal = 0;
         $processedAddOns = [];
         
         if (!empty($selectedAddOns)) {
@@ -974,28 +972,19 @@ function addQuickOrderToCart($conn, $data, $userId) {
             $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
             
             foreach ($addOns as $addOn) {
-                $addOnTotal = $addOn['price'] * $quantity;
-                $addOnsTotal += $addOnTotal;
-                
                 $processedAddOns[] = [
                     'id' => $addOn['id'],
                     'name' => $addOn['name'],
-                    'price' => $addOn['price'],
+                    'price' => floatval($addOn['price']),
                     'category' => $addOn['category'],
                     'quantity' => $quantity,
-                    'total' => $addOnTotal
+                    'total' => floatval($addOn['price']) * $quantity
                 ];
             }
         }
 
-        // 6. CALCULATE PRICES
-        $unitPrice = $selectedVariantPrice;
-        $subtotal = $unitPrice * $quantity;
-        $addOnsTotal = $addOnsTotal;
-        $totalPrice = $subtotal + $addOnsTotal;
-
         // ============================================
-        // 7. GET OR CREATE USER'S ACTIVE CART - MATCHING CART.PHP LOGIC
+        // 6. GET OR CREATE USER'S ACTIVE CART
         // ============================================
         $sessionId = session_id();
         error_log("=== CART DEBUG IN QUICK-ORDERS ADD ===");
@@ -1043,11 +1032,10 @@ function addQuickOrderToCart($conn, $data, $userId) {
             $createCartStmt = $conn->prepare(
                 "INSERT INTO carts (
                     user_id, session_id, status, ip_address, user_agent, expires_at, 
-                    items_count, total_items, subtotal, add_ons_total, delivery_fee, 
-                    tax, discount, total, created_at, updated_at
+                    created_at, updated_at
                 ) VALUES (
                     :user_id, :session_id, 'active', :ip_address, :user_agent, :expires_at,
-                    0, 0, 0, 0, 0, 0, 0, 0, NOW(), NOW()
+                    NOW(), NOW()
                 )"
             );
             
@@ -1066,7 +1054,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
         error_log("Final Cart ID: " . $cartId);
         error_log("===================================");
 
-        // 8. CHECK FOR EXISTING ITEM FROM DIFFERENT MERCHANT
+        // 7. CHECK FOR EXISTING ITEM FROM DIFFERENT MERCHANT
         $merchantCheck = $conn->prepare(
             "SELECT DISTINCT merchant_id, merchant_name
              FROM cart_items 
@@ -1084,7 +1072,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
             );
         }
 
-        // 9. CHECK IF SAME ITEM ALREADY IN CART (WITH SAME VARIANT AND ADD-ONS)
+        // 8. CHECK IF SAME ITEM ALREADY IN CART (WITH SAME VARIANT AND ADD-ONS)
         $addOnsJson = !empty($processedAddOns) ? json_encode($processedAddOns) : null;
         
         $checkStmt = $conn->prepare(
@@ -1092,7 +1080,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
              WHERE cart_id = :cart_id
              AND quick_order_item_id = :item_id
              AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))
-             AND (add_ons_json = :add_ons_json OR (add_ons_json IS NULL AND :add_ons_json IS NULL))
+             AND (add_ons = :add_ons OR (add_ons IS NULL AND :add_ons IS NULL))
              AND special_instructions = :special_instructions
              AND is_active = 1"
         );
@@ -1100,38 +1088,52 @@ function addQuickOrderToCart($conn, $data, $userId) {
             ':cart_id' => $cartId,
             ':item_id' => $itemId,
             ':variant_id' => $variantId,
-            ':add_ons_json' => $addOnsJson,
+            ':add_ons' => $addOnsJson,
             ':special_instructions' => $specialInstructions
         ]);
+        
+        // Calculate totals for response
+        $totalPrice = $finalPrice * $quantity;
+        foreach ($processedAddOns as $addOn) {
+            $totalPrice += $addOn['total'];
+        }
         
         if ($existing = $checkStmt->fetch(PDO::FETCH_ASSOC)) {
             // Update existing item quantity
             $newQuantity = $existing['quantity'] + $quantity;
-            $newSubtotal = $unitPrice * $newQuantity;
-            $newAddOnsTotal = $addOnsTotal; // Recalculate based on new quantity
-            $newTotal = $newSubtotal + $newAddOnsTotal;
+            $newTotalPrice = $finalPrice * $newQuantity;
+            
+            // Recalculate add-ons for new quantity
+            $updatedAddOns = [];
+            foreach ($processedAddOns as $addOn) {
+                $updatedAddOns[] = [
+                    'id' => $addOn['id'],
+                    'name' => $addOn['name'],
+                    'price' => $addOn['price'],
+                    'category' => $addOn['category'],
+                    'quantity' => $newQuantity,
+                    'total' => $addOn['price'] * $newQuantity
+                ];
+                $newTotalPrice += $addOn['price'] * $newQuantity;
+            }
             
             $updateStmt = $conn->prepare(
                 "UPDATE cart_items 
                  SET quantity = :quantity,
-                     subtotal = :subtotal,
-                     add_ons_total = :add_ons_total,
-                     total_price = :total_price,
+                     add_ons = :add_ons,
                      updated_at = NOW()
                  WHERE id = :id"
             );
             $updateStmt->execute([
                 ':quantity' => $newQuantity,
-                ':subtotal' => $newSubtotal,
-                ':add_ons_total' => $newAddOnsTotal,
-                ':total_price' => $newTotal,
+                ':add_ons' => json_encode($updatedAddOns),
                 ':id' => $existing['id']
             ]);
             
             $cartItemId = $existing['id'];
             $message = 'Item quantity updated';
         } else {
-            // Add new item to cart
+            // Add new item to cart - USING CORRECT TABLE FIELDS
             $itemName = $item['name'] . $selectedVariantName;
             
             $insertStmt = $conn->prepare(
@@ -1142,11 +1144,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
                     quick_order_item_id,
                     name,
                     description,
-                    unit_price,
-                    variant_price,
-                    add_ons_total,
-                    subtotal,
-                    total_price,
+                    price,
                     quantity,
                     image_url,
                     measurement_type,
@@ -1161,9 +1159,9 @@ function addQuickOrderToCart($conn, $data, $userId) {
                     variant_id,
                     variant_data,
                     variant_name,
-                    add_ons_json,
-                    special_instructions,
                     has_variants,
+                    add_ons,
+                    special_instructions,
                     is_active,
                     created_at,
                     updated_at
@@ -1174,11 +1172,7 @@ function addQuickOrderToCart($conn, $data, $userId) {
                     :quick_order_item_id,
                     :name,
                     :description,
-                    :unit_price,
-                    :variant_price,
-                    :add_ons_total,
-                    :subtotal,
-                    :total_price,
+                    :price,
                     :quantity,
                     :image_url,
                     :measurement_type,
@@ -1193,9 +1187,9 @@ function addQuickOrderToCart($conn, $data, $userId) {
                     :variant_id,
                     :variant_data,
                     :variant_name,
-                    :add_ons_json,
-                    :special_instructions,
                     :has_variants,
+                    :add_ons,
+                    :special_instructions,
                     1,
                     NOW(),
                     NOW()
@@ -1209,52 +1203,67 @@ function addQuickOrderToCart($conn, $data, $userId) {
                 ':quick_order_item_id' => $itemId,
                 ':name' => $itemName,
                 ':description' => $item['description'],
-                ':unit_price' => $unitPrice,
-                ':variant_price' => $variantPrice,
-                ':add_ons_total' => $addOnsTotal,
-                ':subtotal' => $subtotal,
-                ':total_price' => $totalPrice,
+                ':price' => $finalPrice,
                 ':quantity' => $quantity,
                 ':image_url' => $item['image_url'],
-                ':measurement_type' => $item['measurement_type'],
-                ':unit' => $item['unit'],
-                ':quantity_value' => $item['quantity'],
-                ':custom_unit' => $item['custom_unit'],
-                ':item_type' => $item['item_type'],
-                ':category' => $item['category'],
+                ':measurement_type' => $item['measurement_type'] ?? 'quantity',
+                ':unit' => $item['unit'] ?? null,
+                ':quantity_value' => $item['quantity'] ?? null,
+                ':custom_unit' => $item['custom_unit'] ?? null,
+                ':item_type' => $item['item_type'] ?? 'food',
+                ':category' => $item['category'] ?? '',
                 ':merchant_id' => $item['merchant_id'],
                 ':merchant_name' => $item['merchant_name'],
-                ':preparation_time' => $item['preparation_time'],
+                ':preparation_time' => $item['preparation_time'] ?? null,
                 ':variant_id' => $variantId,
                 ':variant_data' => $variantData ? json_encode($variantData) : null,
                 ':variant_name' => $selectedVariantName,
-                ':add_ons_json' => $addOnsJson,
-                ':special_instructions' => $specialInstructions,
-                ':has_variants' => $item['has_variants'] ? 1 : 0
+                ':has_variants' => $item['has_variants'] ? 1 : 0,
+                ':add_ons' => $addOnsJson,
+                ':special_instructions' => $specialInstructions
             ]);
             
             $cartItemId = $conn->lastInsertId();
             $message = 'Item added to cart';
         }
 
-        // 10. UPDATE CART TOTALS
-        updateCartTotals($conn, $cartId);
+        // 9. UPDATE CART TIMESTAMP
+        $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
+        $updateCartStmt->execute([':cart_id' => $cartId]);
 
-        // 11. UPDATE STOCK (optional - decrease available stock)
+        // 10. UPDATE STOCK (if tracking inventory)
         if ($variantId && isset($variantData['stock_quantity']) && $variantData['stock_quantity'] > 0) {
             updateVariantStock($conn, $itemId, $variantId, $quantity, 'decrease');
         } elseif (!$variantId && $item['stock_quantity'] > 0) {
             updateItemStock($conn, $itemId, $quantity, 'decrease');
         }
 
-        // 12. GET COMPLETE CART DETAILS FOR RESPONSE
-        $cartDetails = getCartDetails($conn, $cartId, $userId);
+        // 11. GET UPDATED CART SUMMARY
+        $summaryStmt = $conn->prepare(
+            "SELECT 
+                COUNT(id) as item_count,
+                SUM(quantity) as total_quantity,
+                SUM(price * quantity) as subtotal
+             FROM cart_items 
+             WHERE cart_id = :cart_id AND is_active = 1"
+        );
+        $summaryStmt->execute([':cart_id' => $cartId]);
+        $summary = $summaryStmt->fetch(PDO::FETCH_ASSOC);
 
         $conn->commit();
 
         ResponseHandler::success([
-            'cart' => $cartDetails,
-            'message' => $message
+            'success' => true,
+            'message' => $message,
+            'data' => [
+                'cart_item_id' => $cartItemId,
+                'cart_id' => $cartId,
+                'cart_summary' => [
+                    'item_count' => intval($summary['item_count'] ?? 0),
+                    'total_quantity' => intval($summary['total_quantity'] ?? 0),
+                    'subtotal' => floatval($summary['subtotal'] ?? 0)
+                ]
+            ]
         ]);
 
     } catch (Exception $e) {
