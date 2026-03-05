@@ -2093,7 +2093,26 @@ function formatPromotionData($promo, $baseUrl = null) {
 }
 
 function formatMenuItemData($item, $baseUrl) {
-    // Make sure all required keys exist
+    // SAFETY CHECK: If $item is not an array, try to decode it or return empty array
+    if (!is_array($item)) {
+        error_log("formatMenuItemData: Expected array, got " . gettype($item));
+        
+        // If it's a string, try to decode JSON
+        if (is_string($item)) {
+            $decoded = json_decode($item, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $item = $decoded;
+                error_log("Successfully decoded JSON string to array");
+            } else {
+                error_log("Failed to decode JSON string: " . $item);
+                return []; // Return empty array for invalid items
+            }
+        } else {
+            return []; // Return empty array for other non-array types
+        }
+    }
+    
+    // Now it's safe to use array_merge since we know $item is an array
     $item = array_merge([
         'stock_quantity' => null,
         'is_available' => true,
@@ -2122,27 +2141,47 @@ function formatMenuItemData($item, $baseUrl) {
         }
     }
     
-    // Parse variants and REMOVE badge and price_per_unit
+    // Parse variants - with safety checks
     $variants = [];
     if (!empty($item['variants_json'])) {
-        $variants = json_decode($item['variants_json'], true);
-        if (!is_array($variants)) {
-            $variants = [];
-        } else {
-            // Remove badge and price_per_unit from each variant
-            foreach ($variants as &$variant) {
-                unset($variant['badge']);
-                unset($variant['price_per_unit']);
+        // If variants_json is already an array, use it directly
+        if (is_array($item['variants_json'])) {
+            $variants = $item['variants_json'];
+        } 
+        // If it's a string, decode it
+        else if (is_string($item['variants_json'])) {
+            $variants = json_decode($item['variants_json'], true);
+            if (!is_array($variants)) {
+                $variants = [];
             }
+        }
+        
+        // Remove badge and price_per_unit from each variant if they exist
+        if (is_array($variants)) {
+            foreach ($variants as &$variant) {
+                if (is_array($variant)) {
+                    unset($variant['badge']);
+                    unset($variant['price_per_unit']);
+                }
+            }
+        } else {
+            $variants = [];
         }
     }
 
-    // Parse add-ons
+    // Parse add-ons - with safety checks
     $addOns = [];
     if (!empty($item['add_ons_json'])) {
-        $addOns = json_decode($item['add_ons_json'], true);
-        if (!is_array($addOns)) {
-            $addOns = [];
+        // If add_ons_json is already an array, use it directly
+        if (is_array($item['add_ons_json'])) {
+            $addOns = $item['add_ons_json'];
+        }
+        // If it's a string, decode it
+        else if (is_string($item['add_ons_json'])) {
+            $addOns = json_decode($item['add_ons_json'], true);
+            if (!is_array($addOns)) {
+                $addOns = [];
+            }
         }
     }
 
@@ -2161,7 +2200,6 @@ function formatMenuItemData($item, $baseUrl) {
         'description' => $item['description'],
         'price' => floatval($item['price'] ?? 0),
         'display_price' => floatval($displayPrice),
-        // REMOVED formatted_price completely
         'image_url' => $imageUrl,
         'category' => $item['category'],
         'item_type' => $item['item_type'],
@@ -2171,7 +2209,7 @@ function formatMenuItemData($item, $baseUrl) {
         'is_popular' => boolval($item['is_popular']),
         'has_variants' => boolval($item['has_variants']),
         'variant_type' => $item['variant_type'],
-        'variants' => $variants,  // Now without badge and price_per_unit
+        'variants' => $variants,
         'add_ons' => $addOns,
         'preparation_time' => intval($item['preparation_time']),
         'max_quantity' => intval($item['max_quantity']),
@@ -2182,7 +2220,6 @@ function formatMenuItemData($item, $baseUrl) {
         'updated_at' => $item['updated_at'] ?? ''
     ];
 }
-
 function formatCategoryData($category, $baseUrl) {
     $imageUrl = '';
     if (!empty($category['image_url'])) {
