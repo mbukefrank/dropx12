@@ -705,17 +705,17 @@ function createOrderFromCart($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items with enhanced add-ons
+        // Create order items with enhanced add-ons (removed image_url)
         $itemSql = "INSERT INTO order_items (
             order_id, quick_order_id, quick_order_item_id,
             item_name, description, quantity, price, total,
             variant_id, variant_data, selected_options,
-            add_ons_json, special_instructions, image_url, created_at
+            add_ons_json, special_instructions, created_at
         ) VALUES (
             :order_id, :quick_order_id, :quick_order_item_id,
             :item_name, :description, :quantity, :price, :total,
             :variant_id, :variant_data, :selected_options,
-            :add_ons_json, :special_instructions, :image_url, NOW()
+            :add_ons_json, :special_instructions, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
@@ -723,9 +723,6 @@ function createOrderFromCart($conn, $data, $userId) {
         foreach ($itemsWithAddOns as $itemData) {
             $item = $itemData['cart_item'];
             $addOnsData = $itemData['add_ons'];
-            
-            // Get image URL
-            $imageUrl = $item['image_url'] ?? $item['quick_order_image'] ?? null;
             
             $itemStmt->execute([
                 ':order_id' => $orderId,
@@ -740,8 +737,7 @@ function createOrderFromCart($conn, $data, $userId) {
                 ':variant_data' => $itemData['variant_data'] ? json_encode($itemData['variant_data']) : null,
                 ':selected_options' => $itemData['selected_options'] ? json_encode($itemData['selected_options']) : null,
                 ':add_ons_json' => !empty($addOnsData) ? json_encode($addOnsData) : null,
-                ':special_instructions' => $item['special_instructions'] ?? '',
-                ':image_url' => formatImageUrl($imageUrl, 'menu_items')
+                ':special_instructions' => $item['special_instructions'] ?? ''
             ]);
         }
 
@@ -1000,8 +996,7 @@ function createQuickOrderFromItems($conn, $data, $userId) {
                 'variant_id' => $variantId,
                 'variant_data' => $selectedVariant,
                 'has_variants' => $dbItem['has_variants'],
-                'special_instructions' => $itemSpecialInstructions,
-                'image_url' => $dbItem['image_url'] ?? null
+                'special_instructions' => $itemSpecialInstructions
             ];
         }
 
@@ -1050,25 +1045,22 @@ function createQuickOrderFromItems($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items with enhanced add-ons
+        // Create order items with enhanced add-ons (removed image_url)
         $itemSql = "INSERT INTO order_items (
             order_id, quick_order_id, quick_order_item_id,
             item_name, description, quantity, price, total,
             variant_id, variant_data, add_ons_json, 
-            special_instructions, image_url, created_at
+            special_instructions, created_at
         ) VALUES (
             :order_id, :quick_order_id, :quick_order_item_id,
             :item_name, :description, :quantity, :price, :total,
             :variant_id, :variant_data, :add_ons_json,
-            :special_instructions, :image_url, NOW()
+            :special_instructions, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
 
         foreach ($validatedItems as $item) {
-            // Use item-specific image or fallback to quick order image
-            $imageUrl = $item['image_url'] ?? $item['quick_order_image'] ?? null;
-            
             $itemStmt->execute([
                 ':order_id' => $orderId,
                 ':quick_order_id' => $item['quick_order_id'],
@@ -1081,8 +1073,7 @@ function createQuickOrderFromItems($conn, $data, $userId) {
                 ':variant_id' => $item['variant_id'] ?? null,
                 ':variant_data' => $item['variant_data'] ? json_encode($item['variant_data']) : null,
                 ':add_ons_json' => !empty($item['add_ons_data']) ? json_encode($item['add_ons_data']) : null,
-                ':special_instructions' => $item['special_instructions'] ?? '',
-                ':image_url' => formatImageUrl($imageUrl, 'quick_orders')
+                ':special_instructions' => $item['special_instructions'] ?? ''
             ]);
         }
 
@@ -1243,8 +1234,7 @@ function createOrder($conn, $data, $userId) {
                 'item_total' => $itemTotal,
                 'add_ons' => $addOnsData,
                 'add_ons_total' => $addOnsTotal,
-                'special_instructions' => $item['special_instructions'] ?? '',
-                'image_url' => $item['image_url'] ?? null
+                'special_instructions' => $item['special_instructions'] ?? ''
             ];
         }
 
@@ -1295,12 +1285,13 @@ function createOrder($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
+        // Create order items (removed image_url)
         $itemSql = "INSERT INTO order_items (
             order_id, item_name, quantity, price, total,
-            add_ons_json, special_instructions, image_url, created_at
+            add_ons_json, special_instructions, created_at
         ) VALUES (
             :order_id, :item_name, :quantity, :price, :total,
-            :add_ons_json, :special_instructions, :image_url, NOW()
+            :add_ons_json, :special_instructions, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
@@ -1312,8 +1303,7 @@ function createOrder($conn, $data, $userId) {
                 ':price' => $item['price'],
                 ':total' => $item['item_total'],
                 ':add_ons_json' => !empty($item['add_ons']) ? json_encode($item['add_ons']) : null,
-                ':special_instructions' => $item['special_instructions'],
-                ':image_url' => formatImageUrl($item['image_url'] ?? null, 'menu_items')
+                ':special_instructions' => $item['special_instructions']
             ]);
         }
 
@@ -1484,8 +1474,7 @@ function reorder($conn, $data, $userId) {
                         oi.variant_id,
                         oi.variant_data,
                         oi.add_ons_json,
-                        oi.special_instructions as item_instructions,
-                        oi.image_url
+                        oi.special_instructions as item_instructions
                     FROM orders o
                     JOIN order_items oi ON o.id = oi.order_id
                     WHERE o.id = :order_id AND o.user_id = :user_id";
@@ -1764,7 +1753,7 @@ function trackOrder($conn, $orderId, $userId) {
         $historyStmt->execute([':order_id' => $orderId]);
         $history = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Get items with add-ons
+        // Get items with add-ons (removed image_url)
         $itemsStmt = $conn->prepare(
             "SELECT 
                 id,
@@ -1775,7 +1764,6 @@ function trackOrder($conn, $orderId, $userId) {
                 total,
                 add_ons_json,
                 variant_data,
-                image_url,
                 special_instructions
              FROM order_items
              WHERE order_id = :order_id
@@ -1818,7 +1806,6 @@ function trackOrder($conn, $orderId, $userId) {
                 'has_addons' => !empty($addOns),
                 'addons_count' => $addOns ? count($addOns) : 0,
                 'variant' => $variantData,
-                'image_url' => $item['image_url'] ?? '',
                 'special_instructions' => $item['special_instructions'] ?? ''
             ];
         }
@@ -2172,7 +2159,7 @@ function updateDeliveryAddress($conn, $data, $userId) {
 }
 
 /*********************************
- * GET ORDER DETAILS (Enhanced with Add-ons)
+ * GET ORDER DETAILS (FIXED - Removed image_url)
  *********************************/
 function getOrderDetails($conn, $orderId, $userId) {
     global $baseUrl;
@@ -2202,7 +2189,7 @@ function getOrderDetails($conn, $orderId, $userId) {
                     m.address as merchant_address,
                     m.phone as merchant_phone,
                     m.email as merchant_email,
-                    
+                    m.image_url as merchant_image,
                     m.latitude as merchant_lat,
                     m.longitude as merchant_lng,
                     (
@@ -2216,7 +2203,6 @@ function getOrderDetails($conn, $orderId, $userId) {
                                 COALESCE(oi.variant_id, 0), '||',
                                 COALESCE(oi.add_ons_json, ''), '||',
                                 COALESCE(oi.variant_data, ''), '||',
-                               
                                 COALESCE(oi.special_instructions, '')
                             )
                             ORDER BY oi.id SEPARATOR ';;'
@@ -2283,14 +2269,9 @@ function getOrderDetails($conn, $orderId, $userId) {
                         $item['variant_data'] = json_decode($parts[7], true);
                     }
                     
-                    // Image URL at position 8
+                    // Special instructions at position 8
                     if (isset($parts[8]) && !empty($parts[8])) {
-                        $item['image_url'] = $parts[8];
-                    }
-                    
-                    // Special instructions at position 9
-                    if (isset($parts[9]) && !empty($parts[9])) {
-                        $item['special_instructions'] = $parts[9];
+                        $item['special_instructions'] = $parts[8];
                     }
                     
                     $items[] = $item;
